@@ -66,14 +66,13 @@ class WorkState:
     published: bool = False
 
 
-def canonical_paths(root: Path, corpus_id: UUID) -> tuple[Path, Path, Path]:
-    directory = root / "corpora" / str(corpus_id)
-    return directory, directory / "corpus.json", directory / "blocks.parquet"
+def corpus_path(root: Path, corpus_id: UUID) -> Path:
+    return root / "corpora" / str(corpus_id)
 
 
 @contextmanager
 def locked_work(root: Path, corpus_id: UUID) -> Iterator[Path]:
-    destination, _, _ = canonical_paths(root, corpus_id)
+    destination = corpus_path(root, corpus_id)
     parent = destination.parent
     hidden = parent / f".{corpus_id}"
     if destination.exists() and not hidden.exists():
@@ -111,13 +110,18 @@ def prepare_work(hidden: Path, destination: Path, request: Request, binding: dic
     if manifest.is_file() and chunks.is_dir():
         _validate_binding(manifest, binding)
         if ready.exists():
-            candidate = load_corpus(ready)
-            if candidate.request != request:
-                raise ValueError("Ready candidate does not match the command")
-            receipt = _read_json(receipt_path) if receipt_path.is_file() else None
-            if receipt is not None:
-                _validate_receipt(receipt, ready, destination, request, binding)
-            return WorkState(chunks, ready, receipt)
+            try:
+                candidate = load_corpus(ready)
+                if candidate.request != request:
+                    raise ValueError("Ready candidate does not match the command")
+                receipt = _read_json(receipt_path) if receipt_path.is_file() else None
+                if receipt is not None:
+                    _validate_receipt(receipt, ready, destination, request, binding)
+            except (OSError, ValueError):
+                shutil.rmtree(ready) if ready.is_dir() else ready.unlink()
+                receipt_path.unlink(missing_ok=True)
+            else:
+                return WorkState(chunks, ready, receipt)
         receipt_path.unlink(missing_ok=True)
         return WorkState(chunks)
     for path in hidden.iterdir():
@@ -185,7 +189,7 @@ def write_candidate(
     request: Request,
     anchor: Anchor,
     sources: list[Path],
-) -> tuple[Path, Path]:
+) -> None:
     candidate.mkdir()
     corpus_path = candidate / "corpus.json"
     blocks_path = candidate / "blocks.parquet"
@@ -195,14 +199,14 @@ def write_candidate(
     _fsync_file(temporary)
     os.replace(temporary, blocks_path)
     _write_json(corpus_path, {"request": request.document(), "finalized_anchor": anchor.document()})
-    return corpus_path, blocks_path
+    _fsync_directory(candidate)
 
 
-def load_corpus(path: Path, *, exact_files: bool = True) -> LoadedCorpus:
+def load_corpus(path: Path) -> LoadedCorpus:
     path = path.resolve()
     if not path.is_dir():
         raise ValueError(f"Corpus directory does not exist: {path}")
-    if exact_files and {item.name for item in path.iterdir()} != {"corpus.json", "blocks.parquet"}:
+    if {item.name for item in path.iterdir()} != {"corpus.json", "blocks.parquet"}:
         raise ValueError("Corpus directory must contain exactly corpus.json and blocks.parquet")
     try:
         document = json.loads((path / "corpus.json").read_text(encoding="utf-8"))
@@ -268,13 +272,12 @@ def pair_hashes(path: Path) -> dict[str, str]:
     return hashes
 
 
-def save_ready(hidden: Path, candidate: Path, receipt: dict[str, object]) -> Path:
+def save_ready(hidden: Path, candidate: Path, receipt: dict[str, object]) -> None:
     ready = hidden / "ready"
     _write_json(hidden / "receipt.json", receipt)
     if candidate != ready:
         os.rename(candidate, ready)
     _fsync_directory(hidden)
-    return ready
 
 
 def publish(hidden: Path, destination: Path) -> None:
@@ -286,7 +289,6 @@ def publish(hidden: Path, destination: Path) -> None:
     _fsync_directory(ready)
     os.rename(ready, destination)
     _fsync_directory(destination.parent)
-    shutil.rmtree(hidden)
 
 
 def discard_work(hidden: Path) -> None:

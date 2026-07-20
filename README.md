@@ -45,6 +45,8 @@ ROOT/corpora/.<UUID>/
 
 Running the same command resumes those checkpoints. A request with different range, chain, operation, or extension source is rejected. Publication validates the complete candidate and atomically renames its ready directory to `ROOT/corpora/<UUID>/`. Existing destinations are never overwritten.
 
+The destination rename plus parent-directory sync is the commit boundary. A SIGINT during that short publication transition is deferred so a committed command can emit its receipt.
+
 ## Extend
 
 Extension fully validates the source, copies its rows into a new Corpus, and acquires only the suffix. It never mutates, renames, deletes, or hard-links the source.

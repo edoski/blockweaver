@@ -1,29 +1,33 @@
 import asyncio
 import json
-from collections.abc import Coroutine
+import signal
+from collections.abc import Callable, Coroutine
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 from uuid import UUID
 
 import typer
-from typer._click.exceptions import ClickException, Exit
+from typer._click.exceptions import ClickException
 from typer.core import TyperGroup
 
-from ._build import acquire_corpus, extend_corpus, verify_corpus
+from ._build import Publication, acquire_corpus, extend_corpus, verify_corpus
 from ._contract import Request
 
 
 class MachineGroup(TyperGroup):
     def main(self, *args: Any, **kwargs: Any) -> Any:
+        standalone_mode = kwargs.get("standalone_mode", True)
         kwargs["standalone_mode"] = False
         try:
             result = super().main(*args, **kwargs)
-            if isinstance(result, int) and result:
-                raise Exit(result)
-            return result
         except ClickException as error:
             _progress({"event": "error", "message": error.format_message()})
-            raise Exit(error.exit_code) from None
+            if standalone_mode:
+                raise SystemExit(error.exit_code) from None
+            raise
+        if standalone_mode and isinstance(result, int) and result:
+            raise SystemExit(result)
+        return result
 
 
 app = typer.Typer(cls=MachineGroup, no_args_is_help=True, add_completion=False, pretty_exceptions_enable=False)
@@ -53,7 +57,7 @@ def acquire(
         _progress({"event": "error", "message": str(error)})
         raise typer.Exit(1) from None
     _execute(
-        acquire_corpus(
+        lambda publication: acquire_corpus(
             request,
             storage_root=storage_root,
             rpc_url=rpc_url,
@@ -61,6 +65,7 @@ def acquire(
             batch_size=batch_size,
             concurrency=concurrency,
             progress=_progress,
+            publication=publication,
         ),
         [rpc_url, verify_rpc_url],
     )
@@ -80,7 +85,7 @@ def extend(
 ) -> None:
     """Extend a validated Corpus into a new Corpus."""
     _execute(
-        extend_corpus(
+        lambda publication: extend_corpus(
             source_corpus,
             storage_root=storage_root,
             corpus_id=corpus_id,
@@ -90,6 +95,7 @@ def extend(
             batch_size=batch_size,
             concurrency=concurrency,
             progress=_progress,
+            publication=publication,
         ),
         [rpc_url, verify_rpc_url],
     )
@@ -106,7 +112,7 @@ def verify(
 ) -> None:
     """Validate a Corpus locally and optionally against RPC."""
     _execute(
-        verify_corpus(
+        lambda _publication: verify_corpus(
             corpus,
             rpc_url=rpc_url,
             full_rpc=full_rpc,
@@ -122,9 +128,23 @@ def _progress(value: dict[str, object]) -> None:
     typer.echo(json.dumps(value, sort_keys=True, separators=(",", ":")), err=True)
 
 
-def _execute(operation: Coroutine[Any, Any, dict[str, object]], secrets: list[str]) -> None:
+def _execute(
+    operation: Callable[[Publication], Coroutine[Any, Any, dict[str, object]]],
+    secrets: list[str],
+) -> None:
+    phase = "running"
+
+    def transition(next_phase: Literal["publishing", "committed"]) -> None:
+        nonlocal phase
+        phase = next_phase
+
+    def interrupt(*_args: object) -> None:
+        if phase == "running":
+            raise KeyboardInterrupt
+
+    previous_handler = signal.signal(signal.SIGINT, interrupt)
     try:
-        receipt = asyncio.run(operation)
+        receipt = asyncio.run(operation(transition))
     except (KeyboardInterrupt, asyncio.CancelledError):
         _progress({"event": "interrupted"})
         raise typer.Exit(130) from None
@@ -134,4 +154,7 @@ def _execute(operation: Coroutine[Any, Any, dict[str, object]], secrets: list[st
             message = message.replace(secret, "<redacted>")
         _progress({"event": "error", "message": message})
         raise typer.Exit(1) from None
-    typer.echo(json.dumps(receipt, sort_keys=True, separators=(",", ":")))
+    else:
+        typer.echo(json.dumps(receipt, sort_keys=True, separators=(",", ":")))
+    finally:
+        signal.signal(signal.SIGINT, previous_handler)
