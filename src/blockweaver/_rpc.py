@@ -56,7 +56,7 @@ class Rpc:
         }
         groups = [calls[index : index + self._batch_size] for index in range(0, len(calls), self._batch_size)]
         replies: dict[int, Any] = {}
-        for part in await asyncio.gather(*(self._run(group, validators) for group in groups)):
+        for part in await self._run_groups(groups, validators):
             replies.update(part)
         return [replies[call["id"]] for call in calls]
 
@@ -91,15 +91,28 @@ class Rpc:
             if attempt >= 3 and len(pending) > 1:
                 items = list(pending.values())
                 midpoint = len(items) // 2
-                first_half, second_half = await asyncio.gather(
-                    self._run(items[:midpoint], validators, attempt), self._run(items[midpoint:], validators, attempt)
-                )
+                first_half, second_half = await self._run_groups([items[:midpoint], items[midpoint:]], validators, attempt)
                 complete.update(first_half)
                 complete.update(second_half)
                 return complete
             delay = retry_after if retry_after is not None else random.uniform(0, min(2 ** (attempt - 4), 2.0))
             await asyncio.sleep(max(0.0, delay))
         raise RuntimeError("RPC request failed after 12 attempts")
+
+    async def _run_groups(
+        self,
+        groups: Iterable[list[dict[str, Any]]],
+        validators: dict[int, Validator],
+        prior_attempts: int = 0,
+    ) -> list[dict[int, Any]]:
+        tasks = [asyncio.create_task(self._run(group, validators, prior_attempts)) for group in groups]
+        try:
+            return list(await asyncio.gather(*tasks))
+        except BaseException:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
 
     async def _post(self, calls: list[dict[str, Any]]) -> tuple[int, Any, float | None]:
         assert self._session is not None

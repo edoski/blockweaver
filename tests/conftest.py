@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 from collections.abc import Iterator
+from contextlib import suppress
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
@@ -18,12 +20,17 @@ class ChainServer:
         self.chain_id = chain_id
         self.finalized = finalized
         self.requests: list[list[dict[str, Any]]] = []
+        self.request_counts: dict[int, int] = {}
         self.http_failures = 0
         self.omit_once: set[int] = set()
+        self.omit_counts: dict[int, int] = {}
         self.omit: set[int] = set()
         self.null_once: set[int] = set()
         self.changes: dict[int, dict[str, Any]] = {}
+        self.changes_after: dict[int, tuple[int, dict[str, Any]]] = {}
         self.errors: dict[int, dict[str, Any]] = {}
+        self.delays: dict[int, float] = {}
+        self.delays_after: dict[int, tuple[int, float]] = {}
         self.reject_batches_larger_than: int | None = None
         self.wrong_id_once = False
         state = self
@@ -45,7 +52,16 @@ class ChainServer:
                     params = call.get("params")
                     selector = params[0] if isinstance(params, list) and params else None
                     number = state.finalized if selector == "finalized" else int(selector, 16) if isinstance(selector, str) else -1
+                    state.request_counts[number] = state.request_counts.get(number, 0) + 1
+                    delay = state.delays.get(number, 0.0)
+                    after = state.delays_after.get(number)
+                    if after is not None and state.request_counts[number] > after[0]:
+                        delay = after[1]
+                    time.sleep(delay)
                     if number in state.omit:
+                        continue
+                    if state.omit_counts.get(number, 0):
+                        state.omit_counts[number] -= 1
                         continue
                     if number in state.omit_once:
                         state.omit_once.remove(number)
@@ -80,7 +96,8 @@ class ChainServer:
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
-                self.wfile.write(body)
+                with suppress(BrokenPipeError, ConnectionResetError):
+                    self.wfile.write(body)
 
             def log_message(self, format: str, *args: object) -> None:
                 del format, args
@@ -94,6 +111,10 @@ class ChainServer:
         return f"http://127.0.0.1:{self._server.server_port}"
 
     def block(self, number: int) -> dict[str, Any]:
+        changes = self.changes.get(number, {})
+        delayed_changes = self.changes_after.get(number)
+        if delayed_changes is not None and self.request_counts.get(number, 0) > delayed_changes[0]:
+            changes = {**changes, **delayed_changes[1]}
         return {
             "number": hex(number),
             "hash": block_hash(number),
@@ -103,7 +124,7 @@ class ChainServer:
             "gasUsed": hex(15_000_000 + number),
             "gasLimit": hex(30_000_000),
             "transactions": [block_hash(number * 10 + offset) for offset in range(number % 3)],
-            **self.changes.get(number, {}),
+            **changes,
         }
 
     def __enter__(self) -> ChainServer:

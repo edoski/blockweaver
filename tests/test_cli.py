@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import os
@@ -15,6 +16,7 @@ import pytest
 from conftest import ChainServer
 from typer.testing import CliRunner
 
+from blockweaver._rpc import Rpc
 from blockweaver.cli import app
 
 CORPUS_ID = "11111111-1111-4111-8111-111111111111"
@@ -99,6 +101,89 @@ def test_installed_executable_failures_are_single_machine_errors(tmp_path: Path)
         assert result.stdout == ""
         assert len(lines) == 1
         assert json.loads(lines[0])["event"] == "error"
+
+
+def test_installed_verify_drains_retrying_siblings_after_terminal_failure(
+    tmp_path: Path,
+    chains: tuple[ChainServer, ChainServer],
+) -> None:
+    primary, verifier = chains
+    seeded = CliRunner().invoke(app, acquire_arguments(tmp_path, primary, verifier, last=17, batch_size=2))
+    assert seeded.exit_code == 0, seeded.output
+    primary.requests.clear()
+    primary.request_counts.clear()
+    primary.omit = set(range(12, 18))
+    primary.changes[10] = {"hash": "invalid"}
+    primary.delays[10] = 0.75
+    primary.delays_after = {number: (3, 2.0) for number in range(12, 18)}
+
+    executable = Path(sys.executable).with_name("blockweaver")
+    corpus = tmp_path / "corpora" / CORPUS_ID
+    result = subprocess.run(
+        [executable, "verify", corpus, "--rpc-url", primary.url, "--full-rpc", "--batch-size", "2", "--concurrency", "6"],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    messages = [json.loads(line) for line in result.stderr.splitlines()]
+    assert result.returncode == 1
+    assert result.stdout == ""
+    assert [message["event"] for message in messages] == ["local_valid", "error"]
+    assert messages[-1]["message"] == "Invalid block hash"
+
+
+@pytest.mark.parametrize("failure_site", ["outer", "bisected"])
+def test_rpc_fanouts_finish_siblings_before_closing_the_session(
+    tmp_path: Path,
+    chains: tuple[ChainServer, ChainServer],
+    monkeypatch: pytest.MonkeyPatch,
+    failure_site: str,
+) -> None:
+    primary, verifier = chains
+    last = 17 if failure_site == "outer" else 11
+    seeded = CliRunner().invoke(app, acquire_arguments(tmp_path, primary, verifier, last=last, batch_size=2))
+    assert seeded.exit_code == 0, seeded.output
+    primary.requests.clear()
+    primary.request_counts.clear()
+
+    if failure_site == "outer":
+        primary.changes[10] = {"hash": "invalid"}
+        primary.delays[10] = 0.05
+        primary.omit = set(range(12, 18))
+        primary.delays.update({number: 2.0 for number in range(12, 18)})
+    else:
+        primary.omit_counts[10] = 3
+        primary.omit = {11}
+        primary.changes_after[10] = (3, {"hash": "invalid"})
+        primary.delays[10] = 0.05
+        primary.delays_after[11] = (3, 2.0)
+
+    posts_after_close: list[list[dict[str, object]]] = []
+    original_post = Rpc._post
+    original_exit = Rpc.__aexit__
+
+    async def track_post(self: Rpc, calls: list[dict[str, object]]) -> tuple[int, object, float | None]:
+        if self._session is not None and self._session.closed:
+            posts_after_close.append(calls)
+        return await original_post(self, calls)
+
+    async def yielding_exit(self: Rpc, *args: object) -> None:
+        await original_exit(self, *args)
+        await asyncio.sleep(0.05)
+
+    monkeypatch.setattr(Rpc, "_post", track_post)
+    monkeypatch.setattr(Rpc, "__aexit__", yielding_exit)
+    monkeypatch.setattr(random, "uniform", lambda *_args: 0.0)
+
+    corpus = tmp_path / "corpora" / CORPUS_ID
+    result = CliRunner().invoke(
+        app,
+        ["verify", str(corpus), "--rpc-url", primary.url, "--full-rpc", "--batch-size", "2", "--concurrency", "6"],
+    )
+
+    assert result.exit_code == 1
+    assert posts_after_close == []
 
 
 def test_acquire_publishes_exact_corpus_and_machine_receipt(
