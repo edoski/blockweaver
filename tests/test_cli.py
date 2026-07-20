@@ -2,9 +2,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import random
+import shutil
 from pathlib import Path
 
 import polars as pl
+import pytest
 from conftest import ChainServer
 from typer.testing import CliRunner
 
@@ -21,6 +25,33 @@ def test_cli_exposes_the_three_operations() -> None:
     assert "acquire" in result.stdout
     assert "extend" in result.stdout
     assert "verify" in result.stdout
+
+
+def test_verify_exposes_only_the_positive_full_rpc_flag() -> None:
+    result = CliRunner().invoke(app, ["verify", "--help"])
+
+    assert result.exit_code == 0
+    assert "--full-rpc" in result.stdout
+    assert "--no-full-rpc" not in result.stdout
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ["acquire"],
+        ["acquire", "--corpus-id", "not-a-uuid"],
+        ["acquire", "--chain-id", "not-an-integer"],
+    ],
+)
+def test_cli_parse_failures_are_single_machine_errors(arguments: list[str]) -> None:
+    result = CliRunner().invoke(app, arguments)
+
+    assert result.exit_code != 0
+    assert result.stdout == ""
+    assert json.loads(result.stderr) == {
+        "event": "error",
+        "message": json.loads(result.stderr)["message"],
+    }
 
 
 def test_acquire_publishes_exact_corpus_and_machine_receipt(
@@ -81,6 +112,7 @@ def test_acquire_publishes_exact_corpus_and_machine_receipt(
     assert frame["block_number"].to_list() == [10, 11, 12, 13, 14]
     assert receipt["operation"] == "acquire"
     assert receipt["rows"] == 5
+    assert {fact["block_number"] for fact in receipt["samples"]} == {10, 11, 12, 13, 14}
     assert receipt["pair_sha256"] == {name: hashlib.sha256((destination / name).read_bytes()).hexdigest() for name in ("corpus.json", "blocks.parquet")}
     assert primary.url not in result.output
     assert verifier.url not in result.output
@@ -160,6 +192,133 @@ def test_acquire_resumes_only_complete_checkpoints_and_rejects_rebinding(
     assert events[1]["first_block"] == 1024
 
 
+def test_acquire_recovers_partial_initialization_without_lock_residue(
+    tmp_path: Path,
+    chains: tuple[ChainServer, ChainServer],
+) -> None:
+    primary, verifier = chains
+    hidden = tmp_path / "corpora" / f".{CORPUS_ID}"
+    (hidden / "chunks").mkdir(parents=True)
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "acquire",
+            "--storage-root",
+            str(tmp_path),
+            "--corpus-id",
+            CORPUS_ID,
+            "--chain-id",
+            "1",
+            "--first-block",
+            "10",
+            "--last-block",
+            "14",
+            "--rpc-url",
+            primary.url,
+            "--verify-rpc-url",
+            verifier.url,
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert [path.name for path in (tmp_path / "corpora").iterdir()] == [CORPUS_ID]
+
+
+def test_acquire_publishes_valid_pair_left_ready_by_a_crash(
+    tmp_path: Path,
+    chains: tuple[ChainServer, ChainServer],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    primary, verifier = chains
+    arguments = [
+        "acquire",
+        "--storage-root",
+        str(tmp_path),
+        "--corpus-id",
+        CORPUS_ID,
+        "--chain-id",
+        "1",
+        "--first-block",
+        "10",
+        "--last-block",
+        "14",
+        "--rpc-url",
+        primary.url,
+        "--verify-rpc-url",
+        verifier.url,
+    ]
+    corpora = tmp_path / "corpora"
+    hidden = corpora / f".{CORPUS_ID}"
+    original_rename = os.rename
+
+    def interrupt_ready(source: Path, destination: Path) -> None:
+        original_rename(source, destination)
+        if Path(source).name == "ready.tmp" and Path(destination).name == "ready":
+            raise OSError("simulated crash after ready transition")
+
+    monkeypatch.setattr(os, "rename", interrupt_ready)
+    interrupted = CliRunner().invoke(app, arguments)
+
+    assert interrupted.exit_code == 1
+    assert (hidden / "ready").is_dir()
+    assert (hidden / "receipt.json").is_file()
+
+    monkeypatch.setattr(os, "rename", original_rename)
+    recovered = CliRunner().invoke(app, arguments)
+
+    assert recovered.exit_code == 0, recovered.output
+    assert [path.name for path in corpora.iterdir()] == [CORPUS_ID]
+
+
+def test_acquire_recovers_after_atomic_publication_before_work_cleanup(
+    tmp_path: Path,
+    chains: tuple[ChainServer, ChainServer],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    primary, verifier = chains
+    arguments = [
+        "acquire",
+        "--storage-root",
+        str(tmp_path),
+        "--corpus-id",
+        CORPUS_ID,
+        "--chain-id",
+        "1",
+        "--first-block",
+        "10",
+        "--last-block",
+        "14",
+        "--rpc-url",
+        primary.url,
+        "--verify-rpc-url",
+        verifier.url,
+    ]
+    destination = tmp_path / "corpora" / CORPUS_ID
+    hidden = tmp_path / "corpora" / f".{CORPUS_ID}"
+    original_rmtree = shutil.rmtree
+
+    def interrupt_cleanup(path: Path, *_args: object, **_kwargs: object) -> None:
+        if Path(path) == hidden and destination.exists():
+            (hidden / "receipt.json").unlink()
+            raise OSError("simulated crash after publication")
+        original_rmtree(path)
+
+    monkeypatch.setattr(shutil, "rmtree", interrupt_cleanup)
+    interrupted = CliRunner().invoke(app, arguments)
+
+    assert interrupted.exit_code == 1
+    assert destination.is_dir()
+    assert hidden.is_dir()
+
+    monkeypatch.setattr(shutil, "rmtree", original_rmtree)
+    recovered = CliRunner().invoke(app, arguments)
+
+    assert recovered.exit_code == 0, recovered.output
+    assert json.loads(recovered.stdout)["corpus_id"] == CORPUS_ID
+    assert not hidden.exists()
+
+
 def test_extend_keeps_source_immutable_and_includes_boundary_samples(
     tmp_path: Path,
     chains: tuple[ChainServer, ChainServer],
@@ -216,6 +375,71 @@ def test_extend_keeps_source_immutable_and_includes_boundary_samples(
     assert receipt["reused_rows"] == 5
     assert receipt["acquired_rows"] == 4
     assert {fact["block_number"] for fact in receipt["samples"]} >= {10, 14, 15, 18}
+    assert len(receipt["samples"]) == 7
+
+
+def test_extend_binds_the_exact_source_bytes_it_validates(
+    tmp_path: Path,
+    chains: tuple[ChainServer, ChainServer],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    primary, verifier = chains
+    seeded = CliRunner().invoke(
+        app,
+        [
+            "acquire",
+            "--storage-root",
+            str(tmp_path),
+            "--corpus-id",
+            CORPUS_ID,
+            "--chain-id",
+            "1",
+            "--first-block",
+            "10",
+            "--last-block",
+            "14",
+            "--rpc-url",
+            primary.url,
+            "--verify-rpc-url",
+            verifier.url,
+        ],
+    )
+    assert seeded.exit_code == 0, seeded.output
+    source = tmp_path / "corpora" / CORPUS_ID
+    original_schema = pl.read_parquet_schema
+    changed = False
+
+    def rewrite_during_validation(path: Path, *args: object, **kwargs: object) -> dict[str, pl.DataType]:
+        nonlocal changed
+        schema = original_schema(path, *args, **kwargs)
+        if Path(path) == source / "blocks.parquet" and not changed:
+            changed = True
+            frame = pl.read_parquet(path)
+            frame.write_parquet(path, compression="uncompressed")
+        return schema
+
+    monkeypatch.setattr(pl, "read_parquet_schema", rewrite_during_validation)
+    extended = CliRunner().invoke(
+        app,
+        [
+            "extend",
+            str(source),
+            "--storage-root",
+            str(tmp_path),
+            "--corpus-id",
+            EXTENDED_ID,
+            "--last-block",
+            "18",
+            "--rpc-url",
+            primary.url,
+            "--verify-rpc-url",
+            verifier.url,
+        ],
+    )
+
+    assert extended.exit_code == 1
+    assert "Source Corpus changed during validation" in extended.stderr
+    assert not (tmp_path / "corpora" / EXTENDED_ID).exists()
 
 
 def test_verify_always_checks_every_local_row_and_full_rpc(
@@ -267,6 +491,116 @@ def test_verify_always_checks_every_local_row_and_full_rpc(
     invalid = CliRunner().invoke(app, ["verify", str(corpus)])
     assert invalid.exit_code == 1
     assert "invalid block values" in invalid.stderr
+
+
+def test_large_full_verify_and_extension_avoid_eager_corpus_reads(
+    tmp_path: Path,
+    chains: tuple[ChainServer, ChainServer],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    primary, verifier = chains
+    primary.finalized = verifier.finalized = 1_030
+    seeded = CliRunner().invoke(
+        app,
+        [
+            "acquire",
+            "--storage-root",
+            str(tmp_path),
+            "--corpus-id",
+            CORPUS_ID,
+            "--chain-id",
+            "1",
+            "--first-block",
+            "0",
+            "--last-block",
+            "1025",
+            "--rpc-url",
+            primary.url,
+            "--verify-rpc-url",
+            verifier.url,
+            "--batch-size",
+            "100",
+        ],
+    )
+    assert seeded.exit_code == 0, seeded.output
+    corpus = tmp_path / "corpora" / CORPUS_ID
+    original_read = pl.read_parquet
+
+    def reject_eager_corpus(path: Path, *args: object, **kwargs: object) -> pl.DataFrame:
+        if Path(path).name == "blocks.parquet":
+            raise AssertionError("Corpus reads must stay bounded")
+        return original_read(path, *args, **kwargs)
+
+    original_read_bytes = Path.read_bytes
+
+    def reject_whole_corpus(self: Path) -> bytes:
+        if self.name == "blocks.parquet":
+            raise AssertionError("Corpus hashing must stay bounded")
+        return original_read_bytes(self)
+
+    monkeypatch.setattr(pl, "read_parquet", reject_eager_corpus)
+    monkeypatch.setattr(Path, "read_bytes", reject_whole_corpus)
+    verified = CliRunner().invoke(
+        app,
+        ["verify", str(corpus), "--rpc-url", primary.url, "--full-rpc", "--batch-size", "100"],
+    )
+    extended = CliRunner().invoke(
+        app,
+        [
+            "extend",
+            str(corpus),
+            "--storage-root",
+            str(tmp_path),
+            "--corpus-id",
+            EXTENDED_ID,
+            "--last-block",
+            "1028",
+            "--rpc-url",
+            primary.url,
+            "--verify-rpc-url",
+            verifier.url,
+            "--batch-size",
+            "100",
+        ],
+    )
+
+    assert verified.exit_code == 0, verified.output
+    assert len(json.loads(verified.stdout)["samples"]) == 5
+    assert extended.exit_code == 0, extended.output
+
+
+def test_rpc_verification_rejects_finality_regression_below_stored_anchor(
+    tmp_path: Path,
+    chains: tuple[ChainServer, ChainServer],
+) -> None:
+    primary, verifier = chains
+    seeded = CliRunner().invoke(
+        app,
+        [
+            "acquire",
+            "--storage-root",
+            str(tmp_path),
+            "--corpus-id",
+            CORPUS_ID,
+            "--chain-id",
+            "1",
+            "--first-block",
+            "10",
+            "--last-block",
+            "14",
+            "--rpc-url",
+            primary.url,
+            "--verify-rpc-url",
+            verifier.url,
+        ],
+    )
+    assert seeded.exit_code == 0, seeded.output
+    primary.finalized = 29
+
+    result = CliRunner().invoke(app, ["verify", str(tmp_path / "corpora" / CORPUS_ID), "--rpc-url", primary.url])
+
+    assert result.exit_code == 1
+    assert "does not cover the stored finalized anchor" in result.stderr
 
 
 def test_rpc_bisects_repeatedly_failing_batches(
@@ -335,3 +669,72 @@ def test_rpc_response_id_mismatch_fails_without_leaking_url(
     assert result.exit_code == 1
     assert "response ID mismatch" in result.stderr
     assert primary.url not in result.output
+
+
+def test_rpc_rejects_corrupt_success_before_retrying_missing_sibling(
+    tmp_path: Path,
+    chains: tuple[ChainServer, ChainServer],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    primary, verifier = chains
+    primary.omit = {10}
+    primary.changes[11] = {"hash": "invalid"}
+    monkeypatch.setattr(random, "uniform", lambda *_args: 0.0)
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "acquire",
+            "--storage-root",
+            str(tmp_path),
+            "--corpus-id",
+            CORPUS_ID,
+            "--chain-id",
+            "1",
+            "--first-block",
+            "10",
+            "--last-block",
+            "11",
+            "--rpc-url",
+            primary.url,
+            "--verify-rpc-url",
+            verifier.url,
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "Invalid block hash" in result.stderr
+
+
+def test_rpc_error_requires_integer_code_and_string_message(
+    tmp_path: Path,
+    chains: tuple[ChainServer, ChainServer],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    primary, verifier = chains
+    primary.errors[10] = {"code": -32000}
+    monkeypatch.setattr(random, "uniform", lambda *_args: 0.0)
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "acquire",
+            "--storage-root",
+            str(tmp_path),
+            "--corpus-id",
+            CORPUS_ID,
+            "--chain-id",
+            "1",
+            "--first-block",
+            "10",
+            "--last-block",
+            "10",
+            "--rpc-url",
+            primary.url,
+            "--verify-rpc-url",
+            verifier.url,
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "Invalid JSON-RPC error shape" in result.stderr

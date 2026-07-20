@@ -20,8 +20,10 @@ class ChainServer:
         self.requests: list[list[dict[str, Any]]] = []
         self.http_failures = 0
         self.omit_once: set[int] = set()
+        self.omit: set[int] = set()
         self.null_once: set[int] = set()
         self.changes: dict[int, dict[str, Any]] = {}
+        self.errors: dict[int, dict[str, Any]] = {}
         self.reject_batches_larger_than: int | None = None
         self.wrong_id_once = False
         state = self
@@ -42,9 +44,14 @@ class ChainServer:
                 for call in calls:
                     params = call.get("params")
                     selector = params[0] if isinstance(params, list) and params else None
-                    number = state.finalized if selector in {"finalized", "latest"} else int(selector, 16) if isinstance(selector, str) else -1
+                    number = state.finalized if selector == "finalized" else int(selector, 16) if isinstance(selector, str) else -1
+                    if number in state.omit:
+                        continue
                     if number in state.omit_once:
                         state.omit_once.remove(number)
+                        continue
+                    if number in state.errors:
+                        replies.append({"jsonrpc": "2.0", "id": call["id"], "error": state.errors[number]})
                         continue
                     if self.server.state.reject_batches_larger_than is not None and len(calls) > self.server.state.reject_batches_larger_than:  # type: ignore[attr-defined]
                         replies.append(

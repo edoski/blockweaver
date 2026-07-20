@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import os
 import re
 import shutil
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -39,7 +42,28 @@ class LoadedCorpus:
     path: Path
     request: Request
     anchor: Anchor
-    frame: pl.DataFrame
+    rows: int
+
+    @property
+    def blocks_path(self) -> Path:
+        return self.path / "blocks.parquet"
+
+    def fact(self, number: int) -> dict[str, object]:
+        return self.facts([number])[number]
+
+    def facts(self, numbers: list[int]) -> dict[int, dict[str, object]]:
+        frame = pl.scan_parquet(self.blocks_path).filter(pl.col("block_number").is_in(numbers)).collect(engine="streaming")
+        if frame["block_number"].to_list() != numbers:
+            raise ValueError("Requested Corpus rows are missing")
+        return {int(row["block_number"]): {name: int(value) for name, value in row.items()} for row in frame.iter_rows(named=True)}
+
+
+@dataclass(frozen=True, slots=True)
+class WorkState:
+    chunks: Path
+    candidate: Path | None = None
+    receipt: dict[str, object] | None = None
+    published: bool = False
 
 
 def canonical_paths(root: Path, corpus_id: UUID) -> tuple[Path, Path, Path]:
@@ -47,28 +71,61 @@ def canonical_paths(root: Path, corpus_id: UUID) -> tuple[Path, Path, Path]:
     return directory, directory / "corpus.json", directory / "blocks.parquet"
 
 
-def prepare_work(root: Path, request: Request, binding: dict[str, object]) -> tuple[Path, Path]:
-    destination, _, _ = canonical_paths(root, request.corpus_id)
-    if destination.exists():
-        raise FileExistsError(f"Destination already exists: {destination}")
+@contextmanager
+def locked_work(root: Path, corpus_id: UUID) -> Iterator[Path]:
+    destination, _, _ = canonical_paths(root, corpus_id)
     parent = destination.parent
+    hidden = parent / f".{corpus_id}"
+    if destination.exists() and not hidden.exists():
+        raise FileExistsError(f"Destination already exists: {destination}")
     parent.mkdir(parents=True, exist_ok=True)
-    hidden = parent / f".{request.corpus_id}"
+    hidden.mkdir(exist_ok=True)
+    descriptor = os.open(hidden, os.O_RDONLY)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        if destination.exists() and not hidden.exists():
+            raise FileExistsError(f"Destination already exists: {destination}")
+        yield hidden
+    finally:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
+
+
+def prepare_work(hidden: Path, destination: Path, request: Request, binding: dict[str, object]) -> WorkState:
     manifest = hidden / "binding.json"
     chunks = hidden / "chunks"
-    if hidden.exists():
-        if not hidden.is_dir() or not manifest.is_file() or not chunks.is_dir():
-            raise ValueError("Incomplete work directory has an invalid shape")
-        persisted = json.loads(manifest.read_text(encoding="utf-8"))
-        if persisted != binding:
-            raise ValueError("Incomplete work belongs to a different command")
-        for path in hidden.rglob("*.tmp"):
-            path.unlink()
-        return hidden, chunks
+    ready = hidden / "ready"
+    receipt_path = hidden / "receipt.json"
+    if destination.exists():
+        candidate = load_corpus(destination)
+        if candidate.request != request:
+            raise ValueError("Published recovery does not match the command")
+        if manifest.is_file():
+            _validate_binding(manifest, binding)
+        receipt = _read_json(receipt_path) if receipt_path.is_file() else None
+        if receipt is not None:
+            _validate_receipt(receipt, destination, destination, request, binding)
+        return WorkState(chunks, destination, receipt, True)
+    for path in hidden.rglob("*.tmp"):
+        shutil.rmtree(path) if path.is_dir() else path.unlink()
+    if manifest.is_file() and chunks.is_dir():
+        _validate_binding(manifest, binding)
+        if ready.exists():
+            candidate = load_corpus(ready)
+            if candidate.request != request:
+                raise ValueError("Ready candidate does not match the command")
+            receipt = _read_json(receipt_path) if receipt_path.is_file() else None
+            if receipt is not None:
+                _validate_receipt(receipt, ready, destination, request, binding)
+            return WorkState(chunks, ready, receipt)
+        receipt_path.unlink(missing_ok=True)
+        return WorkState(chunks)
+    for path in hidden.iterdir():
+        shutil.rmtree(path) if path.is_dir() else path.unlink()
     chunks.mkdir(parents=True)
     _write_json(manifest, binding)
     _fsync_directory(hidden)
-    return hidden, chunks
+    return WorkState(chunks)
 
 
 def checkpoint_paths(chunks: Path, request: Request, size: int) -> tuple[list[Path], int, Block | None]:
@@ -124,14 +181,15 @@ def read_checkpoint(path: Path, chain_id: int) -> list[Block]:
 
 
 def write_candidate(
-    hidden: Path,
+    candidate: Path,
     request: Request,
     anchor: Anchor,
     sources: list[Path],
 ) -> tuple[Path, Path]:
-    corpus_path = hidden / "corpus.json"
-    blocks_path = hidden / "blocks.parquet"
-    temporary = hidden / "blocks.parquet.tmp"
+    candidate.mkdir()
+    corpus_path = candidate / "corpus.json"
+    blocks_path = candidate / "blocks.parquet"
+    temporary = candidate / "blocks.parquet.tmp"
     scans = [pl.scan_parquet(path).select(FINAL_COLUMNS) for path in sources]
     pl.concat(scans, how="vertical").sink_parquet(temporary, compression="zstd", row_group_size=4096, maintain_order=True)
     _fsync_file(temporary)
@@ -151,28 +209,17 @@ def load_corpus(path: Path, *, exact_files: bool = True) -> LoadedCorpus:
     except (OSError, json.JSONDecodeError) as error:
         raise ValueError("Invalid corpus.json") from error
     request, anchor = _parse_document(document)
-    try:
-        frame = pl.read_parquet(path / "blocks.parquet")
-    except Exception as error:
-        raise ValueError("Invalid blocks.parquet") from error
-    validate_frame(frame, request)
+    rows = validate_blocks(path / "blocks.parquet", request)
     if anchor.block_number < request.last_block:
         raise ValueError("Finalized anchor precedes the Corpus")
-    return LoadedCorpus(path, request, anchor, frame)
+    return LoadedCorpus(path, request, anchor, rows)
 
 
-def validate_frame(frame: pl.DataFrame, request: Request) -> None:
-    if frame.schema != FINAL_SCHEMA:
-        raise ValueError("blocks.parquet has a noncanonical schema")
-    if frame.null_count().row(0) != (0,) * len(FINAL_SCHEMA):
-        raise ValueError("blocks.parquet contains nulls")
-    if frame.height != request.last_block - request.first_block + 1:
-        raise ValueError("blocks.parquet row count does not match request")
-    numbers = frame["block_number"]
-    if numbers.to_list() != list(range(request.first_block, request.last_block + 1)):
-        raise ValueError("Block numbers are not the requested contiguous range")
-    invalid = frame.select(
-        (
+def validate_blocks(path: Path, request: Request) -> int:
+    try:
+        schema = pl.read_parquet_schema(path)
+        scan = pl.scan_parquet(path)
+        invalid = (
             (pl.col("chain_id") != request.chain_id)
             | (pl.col("timestamp") < 0)
             | (pl.col("base_fee_per_gas") <= 0)
@@ -180,26 +227,107 @@ def validate_frame(frame: pl.DataFrame, request: Request) -> None:
             | (pl.col("gas_limit") <= 0)
             | (pl.col("gas_used") > pl.col("gas_limit"))
             | (pl.col("tx_count") < 0)
-        ).any()
-    ).item()
-    if invalid or not frame["timestamp"].is_sorted():
+        )
+        summary = (
+            scan.select(
+                pl.len().alias("rows"),
+                pl.col("block_number").first().alias("first"),
+                pl.col("block_number").last().alias("last"),
+                (pl.col("block_number").diff() != 1).fill_null(False).any().alias("gaps"),
+                (pl.col("timestamp").diff() < 0).fill_null(False).any().alias("time_decreases"),
+                invalid.any().alias("invalid"),
+                pl.sum_horizontal(*(pl.col(name).null_count() for name in FINAL_COLUMNS)).alias("nulls"),
+            )
+            .collect(engine="streaming")
+            .row(0, named=True)
+        )
+    except Exception as error:
+        raise ValueError("Invalid blocks.parquet") from error
+    if schema != FINAL_SCHEMA:
+        raise ValueError("blocks.parquet has a noncanonical schema")
+    if summary["nulls"]:
+        raise ValueError("blocks.parquet contains nulls")
+    expected_rows = request.last_block - request.first_block + 1
+    if summary["rows"] != expected_rows:
+        raise ValueError("blocks.parquet row count does not match request")
+    if summary["first"] != request.first_block or summary["last"] != request.last_block or summary["gaps"]:
+        raise ValueError("Block numbers are not the requested contiguous range")
+    if summary["invalid"] or summary["time_decreases"]:
         raise ValueError("blocks.parquet contains invalid block values")
+    return expected_rows
 
 
 def pair_hashes(path: Path) -> dict[str, str]:
-    return {name: hashlib.sha256((path / name).read_bytes()).hexdigest() for name in ("corpus.json", "blocks.parquet")}
+    hashes: dict[str, str] = {}
+    for name in ("corpus.json", "blocks.parquet"):
+        digest = hashlib.sha256()
+        with (path / name).open("rb") as stream:
+            while chunk := stream.read(1024 * 1024):
+                digest.update(chunk)
+        hashes[name] = digest.hexdigest()
+    return hashes
+
+
+def save_ready(hidden: Path, candidate: Path, receipt: dict[str, object]) -> Path:
+    ready = hidden / "ready"
+    _write_json(hidden / "receipt.json", receipt)
+    if candidate != ready:
+        os.rename(candidate, ready)
+    _fsync_directory(hidden)
+    return ready
 
 
 def publish(hidden: Path, destination: Path) -> None:
+    ready = hidden / "ready"
     for name in ("corpus.json", "blocks.parquet"):
-        _fsync_file(hidden / name)
-    shutil.rmtree(hidden / "chunks")
-    (hidden / "binding.json").unlink()
-    if {item.name for item in hidden.iterdir()} != {"corpus.json", "blocks.parquet"}:
+        _fsync_file(ready / name)
+    if {item.name for item in ready.iterdir()} != {"corpus.json", "blocks.parquet"}:
         raise ValueError("Candidate contains unexpected files")
-    _fsync_directory(hidden)
-    os.rename(hidden, destination)
+    _fsync_directory(ready)
+    os.rename(ready, destination)
     _fsync_directory(destination.parent)
+    shutil.rmtree(hidden)
+
+
+def discard_work(hidden: Path) -> None:
+    shutil.rmtree(hidden)
+
+
+def _validate_binding(path: Path, binding: dict[str, object]) -> None:
+    if _read_json(path) != binding:
+        raise ValueError("Incomplete work belongs to a different command")
+
+
+def _validate_receipt(
+    receipt: dict[str, object],
+    candidate: Path,
+    destination: Path,
+    request: Request,
+    binding: dict[str, object],
+) -> None:
+    expected = {
+        "operation": binding["operation"],
+        "corpus_id": str(request.corpus_id),
+        "path": str(destination),
+        "chain_id": request.chain_id,
+        "first_block": request.first_block,
+        "last_block": request.last_block,
+        "rows": request.last_block - request.first_block + 1,
+    }
+    if any(receipt.get(name) != value for name, value in expected.items()):
+        raise ValueError("Recovery receipt does not match the command")
+    if receipt.get("pair_sha256") != pair_hashes(candidate):
+        raise ValueError("Recovery receipt does not match the Corpus")
+
+
+def _read_json(path: Path) -> dict[str, object]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError(f"Invalid work state: {path.name}") from error
+    if not isinstance(value, dict):
+        raise ValueError(f"Invalid work state: {path.name}")
+    return value
 
 
 def _parse_document(value: Any) -> tuple[Request, Anchor]:

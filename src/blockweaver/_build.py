@@ -4,23 +4,25 @@ from __future__ import annotations
 
 import hashlib
 import signal
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager
+from itertools import islice
 from pathlib import Path
 from uuid import UUID
-
-from filelock import FileLock
 
 from ._contract import Anchor, Block, Request, validate_links
 from ._corpus import (
     LoadedCorpus,
     canonical_paths,
     checkpoint_paths,
+    discard_work,
     load_corpus,
+    locked_work,
     pair_hashes,
     prepare_work,
     publish,
     read_checkpoint,
+    save_ready,
     write_candidate,
     write_checkpoint,
 )
@@ -49,6 +51,7 @@ async def acquire_corpus(
         concurrency=concurrency,
         progress=progress,
         source=None,
+        source_hashes=None,
     )
 
 
@@ -64,7 +67,11 @@ async def extend_corpus(
     concurrency: int,
     progress: Progress,
 ) -> dict[str, object]:
+    source_path = source_path.resolve()
+    source_hashes = pair_hashes(source_path)
     source = load_corpus(source_path)
+    if pair_hashes(source_path) != source_hashes:
+        raise ValueError("Source Corpus changed during validation")
     if corpus_id == source.request.corpus_id:
         raise ValueError("Extension requires a new corpus_id")
     if last_block <= source.request.last_block:
@@ -84,6 +91,7 @@ async def extend_corpus(
         concurrency=concurrency,
         progress=progress,
         source=source,
+        source_hashes=source_hashes,
     )
 
 
@@ -97,32 +105,76 @@ async def _build(
     concurrency: int,
     progress: Progress,
     source: LoadedCorpus | None,
+    source_hashes: dict[str, str] | None,
 ) -> dict[str, object]:
     if rpc_url == verify_rpc_url:
         raise ValueError("Primary and verifier RPC endpoints must be independent")
     destination, _, _ = canonical_paths(storage_root.resolve(), request.corpus_id)
-    source_hashes = pair_hashes(source.path) if source else None
-    suffix_first = source.request.last_block + 1 if source else request.first_block
+    source_id = source.request.corpus_id if source is not None else None
+    source_rows = source.rows if source is not None else 0
+    source_last = source.request.last_block if source is not None else None
+    source_path = source.blocks_path if source is not None else None
+    operation = "extend" if source_id is not None else "acquire"
+    suffix_first = source_last + 1 if source_last is not None else request.first_block
     suffix_request = Request(request.corpus_id, request.chain_id, suffix_first, request.last_block)
     binding: dict[str, object] = {
         "version": "0.1.0",
-        "operation": "extend" if source else "acquire",
+        "operation": operation,
         "request": request.document(),
     }
-    if source:
+    if source is not None:
         binding["source"] = {
             "path": str(source.path),
             "pair_sha256": source_hashes,
         }
-    lock_path = destination.parent / f".{request.corpus_id}.lock"
-    with FileLock(lock_path):
-        hidden, chunks = prepare_work(storage_root.resolve(), request, binding)
-        paths, next_block, previous = checkpoint_paths(chunks, suffix_request, _CHECKPOINT_SIZE)
+    with locked_work(storage_root.resolve(), request.corpus_id) as hidden:
+        work = prepare_work(hidden, destination, request, binding)
+        if work.candidate:
+            candidate = load_corpus(work.candidate)
+            hashes = pair_hashes(work.candidate)
+            receipt = work.receipt
+            if receipt is None:
+                async with (
+                    Rpc(rpc_url, batch_size=batch_size, concurrency=concurrency) as primary,
+                    Rpc(verify_rpc_url, batch_size=batch_size, concurrency=concurrency) as verifier,
+                ):
+                    primary_chain, verifier_chain = await primary.chain_id(), await verifier.chain_id()
+                    if primary_chain != request.chain_id or verifier_chain != request.chain_id:
+                        raise ValueError("RPC chain ID does not match the Corpus request")
+                    if source is not None:
+                        await _validate_source_boundary(source, primary, verifier)
+                    samples = await _check_samples(candidate, primary, _sample_numbers(request, source_last))
+                    verifier_fact = await _validate_candidate_finality(candidate, primary, verifier)
+                receipt = _receipt(
+                    operation=operation,
+                    request=request,
+                    path=destination,
+                    source_id=source_id,
+                    source_rows=source_rows,
+                    reused=source_rows,
+                    acquired=request.last_block - suffix_first + 1,
+                    anchor=candidate.anchor,
+                    hashes=hashes,
+                    samples=samples,
+                    verifier=verifier_fact,
+                )
+            if source is not None and pair_hashes(source.path) != source_hashes:
+                raise ValueError("Source Corpus changed during extension")
+            if work.published:
+                discard_work(hidden)
+                progress({"event": "published", "corpus_id": str(request.corpus_id), "recovered": True})
+                return receipt
+            save_ready(hidden, work.candidate, receipt)
+            with _publication_signals_blocked():
+                publish(hidden, destination)
+            progress({"event": "published", "corpus_id": str(request.corpus_id), "recovered": True})
+            return receipt
+        paths, next_block, previous = checkpoint_paths(work.chunks, suffix_request, _CHECKPOINT_SIZE)
         reused_suffix = next_block - suffix_first
         progress(
             {
                 "event": "resume",
-                "reused_rows": (source.frame.height if source else 0) + reused_suffix,
+                "reused_rows": source_rows + reused_suffix,
             }
         )
         async with (
@@ -133,7 +185,7 @@ async def _build(
             if primary_chain != request.chain_id or verifier_chain != request.chain_id:
                 raise ValueError("RPC chain ID does not match the Corpus request")
             boundary: Block | None = None
-            if source:
+            if source is not None:
                 boundary = await _validate_source_boundary(source, primary, verifier)
                 if previous is not None:
                     first_saved = read_checkpoint(paths[0], request.chain_id)[0]
@@ -142,7 +194,7 @@ async def _build(
                 last = min(next_block + _CHECKPOINT_SIZE - 1, request.last_block)
                 blocks = await primary.blocks(range(next_block, last + 1), chain_id=request.chain_id)
                 validate_links(blocks, previous or boundary)
-                path = chunks / f"{next_block:020d}-{last:020d}.parquet"
+                path = work.chunks / f"{next_block:020d}-{last:020d}.parquet"
                 write_checkpoint(path, blocks)
                 paths.append(path)
                 previous = blocks[-1]
@@ -155,33 +207,33 @@ async def _build(
                     }
                 )
             assert previous is not None
-            anchor, verifier_fact = await _prove_finality(previous, primary, verifier, request)
-            sources = ([source.path / "blocks.parquet"] if source else []) + paths
-            corpus_path, blocks_path = write_candidate(hidden, request, anchor, sources)
-            candidate = load_corpus(hidden, exact_files=False)
-            samples = await _check_samples(candidate, primary, _sample_numbers(request, source))
-            if source and pair_hashes(source.path) != source_hashes:
+            anchor, verifier_fact = await _prove_finality(previous, verifier, request)
+            sources = ([source_path] if source_path is not None else []) + paths
+            candidate_path = hidden / "ready.tmp"
+            write_candidate(candidate_path, request, anchor, sources)
+            candidate = load_corpus(candidate_path)
+            samples = await _check_samples(candidate, primary, _sample_numbers(request, source_last))
+            if source is not None and pair_hashes(source.path) != source_hashes:
                 raise ValueError("Source Corpus changed during extension")
-        hashes = {
-            "corpus.json": hashlib.sha256(corpus_path.read_bytes()).hexdigest(),
-            "blocks.parquet": hashlib.sha256(blocks_path.read_bytes()).hexdigest(),
-        }
+        hashes = pair_hashes(candidate_path)
+        receipt = _receipt(
+            operation=operation,
+            request=request,
+            path=destination,
+            source_id=source_id,
+            source_rows=source_rows,
+            reused=source_rows + reused_suffix,
+            acquired=request.last_block - suffix_first + 1 - reused_suffix,
+            anchor=anchor,
+            hashes=hashes,
+            samples=samples,
+            verifier=verifier_fact,
+        )
+        save_ready(hidden, candidate_path, receipt)
         with _publication_signals_blocked():
             publish(hidden, destination)
         progress({"event": "published", "corpus_id": str(request.corpus_id)})
-    prefix_rows = source.frame.height if source else 0
-    return _receipt(
-        operation="extend" if source else "acquire",
-        request=request,
-        path=destination,
-        source=source,
-        reused=prefix_rows + reused_suffix,
-        acquired=request.last_block - suffix_first + 1 - reused_suffix,
-        anchor=anchor,
-        hashes=hashes,
-        samples=samples,
-        verifier=verifier_fact,
-    )
+    return receipt
 
 
 async def verify_corpus(
@@ -194,30 +246,28 @@ async def verify_corpus(
     progress: Progress,
 ) -> dict[str, object]:
     corpus = load_corpus(path)
-    progress({"event": "local_valid", "rows": corpus.frame.height})
+    progress({"event": "local_valid", "rows": corpus.rows})
     sample_numbers = _sample_numbers(corpus.request, None)
-    numbers = list(range(corpus.request.first_block, corpus.request.last_block + 1)) if full_rpc else sample_numbers
+    numbers: Iterable[int] = range(corpus.request.first_block, corpus.request.last_block + 1) if full_rpc else sample_numbers
     samples: list[dict[str, object]]
     verifier_fact: dict[str, object] = {"mode": "local"}
     if rpc_url is None:
         if full_rpc:
             raise ValueError("--full-rpc requires --rpc-url or BLOCKWEAVER_RPC_URL")
-        samples = [_local_fact(corpus, number) for number in sample_numbers]
+        samples = [corpus.fact(number) for number in sample_numbers]
     else:
         async with Rpc(rpc_url, batch_size=batch_size, concurrency=concurrency) as rpc:
             chain_id = await rpc.chain_id()
             if chain_id != corpus.request.chain_id:
                 raise ValueError("RPC chain ID does not match the Corpus")
-            samples = await _check_samples(corpus, rpc, numbers, set(sample_numbers))
+            samples = await _check_samples(corpus, rpc, numbers, set(sample_numbers), contiguous=full_rpc)
             stored_anchor = (await rpc.blocks([corpus.anchor.block_number], chain_id=chain_id))[0]
             if stored_anchor.block_hash != corpus.anchor.block_hash:
                 raise ValueError("Stored finalized anchor no longer matches RPC")
-            fresh = await rpc.tagged_block("finalized", chain_id=chain_id)
-            if fresh.block_number < corpus.request.last_block:
-                raise ValueError("RPC finalized head does not cover the Corpus")
-            reread = (await rpc.blocks([fresh.block_number], chain_id=chain_id))[0]
-            if fresh != reread:
-                raise ValueError("Finalized tag changed during verification")
+            fresh = await rpc.finalized_block(chain_id=chain_id)
+            if fresh.block_number < corpus.anchor.block_number:
+                raise ValueError("RPC finalized head does not cover the stored finalized anchor")
+            await _connect_ancestry(stored_anchor, fresh, rpc, chain_id)
             verifier_fact = {
                 "mode": "full_rpc" if full_rpc else "sample_rpc",
                 "chain_id": chain_id,
@@ -228,8 +278,9 @@ async def verify_corpus(
         operation="verify",
         request=corpus.request,
         path=corpus.path,
-        source=None,
-        reused=corpus.frame.height,
+        source_id=None,
+        source_rows=0,
+        reused=corpus.rows,
         acquired=0,
         anchor=corpus.anchor,
         hashes=pair_hashes(corpus.path),
@@ -240,35 +291,25 @@ async def verify_corpus(
 
 async def _validate_source_boundary(source: LoadedCorpus, primary: Rpc, verifier: Rpc) -> Block:
     number = source.request.last_block
-    left, right = (
+    primary_block, verifier_block = (
         await primary.blocks([number], chain_id=source.request.chain_id),
         await verifier.blocks([number], chain_id=source.request.chain_id),
     )
-    if left[0] != right[0]:
+    if primary_block[0] != verifier_block[0]:
         raise ValueError("RPC endpoints disagree on the source boundary")
-    if left[0].durable_row() != _local_fact(source, number):
+    if primary_block[0].durable_row() != source.fact(number):
         raise ValueError("Source boundary does not match RPC")
-    return left[0]
+    return primary_block[0]
 
 
-async def _prove_finality(target: Block, primary: Rpc, verifier: Rpc, request: Request) -> tuple[Anchor, dict[str, object]]:
+async def _prove_finality(target: Block, verifier: Rpc, request: Request) -> tuple[Anchor, dict[str, object]]:
     verifier_target = (await verifier.blocks([target.block_number], chain_id=request.chain_id))[0]
     if target != verifier_target:
         raise ValueError("RPC endpoints disagree on the target block")
-    tagged = await verifier.tagged_block("finalized", chain_id=request.chain_id)
+    tagged = await verifier.finalized_block(chain_id=request.chain_id)
     if tagged.block_number < target.block_number:
         raise ValueError("Verifier finalized head does not cover the target")
-    previous = verifier_target
-    cursor = target.block_number + 1
-    while cursor <= tagged.block_number:
-        last = min(cursor + _CHECKPOINT_SIZE - 1, tagged.block_number)
-        segment = await verifier.blocks(range(cursor, last + 1), chain_id=request.chain_id)
-        validate_links(segment, previous)
-        previous = segment[-1]
-        cursor = last + 1
-    reread = (await verifier.blocks([tagged.block_number], chain_id=request.chain_id))[0]
-    if tagged != reread or previous != tagged:
-        raise ValueError("Finalized tag did not survive numbered reread")
+    await _connect_ancestry(verifier_target, tagged, verifier, request.chain_id)
     return Anchor(tagged.block_number, tagged.block_hash), {
         "chain_id": request.chain_id,
         "target_block_hash": target.block_hash,
@@ -277,38 +318,81 @@ async def _prove_finality(target: Block, primary: Rpc, verifier: Rpc, request: R
     }
 
 
-async def _check_samples(corpus: LoadedCorpus, rpc: Rpc, numbers: list[int], receipt_numbers: set[int] | None = None) -> list[dict[str, object]]:
+async def _validate_candidate_finality(corpus: LoadedCorpus, primary: Rpc, verifier: Rpc) -> dict[str, object]:
+    chain_id = corpus.request.chain_id
+    target = (await primary.blocks([corpus.request.last_block], chain_id=chain_id))[0]
+    verifier_target = (await verifier.blocks([target.block_number], chain_id=chain_id))[0]
+    if target != verifier_target:
+        raise ValueError("RPC endpoints disagree on the target block")
+    stored_anchor = (await verifier.blocks([corpus.anchor.block_number], chain_id=chain_id))[0]
+    if stored_anchor.block_hash != corpus.anchor.block_hash:
+        raise ValueError("Stored finalized anchor no longer matches RPC")
+    await _connect_ancestry(verifier_target, stored_anchor, verifier, chain_id)
+    fresh = await verifier.finalized_block(chain_id=chain_id)
+    if fresh.block_number < stored_anchor.block_number:
+        raise ValueError("Verifier finalized head does not cover the stored finalized anchor")
+    await _connect_ancestry(stored_anchor, fresh, verifier, chain_id)
+    return {
+        "chain_id": chain_id,
+        "target_block_hash": target.block_hash,
+        "finalized_block_number": fresh.block_number,
+        "finalized_block_hash": fresh.block_hash,
+        "recovered": True,
+    }
+
+
+async def _connect_ancestry(previous: Block, tagged: Block, rpc: Rpc, chain_id: int) -> None:
+    cursor = previous.block_number + 1
+    while cursor <= tagged.block_number:
+        last = min(cursor + _CHECKPOINT_SIZE - 1, tagged.block_number)
+        segment = await rpc.blocks(range(cursor, last + 1), chain_id=chain_id)
+        validate_links(segment, previous)
+        previous = segment[-1]
+        cursor = last + 1
+    reread = (await rpc.blocks([tagged.block_number], chain_id=chain_id))[0]
+    if tagged != reread or previous != tagged:
+        raise ValueError("Finalized tag did not survive numbered reread")
+
+
+async def _check_samples(
+    corpus: LoadedCorpus,
+    rpc: Rpc,
+    numbers: Iterable[int],
+    receipt_numbers: set[int] | None = None,
+    *,
+    contiguous: bool = False,
+) -> list[dict[str, object]]:
     facts: list[dict[str, object]] = []
-    contiguous = numbers == list(range(numbers[0], numbers[-1] + 1))
     previous: Block | None = None
-    for offset in range(0, len(numbers), _CHECKPOINT_SIZE):
-        remote = await rpc.blocks(numbers[offset : offset + _CHECKPOINT_SIZE], chain_id=corpus.request.chain_id)
+    iterator = iter(numbers)
+    while batch := list(islice(iterator, _CHECKPOINT_SIZE)):
+        remote = await rpc.blocks(batch, chain_id=corpus.request.chain_id)
+        local = corpus.facts(batch)
         if contiguous:
             validate_links(remote, previous)
             previous = remote[-1]
         for block in remote:
-            if block.durable_row() != _local_fact(corpus, block.block_number):
+            if block.durable_row() != local[block.block_number]:
                 raise ValueError(f"Corpus row {block.block_number} does not match RPC")
             if receipt_numbers is None or block.block_number in receipt_numbers:
                 facts.append({**block.durable_row(), "block_hash": block.block_hash})
     return facts
 
 
-def _local_fact(corpus: LoadedCorpus, number: int) -> dict[str, object]:
-    row = corpus.frame.row(number - corpus.request.first_block, named=True)
-    if row["block_number"] != number:
-        raise ValueError(f"Corpus row {number} is missing")
-    return {name: int(value) for name, value in row.items()}
-
-
-def _sample_numbers(request: Request, source: LoadedCorpus | None) -> list[int]:
+def _sample_numbers(request: Request, source_last: int | None) -> list[int]:
     selected = {request.first_block, request.last_block}
-    if source:
-        selected.update({source.request.last_block, source.request.last_block + 1})
-    width = request.last_block - request.first_block + 1
-    for counter in range(3):
-        digest = hashlib.sha256(request.corpus_id.bytes + bytes([counter])).digest()
-        selected.add(request.first_block + int.from_bytes(digest[:8], "big") % width)
+    if source_last is not None:
+        selected.update({source_last, source_last + 1})
+    blocked = sorted(number for number in selected if request.first_block < number < request.last_block)
+    available = request.last_block - request.first_block - 1 - len(blocked)
+    if available > 0:
+        seed = int.from_bytes(hashlib.sha256(request.corpus_id.bytes).digest()[:8], "big")
+        for offset in range(min(3, available)):
+            candidate = request.first_block + 1 + (seed + offset) % available
+            for boundary in blocked:
+                if candidate >= boundary:
+                    candidate += 1
+            selected.add(candidate)
     return sorted(selected)
 
 
@@ -317,7 +401,8 @@ def _receipt(
     operation: str,
     request: Request,
     path: Path,
-    source: LoadedCorpus | None,
+    source_id: UUID | None,
+    source_rows: int,
     reused: int,
     acquired: int,
     anchor: Anchor,
@@ -334,7 +419,7 @@ def _receipt(
         "first_block": request.first_block,
         "last_block": request.last_block,
         "rows": request.last_block - request.first_block + 1,
-        "source_rows": source.frame.height if source else 0,
+        "source_rows": source_rows,
         "reused_rows": reused,
         "acquired_rows": acquired,
         "finalized_anchor": anchor.document(),
@@ -342,8 +427,8 @@ def _receipt(
         "samples": samples,
         "verifier": verifier,
     }
-    if source:
-        receipt["source_corpus_id"] = str(source.request.corpus_id)
+    if source_id is not None:
+        receipt["source_corpus_id"] = str(source_id)
     return receipt
 
 

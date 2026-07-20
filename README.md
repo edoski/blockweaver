@@ -43,7 +43,7 @@ Acquisition checkpoints complete deterministic ranges under exactly:
 ROOT/corpora/.<UUID>/
 ```
 
-Running the same command resumes those checkpoints. A request with different range, chain, operation, or extension source is rejected. Publication validates the complete candidate and atomically renames the hidden directory to `ROOT/corpora/<UUID>/`. Existing destinations are never overwritten.
+Running the same command resumes those checkpoints. A request with different range, chain, operation, or extension source is rejected. Publication validates the complete candidate and atomically renames its ready directory to `ROOT/corpora/<UUID>/`. Existing destinations are never overwritten.
 
 ## Extend
 
@@ -61,6 +61,8 @@ Before publication, both endpoints must agree with the source boundary, the firs
 ## Verify
 
 Every verification performs full local validation, including exact filenames, JSON shape, Parquet schema, row count, order, domains, and timestamps.
+
+Existing ETH and AVAX FABLE Corpus directories that match the durable contract below can be verified directly. Verification reads the pair in place and needs no FABLE imports or acquisition code.
 
 ```console
 blockweaver verify ./data/corpora/11111111-1111-4111-8111-111111111111

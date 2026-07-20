@@ -6,11 +6,27 @@ from typing import Annotated, Any
 from uuid import UUID
 
 import typer
+from typer._click.exceptions import ClickException, Exit
+from typer.core import TyperGroup
 
 from ._build import acquire_corpus, extend_corpus, verify_corpus
 from ._contract import Request
 
-app = typer.Typer(no_args_is_help=True, add_completion=False, pretty_exceptions_enable=False)
+
+class MachineGroup(TyperGroup):
+    def main(self, *args: Any, **kwargs: Any) -> Any:
+        kwargs["standalone_mode"] = False
+        try:
+            result = super().main(*args, **kwargs)
+            if isinstance(result, int) and result:
+                raise Exit(result)
+            return result
+        except ClickException as error:
+            _progress({"event": "error", "message": error.format_message()})
+            raise Exit(error.exit_code) from None
+
+
+app = typer.Typer(cls=MachineGroup, no_args_is_help=True, add_completion=False, pretty_exceptions_enable=False)
 
 RpcUrl = Annotated[str, typer.Option(envvar="BLOCKWEAVER_RPC_URL")]
 VerifyRpcUrl = Annotated[str, typer.Option(envvar="BLOCKWEAVER_VERIFY_RPC_URL")]
@@ -84,7 +100,7 @@ def verify(
     corpus: Path,
     *,
     rpc_url: OptionalRpcUrl = None,
-    full_rpc: Annotated[bool, typer.Option()] = False,
+    full_rpc: Annotated[bool, typer.Option("--full-rpc")] = False,
     batch_size: Annotated[int, typer.Option(min=1)] = 20,
     concurrency: Annotated[int, typer.Option(min=1)] = 6,
 ) -> None:
