@@ -1,0 +1,52 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "blockweaver"
+version = "0.1.0"
+description = "Acquire and verify immutable EVM block corpora."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11"
+authors = [{ name = "Edoardo S." }]
+dependencies = [
+  "aiohttp>=3.12,<4",
+  "filelock>=3.18,<4",
+  "polars>=1.31,<2",
+  "typer>=0.16,<1",
+]
+
+[project.urls]
+Repository = "https://github.com/edoski/blockweaver"
+Issues = "https://github.com/edoski/blockweaver/issues"
+
+[project.scripts]
+blockweaver = "blockweaver.cli:app"
+
+[dependency-groups]
+dev = [
+  "pyright>=1.1.403,<2",
+  "pytest>=8.4,<9",
+  "ruff>=0.12,<1",
+  "vulture>=2.14,<3",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/blockweaver"]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 160
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+
+[tool.pyright]
+include = ["src", "tests"]
+pythonVersion = "3.11"
+typeCheckingMode = "standard"
