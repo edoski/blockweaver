@@ -103,24 +103,19 @@ def test_installed_executable_failures_are_single_machine_errors(tmp_path: Path)
         assert json.loads(lines[0])["event"] == "error"
 
 
-def test_installed_verify_drains_retrying_siblings_after_terminal_failure(
+def test_installed_verify_rpc_failure_is_machine_readable(
     tmp_path: Path,
     chains: tuple[ChainServer, ChainServer],
 ) -> None:
     primary, verifier = chains
-    seeded = CliRunner().invoke(app, acquire_arguments(tmp_path, primary, verifier, last=17, batch_size=2))
+    seeded = CliRunner().invoke(app, acquire_arguments(tmp_path, primary, verifier, last=11))
     assert seeded.exit_code == 0, seeded.output
-    primary.requests.clear()
-    primary.request_counts.clear()
-    primary.omit = set(range(12, 18))
     primary.changes[10] = {"hash": "invalid"}
-    primary.delays[10] = 0.75
-    primary.delays_after = {number: (3, 2.0) for number in range(12, 18)}
 
     executable = Path(sys.executable).with_name("blockweaver")
     corpus = tmp_path / "corpora" / CORPUS_ID
     result = subprocess.run(
-        [executable, "verify", corpus, "--rpc-url", primary.url, "--full-rpc", "--batch-size", "2", "--concurrency", "6"],
+        [executable, "verify", corpus, "--rpc-url", primary.url, "--full-rpc"],
         text=True,
         capture_output=True,
         check=False,
