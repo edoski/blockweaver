@@ -4,15 +4,20 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import time
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from itertools import islice
 from pathlib import Path
-from typing import Literal
+from typing import Literal, cast
 from uuid import UUID
+
+import polars as pl
+from google.cloud import bigquery
 
 from ._contract import Anchor, Block, Request, validate_links
 from ._corpus import (
+    FINAL_SCHEMA,
     LoadedCorpus,
     checkpoint_paths,
     corpus_path,
@@ -34,6 +39,65 @@ from ._rpc import Rpc
 Progress = Callable[[dict[str, object]], None]
 Publication = Callable[[Literal["publishing", "committed"]], None]
 _CHECKPOINT_SIZE = 1024
+_AVALANCHE_CHAIN_ID = 43_114
+_AVALANCHE_DATASET = "bigquery-public-data.goog_blockchain_avalanche_contract_chain_us"
+_AVALANCHE_QUERY = f"""
+WITH requested_blocks AS (
+  SELECT block_number, block_timestamp, block_hash, parent_hash, base_fee_per_gas, gas_used, gas_limit
+  FROM `{_AVALANCHE_DATASET}.blocks`
+  WHERE block_timestamp >= TIMESTAMP_SECONDS(@first_timestamp)
+    AND block_timestamp < TIMESTAMP_SECONDS(@after_timestamp)
+    AND block_number BETWEEN @first_block AND @last_block
+),
+requested_receipts AS (
+  SELECT block_hash, transaction_index, gas_used, effective_gas_price
+  FROM `{_AVALANCHE_DATASET}.receipts`
+  WHERE block_timestamp >= TIMESTAMP_SECONDS(@first_timestamp)
+    AND block_timestamp < TIMESTAMP_SECONDS(@after_timestamp)
+),
+weighted AS (
+  SELECT
+    b.block_number,
+    r.transaction_index,
+    r.gas_used,
+    r.effective_gas_price - b.base_fee_per_gas AS priority_fee,
+    b.gas_used AS block_gas_used,
+    COUNT(*) OVER (PARTITION BY b.block_number) AS tx_count,
+    SUM(r.gas_used) OVER (PARTITION BY b.block_number) AS receipt_gas_used,
+    SUM(r.gas_used) OVER (
+      PARTITION BY b.block_number
+      ORDER BY r.effective_gas_price - b.base_fee_per_gas, r.transaction_index
+      ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+    ) AS cumulative_gas_used
+  FROM requested_blocks AS b
+  JOIN requested_receipts AS r USING (block_hash)
+),
+fees AS (
+  SELECT
+    block_number,
+    ANY_VALUE(tx_count) AS tx_count,
+    ANY_VALUE(receipt_gas_used) AS receipt_gas_used,
+    ARRAY_AGG(priority_fee ORDER BY priority_fee, transaction_index LIMIT 1)[OFFSET(0)] AS priority_fee_p50
+  FROM weighted
+  WHERE cumulative_gas_used >= DIV(block_gas_used, 2)
+  GROUP BY block_number
+)
+SELECT
+  b.block_number,
+  UNIX_SECONDS(b.block_timestamp) AS timestamp,
+  {_AVALANCHE_CHAIN_ID} AS chain_id,
+  b.base_fee_per_gas,
+  b.gas_used,
+  b.gas_limit,
+  COALESCE(f.tx_count, 0) AS tx_count,
+  COALESCE(f.receipt_gas_used, 0) AS receipt_gas_used,
+  COALESCE(f.priority_fee_p50, 0) AS effective_priority_fee_per_gas_p50,
+  b.block_hash,
+  b.parent_hash
+FROM requested_blocks AS b
+LEFT JOIN fees AS f USING (block_number)
+ORDER BY block_number
+"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -125,30 +189,152 @@ async def enrich_corpus(
                     for (first, last), fees in zip(group, results, strict=True):
                         priority_fees.extend(fees)
                         progress({"event": "priority_fees", "first_block": first, "last_block": last})
-            candidate_path = hidden / "ready"
-            write_enriched_candidate(candidate_path, source, request, priority_fees)
-            candidate = load_corpus(candidate_path)
-            samples = [candidate.fact(number) for number in _sample_numbers(request, None)]
-            receipt = _receipt(
-                operation="enrich",
-                request=request,
-                path=destination,
-                source_id=source.request.corpus_id,
-                source_rows=source.rows,
-                reused=source.rows,
-                acquired=0,
-                anchor=source.anchor,
-                hashes=pair_hashes(candidate_path),
-                samples=samples,
-                verifier={"mode": "fee_history", "chain_id": request.chain_id},
+            return _publish_enrichment(
+                hidden,
+                destination,
+                source,
+                request,
+                priority_fees,
+                None,
+                source.anchor,
+                "enrich",
+                {"mode": "fee_history", "chain_id": request.chain_id},
+                progress,
+                publication,
             )
-            publication("publishing")
-            publish(hidden, destination)
-            publication("committed")
-            progress({"event": "published", "corpus_id": str(corpus_id)})
-            return receipt
         finally:
             discard_work(hidden)
+
+
+async def enrich_avalanche_bigquery(
+    source_path: Path,
+    *,
+    storage_root: Path,
+    corpus_id: UUID,
+    last_block: int,
+    gcp_project: str,
+    maximum_bytes_billed: int,
+    rpc_url: str,
+    progress: Progress,
+    publication: Publication,
+) -> dict[str, object]:
+    source = load_enrichment_source(source_path)
+    if source.request.chain_id != _AVALANCHE_CHAIN_ID:
+        raise ValueError("BigQuery enrichment requires an Avalanche C-Chain Corpus")
+    if corpus_id == source.request.corpus_id:
+        raise ValueError("Enrichment requires a new corpus_id")
+    if last_block < source.request.last_block:
+        raise ValueError("last_block must not precede the source endpoint")
+
+    request = Request(corpus_id, _AVALANCHE_CHAIN_ID, source.request.first_block, last_block)
+    first_timestamp = cast(int, source.fact(source.request.first_block)["timestamp"])
+    source_last_timestamp = cast(int, source.fact(source.request.last_block)["timestamp"])
+    after_timestamp = source_last_timestamp + 1 if last_block == source.request.last_block else max(source_last_timestamp + 1, int(time.time()) + 1)
+    config = bigquery.QueryJobConfig(
+        maximum_bytes_billed=maximum_bytes_billed,
+        query_parameters=[
+            bigquery.ScalarQueryParameter("first_block", "INT64", request.first_block),
+            bigquery.ScalarQueryParameter("last_block", "INT64", request.last_block),
+            bigquery.ScalarQueryParameter("first_timestamp", "INT64", first_timestamp),
+            bigquery.ScalarQueryParameter("after_timestamp", "INT64", after_timestamp),
+        ],
+    )
+    destination = corpus_path(storage_root.resolve(), corpus_id)
+    with locked_work(storage_root.resolve(), corpus_id) as hidden:
+        try:
+            rows = bigquery.Client(project=gcp_project).query(_AVALANCHE_QUERY, job_config=config, location="US").result(page_size=10_000)
+            priority_fees: list[int] = []
+            suffix_rows: list[dict[str, object]] = []
+            target: Block | None = None
+            for expected, row in zip(range(request.first_block, request.last_block + 1), rows, strict=True):
+                values = dict(row.items())
+                if values["block_number"] != expected:
+                    raise ValueError("BigQuery did not return the requested contiguous range")
+                block_hash = str(values.pop("block_hash")).removeprefix("0x")
+                parent_hash = str(values.pop("parent_hash")).removeprefix("0x")
+                receipt_gas_used = values.pop("receipt_gas_used")
+                if receipt_gas_used != values["gas_used"]:
+                    raise ValueError(f"BigQuery receipts are incomplete for block {expected}")
+                if expected <= source.request.last_block:
+                    priority_fees.append(cast(int, values["effective_priority_fee_per_gas_p50"]))
+                else:
+                    suffix_rows.append(values)
+                if expected == request.last_block:
+                    target = Block(
+                        block_number=expected,
+                        block_hash=block_hash,
+                        parent_hash=parent_hash,
+                        timestamp=cast(int, values["timestamp"]),
+                        chain_id=_AVALANCHE_CHAIN_ID,
+                        base_fee_per_gas=cast(int, values["base_fee_per_gas"]),
+                        gas_used=cast(int, values["gas_used"]),
+                        gas_limit=cast(int, values["gas_limit"]),
+                        tx_count=cast(int, values["tx_count"]),
+                    )
+            assert target is not None
+            progress({"event": "bigquery_complete", "first_block": request.first_block, "last_block": request.last_block})
+
+            suffix = pl.DataFrame(suffix_rows, schema=FINAL_SCHEMA) if suffix_rows else None
+            anchor = source.anchor
+            verifier: dict[str, object] = {"mode": "bigquery", "project": gcp_project, "dataset": _AVALANCHE_DATASET}
+            if suffix is not None:
+                async with Rpc(rpc_url, batch_size=20, concurrency=6) as rpc:
+                    if await rpc.chain_id() != _AVALANCHE_CHAIN_ID:
+                        raise ValueError("RPC chain ID does not match Avalanche C-Chain")
+                    anchor, proof = await _prove_finality(target, rpc, request)
+                verifier = {**verifier, **proof, "mode": "bigquery_rpc"}
+            return _publish_enrichment(
+                hidden,
+                destination,
+                source,
+                request,
+                priority_fees,
+                suffix,
+                anchor,
+                "enrich-bigquery",
+                verifier,
+                progress,
+                publication,
+            )
+        finally:
+            discard_work(hidden)
+
+
+def _publish_enrichment(
+    hidden: Path,
+    destination: Path,
+    source: LoadedCorpus,
+    request: Request,
+    priority_fees: list[int],
+    suffix: pl.DataFrame | None,
+    anchor: Anchor,
+    operation: str,
+    verifier: dict[str, object],
+    progress: Progress,
+    publication: Publication,
+) -> dict[str, object]:
+    candidate_path = hidden / "ready"
+    write_enriched_candidate(candidate_path, source, request, priority_fees, suffix, anchor)
+    candidate = load_corpus(candidate_path)
+    source_last = source.request.last_block if suffix is not None else None
+    receipt = _receipt(
+        operation=operation,
+        request=request,
+        path=destination,
+        source_id=source.request.corpus_id,
+        source_rows=source.rows,
+        reused=source.rows,
+        acquired=request.last_block - source.request.last_block,
+        anchor=anchor,
+        hashes=pair_hashes(candidate_path),
+        samples=[candidate.fact(number) for number in _sample_numbers(request, source_last)],
+        verifier=verifier,
+    )
+    publication("publishing")
+    publish(hidden, destination)
+    publication("committed")
+    progress({"event": "published", "corpus_id": str(request.corpus_id)})
+    return receipt
 
 
 async def _verified_priority_fees(primary: Rpc, verifier: Rpc, first: int, last: int) -> list[int]:

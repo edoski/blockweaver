@@ -71,10 +71,11 @@ blockweaver enrich-bigquery ./data/corpora/11111111-1111-4111-8111-111111111111 
   --corpus-id 22222222-2222-4222-8222-222222222222 \
   --last-block 90818814 \
   --gcp-project fable-503220 \
-  --maximum-bytes-billed 200000000000
+  --maximum-bytes-billed 200000000000 \
+  --rpc-url "$BLOCKWEAVER_RPC_URL"
 ```
 
-The command uses Application Default Credentials and one partition-bounded query against `bigquery-public-data.goog_blockchain_avalanche_contract_chain_us`. `--maximum-bytes-billed` is a hard query limit, not a promise that Google will charge nothing; run it only in a project whose billing and free-tier state you have verified.
+The command uses Application Default Credentials and one partition-bounded query against `bigquery-public-data.goog_blockchain_avalanche_contract_chain_us`. It rejects incomplete receipt coverage and proves an appended target against the RPC finalized chain before publication. `--maximum-bytes-billed` is a hard query limit, not a promise that Google will charge nothing; run it only in a project whose billing and free-tier state you have verified.
 
 ## Extend
 

@@ -10,8 +10,7 @@ import typer
 from typer._click.exceptions import ClickException
 from typer.core import TyperGroup
 
-from ._bigquery import enrich_avalanche_bigquery
-from ._build import Publication, acquire_corpus, enrich_corpus, extend_corpus, verify_corpus
+from ._build import Publication, acquire_corpus, enrich_avalanche_bigquery, enrich_corpus, extend_corpus, verify_corpus
 from ._contract import Request
 
 
@@ -109,6 +108,7 @@ def enrich_bigquery(
     last_block: Annotated[int, typer.Option(min=0)],
     gcp_project: Annotated[str, typer.Option()],
     maximum_bytes_billed: Annotated[int, typer.Option(min=1)],
+    rpc_url: RpcUrl,
 ) -> None:
     """Enrich and optionally extend Avalanche through BigQuery."""
     _execute(
@@ -119,10 +119,11 @@ def enrich_bigquery(
             last_block=last_block,
             gcp_project=gcp_project,
             maximum_bytes_billed=maximum_bytes_billed,
+            rpc_url=rpc_url,
             progress=_progress,
             publication=publication,
         ),
-        [],
+        [rpc_url],
     )
 
 

@@ -17,7 +17,7 @@ import pytest
 from conftest import ChainServer
 from typer.testing import CliRunner
 
-from blockweaver import _bigquery
+from blockweaver import _build
 from blockweaver._rpc import Rpc
 from blockweaver.cli import app
 
@@ -102,14 +102,16 @@ def test_enrich_bigquery_preserves_source_facts_and_appends_avalanche_rows(
     query_rows = [
         {
             "block_number": number,
-            "timestamp": 1_800_000_000 + number,
+            "timestamp": 1_700_000_000 + number,
             "chain_id": 43_114,
-            "base_fee_per_gas": 2_000_000_000 + number,
-            "gas_used": 20_000_000 + number,
-            "gas_limit": 40_000_000,
-            "tx_count": number % 4,
+            "base_fee_per_gas": (2_000_000_000 if number <= 14 else 1_000_000_000) + number,
+            "gas_used": (20_000_000 if number <= 14 else 15_000_000) + number,
+            "gas_limit": 40_000_000 if number <= 14 else 30_000_000,
+            "tx_count": number % (4 if number <= 14 else 3),
+            "receipt_gas_used": (20_000_000 if number <= 14 else 15_000_000) + number,
             "effective_priority_fee_per_gas_p50": number * 1_000,
             "block_hash": f"0x{number + 1:064x}",
+            "parent_hash": f"0x{number:064x}",
         }
         for number in range(10, 17)
     ]
@@ -125,6 +127,7 @@ def test_enrich_bigquery_preserves_source_facts_and_appends_avalanche_rows(
 
     class FakeClient:
         instance: FakeClient
+        queries = 0
 
         def __init__(self, *, project: str) -> None:
             assert project == "fable-503220"
@@ -134,30 +137,40 @@ def test_enrich_bigquery_preserves_source_facts_and_appends_avalanche_rows(
             FakeClient.instance = self
 
         def query(self, query: str, *, job_config: Any, location: str) -> FakeJob:
+            FakeClient.queries += 1
             self.query_text = query
             self.job_config = job_config
             self.location = location
             return FakeJob()
 
-    monkeypatch.setattr(_bigquery.bigquery, "Client", FakeClient)
+    monkeypatch.setattr(_build.bigquery, "Client", FakeClient)
 
-    result = CliRunner().invoke(
-        app,
-        [
+    def arguments(corpus_id: str, rpc_url: str) -> list[str]:
+        return [
             "enrich-bigquery",
             str(source),
             "--storage-root",
             str(tmp_path),
             "--corpus-id",
-            ENRICHED_ID,
+            corpus_id,
             "--last-block",
             "16",
             "--gcp-project",
             "fable-503220",
             "--maximum-bytes-billed",
             "200000000000",
-        ],
-    )
+            "--rpc-url",
+            rpc_url,
+        ]
+
+    query_rows[0]["receipt_gas_used"] = 1
+    rejected = CliRunner().invoke(app, arguments(EXTENDED_ID, "http://unused"))
+    assert rejected.exit_code == 1
+    assert "receipts are incomplete for block 10" in rejected.stderr
+    query_rows[0]["receipt_gas_used"] = query_rows[0]["gas_used"]
+
+    with ChainServer(chain_id=43_114) as rpc:
+        result = CliRunner().invoke(app, arguments(ENRICHED_ID, rpc.url))
 
     assert result.exit_code == 0, result.output
     assert {path.name: path.read_bytes() for path in source.iterdir()} == source_before
@@ -169,11 +182,12 @@ def test_enrich_bigquery_preserves_source_facts_and_appends_avalanche_rows(
     assert frame.tail(2).select(legacy.columns).to_dicts() == [{name: row[name] for name in legacy.columns} for row in query_rows[-2:]]
     document = json.loads((destination / "corpus.json").read_text())
     assert document["request"]["definition"] == {"chain_id": 43_114, "first_block": 10, "last_block": 16}
-    assert document["finalized_anchor"] == {"block_number": 16, "block_hash": f"{17:064x}"}
+    assert document["finalized_anchor"] == {"block_number": 30, "block_hash": f"{31:064x}"}
     receipt = json.loads(result.stdout)
     assert receipt["operation"] == "enrich-bigquery"
     assert receipt["reused_rows"] == 5
     assert receipt["acquired_rows"] == 2
+    assert receipt["verifier"]["mode"] == "bigquery_rpc"
 
     client = FakeClient.instance
     assert client.location == "US"
@@ -190,6 +204,10 @@ def test_enrich_bigquery_preserves_source_facts_and_appends_avalanche_rows(
     last_timestamp = legacy["timestamp"].max()
     assert isinstance(last_timestamp, int)
     assert parameters["after_timestamp"] >= last_timestamp + 1
+
+    duplicate = CliRunner().invoke(app, arguments(ENRICHED_ID, "http://unused"))
+    assert duplicate.exit_code == 1
+    assert FakeClient.queries == 2
 
 
 def test_verify_exposes_only_the_positive_full_rpc_flag() -> None:
