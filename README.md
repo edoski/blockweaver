@@ -63,6 +63,19 @@ blockweaver enrich ./data/corpora/11111111-1111-4111-8111-111111111111 \
 
 Enrichment is a one-shot operation. It keeps no checkpoints or recovery state and uses the existing atomic publication boundary. Normal verification, loading, and extension reject the seven-column shape.
 
+Avalanche C-Chain history beyond Coreth's fee-history window can instead be rebuilt from Google's public Blockchain Analytics tables. This preserves the validated source's seven columns, reconstructs gas-used-weighted P50 from receipts, and optionally appends BigQuery block facts through `--last-block`.
+
+```console
+blockweaver enrich-bigquery ./data/corpora/11111111-1111-4111-8111-111111111111 \
+  --storage-root ./data \
+  --corpus-id 22222222-2222-4222-8222-222222222222 \
+  --last-block 90818814 \
+  --gcp-project fable-503220 \
+  --maximum-bytes-billed 200000000000
+```
+
+The command uses Application Default Credentials and one partition-bounded query against `bigquery-public-data.goog_blockchain_avalanche_contract_chain_us`. `--maximum-bytes-billed` is a hard query limit, not a promise that Google will charge nothing; run it only in a project whose billing and free-tier state you have verified.
+
 ## Extend
 
 Extension fully validates the source, copies its rows into a new Corpus, and acquires only the suffix. It never mutates, renames, deletes, or hard-links the source.

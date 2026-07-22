@@ -10,12 +10,14 @@ import signal
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 
 import polars as pl
 import pytest
 from conftest import ChainServer
 from typer.testing import CliRunner
 
+from blockweaver import _bigquery
 from blockweaver._rpc import Rpc
 from blockweaver.cli import app
 
@@ -55,14 +57,139 @@ def acquire_arguments(
     return arguments
 
 
-def test_cli_exposes_the_four_operations() -> None:
+def test_cli_exposes_the_operations() -> None:
     result = CliRunner().invoke(app, ["--help"])
 
     assert result.exit_code == 0
     assert "acquire" in result.stdout
     assert "enrich" in result.stdout
+    assert "enrich-bigquery" in result.stdout
     assert "extend" in result.stdout
     assert "verify" in result.stdout
+
+
+def test_enrich_bigquery_preserves_source_facts_and_appends_avalanche_rows(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with ChainServer(chain_id=43_114) as primary, ChainServer(chain_id=43_114) as verifier:
+        seeded = CliRunner().invoke(
+            app,
+            [
+                "acquire",
+                "--storage-root",
+                str(tmp_path),
+                "--corpus-id",
+                CORPUS_ID,
+                "--chain-id",
+                "43114",
+                "--first-block",
+                "10",
+                "--last-block",
+                "14",
+                "--rpc-url",
+                primary.url,
+                "--verify-rpc-url",
+                verifier.url,
+            ],
+        )
+    assert seeded.exit_code == 0, seeded.output
+    source = tmp_path / "corpora" / CORPUS_ID
+    legacy = pl.read_parquet(source / "blocks.parquet").drop("effective_priority_fee_per_gas_p50")
+    legacy.write_parquet(source / "blocks.parquet")
+    source_before = {path.name: path.read_bytes() for path in source.iterdir()}
+
+    query_rows = [
+        {
+            "block_number": number,
+            "timestamp": 1_800_000_000 + number,
+            "chain_id": 43_114,
+            "base_fee_per_gas": 2_000_000_000 + number,
+            "gas_used": 20_000_000 + number,
+            "gas_limit": 40_000_000,
+            "tx_count": number % 4,
+            "effective_priority_fee_per_gas_p50": number * 1_000,
+            "block_hash": f"0x{number + 1:064x}",
+        }
+        for number in range(10, 17)
+    ]
+
+    class FakeRows:
+        def __iter__(self):
+            return iter(query_rows)
+
+    class FakeJob:
+        def result(self, *, page_size: int) -> FakeRows:
+            assert page_size == 10_000
+            return FakeRows()
+
+    class FakeClient:
+        instance: FakeClient
+
+        def __init__(self, *, project: str) -> None:
+            assert project == "fable-503220"
+            self.query_text = ""
+            self.job_config: Any = None
+            self.location = ""
+            FakeClient.instance = self
+
+        def query(self, query: str, *, job_config: Any, location: str) -> FakeJob:
+            self.query_text = query
+            self.job_config = job_config
+            self.location = location
+            return FakeJob()
+
+    monkeypatch.setattr(_bigquery.bigquery, "Client", FakeClient)
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "enrich-bigquery",
+            str(source),
+            "--storage-root",
+            str(tmp_path),
+            "--corpus-id",
+            ENRICHED_ID,
+            "--last-block",
+            "16",
+            "--gcp-project",
+            "fable-503220",
+            "--maximum-bytes-billed",
+            "200000000000",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert {path.name: path.read_bytes() for path in source.iterdir()} == source_before
+    destination = tmp_path / "corpora" / ENRICHED_ID
+    assert {path.name for path in destination.iterdir()} == {"blocks.parquet", "corpus.json"}
+    frame = pl.read_parquet(destination / "blocks.parquet")
+    assert frame.head(5).select(legacy.columns).equals(legacy)
+    assert frame["effective_priority_fee_per_gas_p50"].to_list() == [number * 1_000 for number in range(10, 17)]
+    assert frame.tail(2).select(legacy.columns).to_dicts() == [{name: row[name] for name in legacy.columns} for row in query_rows[-2:]]
+    document = json.loads((destination / "corpus.json").read_text())
+    assert document["request"]["definition"] == {"chain_id": 43_114, "first_block": 10, "last_block": 16}
+    assert document["finalized_anchor"] == {"block_number": 16, "block_hash": f"{17:064x}"}
+    receipt = json.loads(result.stdout)
+    assert receipt["operation"] == "enrich-bigquery"
+    assert receipt["reused_rows"] == 5
+    assert receipt["acquired_rows"] == 2
+
+    client = FakeClient.instance
+    assert client.location == "US"
+    assert "cumulative_gas_used >= DIV(block_gas_used, 2)" in client.query_text
+    assert client.query_text.count("block_timestamp >= TIMESTAMP_SECONDS(@first_timestamp)") == 2
+    assert client.query_text.count("block_timestamp < TIMESTAMP_SECONDS(@after_timestamp)") == 2
+    config = client.job_config
+    assert config is not None
+    assert config.maximum_bytes_billed == 200_000_000_000
+    parameters = {parameter.name: parameter.value for parameter in config.query_parameters}
+    assert parameters["first_block"] == 10
+    assert parameters["last_block"] == 16
+    assert parameters["first_timestamp"] == legacy["timestamp"].min()
+    last_timestamp = legacy["timestamp"].max()
+    assert isinstance(last_timestamp, int)
+    assert parameters["after_timestamp"] >= last_timestamp + 1
 
 
 def test_verify_exposes_only_the_positive_full_rpc_flag() -> None:

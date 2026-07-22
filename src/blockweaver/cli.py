@@ -10,6 +10,7 @@ import typer
 from typer._click.exceptions import ClickException
 from typer.core import TyperGroup
 
+from ._bigquery import enrich_avalanche_bigquery
 from ._build import Publication, acquire_corpus, enrich_corpus, extend_corpus, verify_corpus
 from ._contract import Request
 
@@ -96,6 +97,32 @@ def enrich(
             publication=publication,
         ),
         [rpc_url, verify_rpc_url],
+    )
+
+
+@app.command("enrich-bigquery")
+def enrich_bigquery(
+    source_corpus: Path,
+    *,
+    storage_root: Annotated[Path, typer.Option()],
+    corpus_id: Annotated[UUID, typer.Option()],
+    last_block: Annotated[int, typer.Option(min=0)],
+    gcp_project: Annotated[str, typer.Option()],
+    maximum_bytes_billed: Annotated[int, typer.Option(min=1)],
+) -> None:
+    """Enrich and optionally extend Avalanche through BigQuery."""
+    _execute(
+        lambda publication: enrich_avalanche_bigquery(
+            source_corpus,
+            storage_root=storage_root,
+            corpus_id=corpus_id,
+            last_block=last_block,
+            gcp_project=gcp_project,
+            maximum_bytes_billed=maximum_bytes_billed,
+            progress=_progress,
+            publication=publication,
+        ),
+        [],
     )
 
 

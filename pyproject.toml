@@ -12,6 +12,7 @@ requires-python = ">=3.11"
 authors = [{ name = "Edoardo S." }]
 dependencies = [
   "aiohttp>=3.12,<4",
+  "google-cloud-bigquery>=3.38,<4",
   "polars>=1.31,<2",
   "typer>=0.16,<1",
 ]

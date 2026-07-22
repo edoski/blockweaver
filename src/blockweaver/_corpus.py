@@ -198,10 +198,19 @@ def write_candidate(
     _write_candidate(candidate, request, anchor, pl.concat(scans, how="vertical"))
 
 
-def write_enriched_candidate(candidate: Path, source: LoadedCorpus, request: Request, priority_fees: list[int]) -> None:
+def write_enriched_candidate(
+    candidate: Path,
+    source: LoadedCorpus,
+    request: Request,
+    priority_fees: list[int],
+    suffix: pl.DataFrame | None = None,
+    anchor: Anchor | None = None,
+) -> None:
     priority_fee = pl.Series("effective_priority_fee_per_gas_p50", priority_fees, dtype=pl.Int64)
     frame = pl.scan_parquet(source.blocks_path).with_columns(priority_fee).select(FINAL_COLUMNS)
-    _write_candidate(candidate, request, source.anchor, frame)
+    if suffix is not None:
+        frame = pl.concat([frame, suffix.lazy().select(FINAL_COLUMNS)], how="vertical")
+    _write_candidate(candidate, request, anchor or source.anchor, frame)
 
 
 def _write_candidate(candidate: Path, request: Request, anchor: Anchor, frame: pl.LazyFrame) -> None:
