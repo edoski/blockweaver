@@ -157,6 +157,11 @@ async def _verified_priority_fees(primary: Rpc, verifier: Rpc, first: int, last:
         verifier.priority_fees(first, last),
     )
     if fees != verified:
+        fees, verified = await asyncio.gather(
+            primary.priority_fees(first, last),
+            verifier.priority_fees(first, last),
+        )
+    if fees != verified:
         raise ValueError("RPC endpoints disagree on priority fee P50")
     return fees
 
