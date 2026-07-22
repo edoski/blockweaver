@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
@@ -116,10 +117,14 @@ async def enrich_corpus(
                     raise ValueError("RPC chain ID does not match the Corpus request")
                 for first in range(request.first_block, request.last_block + 1, _CHECKPOINT_SIZE):
                     last = min(first + _CHECKPOINT_SIZE - 1, request.last_block)
-                    fees = await primary.priority_fees(first, last)
-                    if fees != await verifier.priority_fees(first, last):
+                    fees, verified = await asyncio.gather(
+                        primary.priority_fees(first, last),
+                        verifier.priority_fees(first, last),
+                    )
+                    if fees != verified:
                         raise ValueError("RPC endpoints disagree on priority fee P50")
                     priority_fees.extend(fees)
+                    progress({"event": "priority_fees", "first_block": first, "last_block": last})
             candidate_path = hidden / "ready"
             write_enriched_candidate(candidate_path, source, request, priority_fees)
             candidate = load_corpus(candidate_path)
