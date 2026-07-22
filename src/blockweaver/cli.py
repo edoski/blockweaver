@@ -10,7 +10,7 @@ import typer
 from typer._click.exceptions import ClickException
 from typer.core import TyperGroup
 
-from ._build import Publication, acquire_corpus, extend_corpus, verify_corpus
+from ._build import Publication, acquire_corpus, enrich_corpus, extend_corpus, verify_corpus
 from ._contract import Request
 
 
@@ -60,6 +60,34 @@ def acquire(
         lambda publication: acquire_corpus(
             request,
             storage_root=storage_root,
+            rpc_url=rpc_url,
+            verify_rpc_url=verify_rpc_url,
+            batch_size=batch_size,
+            concurrency=concurrency,
+            progress=_progress,
+            publication=publication,
+        ),
+        [rpc_url, verify_rpc_url],
+    )
+
+
+@app.command()
+def enrich(
+    source_corpus: Path,
+    *,
+    storage_root: Annotated[Path, typer.Option()],
+    corpus_id: Annotated[UUID, typer.Option()],
+    rpc_url: RpcUrl,
+    verify_rpc_url: VerifyRpcUrl,
+    batch_size: Annotated[int, typer.Option(min=1)] = 20,
+    concurrency: Annotated[int, typer.Option(min=1)] = 6,
+) -> None:
+    """Add priority-fee P50 to a validated seven-column Corpus."""
+    _execute(
+        lambda publication: enrich_corpus(
+            source_corpus,
+            storage_root=storage_root,
+            corpus_id=corpus_id,
             rpc_url=rpc_url,
             verify_rpc_url=verify_rpc_url,
             batch_size=batch_size,

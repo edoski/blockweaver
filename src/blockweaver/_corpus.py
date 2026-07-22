@@ -8,7 +8,7 @@ import json
 import os
 import re
 import shutil
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -19,7 +19,7 @@ import polars as pl
 
 from ._contract import Anchor, Block, Request, validate_links
 
-FINAL_COLUMNS = [
+LEGACY_COLUMNS = [
     "block_number",
     "timestamp",
     "chain_id",
@@ -28,6 +28,8 @@ FINAL_COLUMNS = [
     "gas_limit",
     "tx_count",
 ]
+FINAL_COLUMNS = [*LEGACY_COLUMNS, "effective_priority_fee_per_gas_p50"]
+LEGACY_SCHEMA = {name: pl.Int64 for name in LEGACY_COLUMNS}
 FINAL_SCHEMA = {name: pl.Int64 for name in FINAL_COLUMNS}
 CHECKPOINT_SCHEMA = {
     **FINAL_SCHEMA,
@@ -157,10 +159,11 @@ def checkpoint_paths(chunks: Path, request: Request, size: int) -> tuple[list[Pa
     return valid, expected, previous
 
 
-def write_checkpoint(path: Path, blocks: list[Block]) -> None:
+def write_checkpoint(path: Path, blocks: list[Block], priority_fees: list[int]) -> None:
     temporary = path.with_suffix(".parquet.tmp")
     try:
-        frame = pl.DataFrame([item.checkpoint_row() for item in blocks], schema=CHECKPOINT_SCHEMA)
+        rows = [block.checkpoint_row(priority_fee) for block, priority_fee in zip(blocks, priority_fees, strict=True)]
+        frame = pl.DataFrame(rows, schema=CHECKPOINT_SCHEMA)
         frame.write_parquet(temporary, compression="zstd", row_group_size=4096)
         _fsync_file(temporary)
         os.replace(temporary, path)
@@ -176,7 +179,8 @@ def read_checkpoint(path: Path, chain_id: int) -> list[Block]:
         raise ValueError(f"Unreadable checkpoint: {path.name}") from error
     if frame.schema != CHECKPOINT_SCHEMA or frame.null_count().row(0) != (0,) * len(CHECKPOINT_SCHEMA):
         raise ValueError("Invalid checkpoint schema")
-    blocks = [Block(**row) for row in frame.iter_rows(named=True)]
+    block_columns = [*LEGACY_COLUMNS, "block_hash", "parent_hash"]
+    blocks = [Block(**{name: row[name] for name in block_columns}) for row in frame.iter_rows(named=True)]
     if any(re.fullmatch(r"[0-9a-f]{64}", value) is None for item in blocks for value in (item.block_hash, item.parent_hash)):
         raise ValueError("Invalid checkpoint hash")
     if any(item.chain_id != chain_id for item in blocks) or not blocks:
@@ -190,19 +194,40 @@ def write_candidate(
     anchor: Anchor,
     sources: list[Path],
 ) -> None:
+    scans = [pl.scan_parquet(path).select(FINAL_COLUMNS) for path in sources]
+    _write_candidate(candidate, request, anchor, pl.concat(scans, how="vertical"))
+
+
+def write_enriched_candidate(candidate: Path, source: LoadedCorpus, request: Request, priority_fees: list[int]) -> None:
+    priority_fee = pl.Series("effective_priority_fee_per_gas_p50", priority_fees, dtype=pl.Int64)
+    frame = pl.scan_parquet(source.blocks_path).with_columns(priority_fee).select(FINAL_COLUMNS)
+    _write_candidate(candidate, request, source.anchor, frame)
+
+
+def _write_candidate(candidate: Path, request: Request, anchor: Anchor, frame: pl.LazyFrame) -> None:
     candidate.mkdir()
-    corpus_path = candidate / "corpus.json"
     blocks_path = candidate / "blocks.parquet"
     temporary = candidate / "blocks.parquet.tmp"
-    scans = [pl.scan_parquet(path).select(FINAL_COLUMNS) for path in sources]
-    pl.concat(scans, how="vertical").sink_parquet(temporary, compression="zstd", row_group_size=4096, maintain_order=True)
+    frame.sink_parquet(temporary, compression="zstd", row_group_size=4096, maintain_order=True)
     _fsync_file(temporary)
     os.replace(temporary, blocks_path)
-    _write_json(corpus_path, {"request": request.document(), "finalized_anchor": anchor.document()})
+    _write_json(candidate / "corpus.json", {"request": request.document(), "finalized_anchor": anchor.document()})
     _fsync_directory(candidate)
 
 
 def load_corpus(path: Path) -> LoadedCorpus:
+    path, request, anchor = _load_corpus_pair(path)
+    rows = validate_blocks(path / "blocks.parquet", request)
+    return LoadedCorpus(path, request, anchor, rows)
+
+
+def load_enrichment_source(path: Path) -> LoadedCorpus:
+    path, request, anchor = _load_corpus_pair(path)
+    rows = _validate_blocks(path / "blocks.parquet", request, LEGACY_SCHEMA)
+    return LoadedCorpus(path, request, anchor, rows)
+
+
+def _load_corpus_pair(path: Path) -> tuple[Path, Request, Anchor]:
     path = path.resolve()
     if not path.is_dir():
         raise ValueError(f"Corpus directory does not exist: {path}")
@@ -213,15 +238,27 @@ def load_corpus(path: Path) -> LoadedCorpus:
     except (OSError, json.JSONDecodeError) as error:
         raise ValueError("Invalid corpus.json") from error
     request, anchor = _parse_document(document)
-    rows = validate_blocks(path / "blocks.parquet", request)
     if anchor.block_number < request.last_block:
         raise ValueError("Finalized anchor precedes the Corpus")
-    return LoadedCorpus(path, request, anchor, rows)
+    return path, request, anchor
 
 
 def validate_blocks(path: Path, request: Request) -> int:
+    return _validate_blocks(path, request, FINAL_SCHEMA)
+
+
+def _validate_blocks(
+    path: Path,
+    request: Request,
+    expected_schema: Mapping[str, type[pl.DataType]],
+) -> int:
     try:
         schema = pl.read_parquet_schema(path)
+    except Exception as error:
+        raise ValueError("Invalid blocks.parquet") from error
+    if schema != expected_schema:
+        raise ValueError("blocks.parquet has a noncanonical schema")
+    try:
         scan = pl.scan_parquet(path)
         invalid = (
             (pl.col("chain_id") != request.chain_id)
@@ -232,6 +269,8 @@ def validate_blocks(path: Path, request: Request) -> int:
             | (pl.col("gas_used") > pl.col("gas_limit"))
             | (pl.col("tx_count") < 0)
         )
+        if "effective_priority_fee_per_gas_p50" in expected_schema:
+            invalid |= pl.col("effective_priority_fee_per_gas_p50") < 0
         summary = (
             scan.select(
                 pl.len().alias("rows"),
@@ -240,15 +279,13 @@ def validate_blocks(path: Path, request: Request) -> int:
                 (pl.col("block_number").diff() != 1).fill_null(False).any().alias("gaps"),
                 (pl.col("timestamp").diff() < 0).fill_null(False).any().alias("time_decreases"),
                 invalid.any().alias("invalid"),
-                pl.sum_horizontal(*(pl.col(name).null_count() for name in FINAL_COLUMNS)).alias("nulls"),
+                pl.sum_horizontal(*(pl.col(name).null_count() for name in expected_schema)).alias("nulls"),
             )
             .collect(engine="streaming")
             .row(0, named=True)
         )
     except Exception as error:
         raise ValueError("Invalid blocks.parquet") from error
-    if schema != FINAL_SCHEMA:
-        raise ValueError("blocks.parquet has a noncanonical schema")
     if summary["nulls"]:
         raise ValueError("blocks.parquet contains nulls")
     expected_rows = request.last_block - request.first_block + 1

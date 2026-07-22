@@ -37,6 +37,8 @@ blockweaver acquire \
 
 `--rpc-url` and `--verify-rpc-url` override the environment. `--batch-size` defaults to 20 and `--concurrency` to 6. The caller must supply a UUID4; Blockweaver never mints one.
 
+Block headers supply the existing block facts. Batched `eth_feeHistory(blockCount, newestBlock, [50])` calls supply `effective_priority_fee_per_gas_p50`. Blockweaver requires the requested `oldestBlock` and one P50 reward value for every block. It does not use the response's `baseFeePerGas` length.
+
 Acquisition checkpoints complete deterministic ranges under exactly:
 
 ```text
@@ -46,6 +48,20 @@ ROOT/corpora/.<UUID>/
 Running the same command resumes those checkpoints. A request with different range, chain, operation, or extension source is rejected. Publication validates the complete candidate and atomically renames its ready directory to `ROOT/corpora/<UUID>/`. Existing destinations are never overwritten.
 
 The destination rename plus parent-directory sync is the commit boundary. A SIGINT during that short publication transition is deferred so a committed command can emit its receipt.
+
+## Enrich
+
+`enrich` is the only command that accepts the former exact seven-column Blockweaver Corpus. It validates that source, copies its seven facts without block RPC reads, acquires P50 for the same inclusive range from independent primary and verifier endpoints, and publishes an eight-column Corpus under a new UUID. The source is only read and remains unchanged.
+
+```console
+blockweaver enrich ./data/corpora/11111111-1111-4111-8111-111111111111 \
+  --storage-root ./data \
+  --corpus-id 22222222-2222-4222-8222-222222222222 \
+  --rpc-url "$BLOCKWEAVER_RPC_URL" \
+  --verify-rpc-url "$BLOCKWEAVER_VERIFY_RPC_URL"
+```
+
+Enrichment is a one-shot operation. It keeps no checkpoints or recovery state and uses the existing atomic publication boundary. Normal verification, loading, and extension reject the seven-column shape.
 
 ## Extend
 
@@ -64,7 +80,7 @@ Before publication, both endpoints must agree with the source boundary, the firs
 
 Every verification performs full local validation, including exact filenames, JSON shape, Parquet schema, row count, order, domains, and timestamps.
 
-Existing ETH and AVAX FABLE Corpus directories that match the durable contract below can be verified directly. Verification reads the pair in place and needs no FABLE imports or acquisition code.
+Existing Corpus directories that match the durable eight-column contract below can be verified directly. Verification reads the pair in place and needs no FABLE imports or acquisition code.
 
 ```console
 blockweaver verify ./data/corpora/11111111-1111-4111-8111-111111111111
@@ -89,7 +105,7 @@ blocks.parquet
 {"finalized_anchor":{"block_hash":"0000000000000000000000000000000000000000000000000000000000000000","block_number":19001000},"request":{"corpus_id":"11111111-1111-4111-8111-111111111111","definition":{"chain_id":1,"first_block":19000000,"last_block":19000999}}}
 ```
 
-`blocks.parquet` has seven ordered, non-null `Int64` columns:
+`blocks.parquet` has exactly eight ordered, non-null `Int64` columns:
 
 | Column | Rule |
 | --- | --- |
@@ -100,6 +116,7 @@ blocks.parquet
 | `gas_used` | Between zero and `gas_limit` |
 | `gas_limit` | Positive gas |
 | `tx_count` | Nonnegative transaction count |
+| `effective_priority_fee_per_gas_p50` | Nonnegative gas-used-weighted P50 among included transactions, in wei/gas |
 
 ## Output and trust
 

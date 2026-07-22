@@ -60,6 +60,13 @@ class Rpc:
             replies.update(part)
         return [replies[call["id"]] for call in calls]
 
+    async def priority_fees(self, first_block: int, last_block: int) -> list[int]:
+        count = last_block - first_block + 1
+        call = self._calls("eth_feeHistory", [[hex(count), hex(last_block), [50]]])[0]
+        item_id = call["id"]
+        reply = await self._run([call], {item_id: lambda value: _parse_fee_history(value, first_block, count)})
+        return reply[item_id]
+
     async def finalized_block(self, *, chain_id: int) -> Block:
         call = self._calls("eth_getBlockByNumber", [["finalized", False]])[0]
         item_id = call["id"]
@@ -170,3 +177,16 @@ def _retry_after(value: str | None) -> float | None:
             return min(max(0.0, (when - datetime.now(UTC)).total_seconds()), 60.0)
         except (TypeError, ValueError):
             return None
+
+
+def _parse_fee_history(value: Any, first_block: int, count: int) -> list[int]:
+    if not isinstance(value, dict):
+        raise ValueError("Invalid fee history response shape")
+    if quantity(value.get("oldestBlock"), "fee history oldestBlock") != first_block:
+        raise ValueError("fee history oldestBlock does not match the requested range")
+    rewards = value.get("reward")
+    if not isinstance(rewards, list) or len(rewards) != count:
+        raise ValueError("fee history reward coverage does not match the requested range")
+    if any(not isinstance(row, list) or len(row) != 1 for row in rewards):
+        raise ValueError("fee history reward row must contain exactly P50")
+    return [quantity(row[0], "priority fee P50") for row in rewards]

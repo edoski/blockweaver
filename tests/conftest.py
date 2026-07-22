@@ -33,6 +33,8 @@ class ChainServer:
         self.delays_after: dict[int, tuple[int, float]] = {}
         self.reject_batches_larger_than: int | None = None
         self.wrong_id_once = False
+        self.priority_fees: dict[int, int] = {}
+        self.fee_history_changes: dict[str, Any] = {}
         state = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -50,6 +52,18 @@ class ChainServer:
                 replies = []
                 for call in calls:
                     params = call.get("params")
+                    if call.get("method") == "eth_feeHistory":
+                        count = int(params[0], 16)
+                        newest = int(params[1], 16)
+                        oldest = newest - count + 1
+                        result = {
+                            "oldestBlock": hex(oldest),
+                            "baseFeePerGas": [],
+                            "reward": [[hex(state.priority_fees.get(number, number * 100))] for number in range(oldest, newest + 1)],
+                            **state.fee_history_changes,
+                        }
+                        replies.append({"jsonrpc": "2.0", "id": call["id"], "result": result})
+                        continue
                     selector = params[0] if isinstance(params, list) and params else None
                     number = state.finalized if selector == "finalized" else int(selector, 16) if isinstance(selector, str) else -1
                     state.request_counts[number] = state.request_counts.get(number, 0) + 1

@@ -63,9 +63,12 @@ class Block:
             "tx_count": self.tx_count,
         }
 
-    def checkpoint_row(self) -> dict[str, int | str]:
+    def corpus_row(self, priority_fee_p50: int) -> dict[str, int]:
+        return {**self.durable_row(), "effective_priority_fee_per_gas_p50": priority_fee_p50}
+
+    def checkpoint_row(self, priority_fee_p50: int) -> dict[str, int | str]:
         return {
-            **self.durable_row(),
+            **self.corpus_row(priority_fee_p50),
             "block_hash": self.block_hash,
             "parent_hash": self.parent_hash,
         }
@@ -74,7 +77,10 @@ class Block:
 def quantity(value: Any, label: str) -> int:
     if not isinstance(value, str) or _QUANTITY.fullmatch(value) is None:
         raise ValueError(f"Invalid {label} quantity")
-    return int(value, 16)
+    parsed = int(value, 16)
+    if parsed > 2**63 - 1:
+        raise ValueError(f"{label} quantity exceeds signed Int64")
+    return parsed
 
 
 def block_hash(value: Any, label: str) -> str:
@@ -110,10 +116,6 @@ def parse_block(value: Any, *, expected: int, chain_id: int) -> Block:
     gas_limit = quantity(value["gasLimit"], "gas limit")
     if base_fee <= 0 or gas_limit <= 0 or gas_used > gas_limit:
         raise ValueError("Invalid fee or gas domain")
-    maximum = 2**63 - 1
-    numeric = (number, timestamp, chain_id, base_fee, gas_used, gas_limit, len(transactions))
-    if any(item > maximum for item in numeric):
-        raise ValueError("Block value exceeds signed Int64")
     return Block(
         block_number=number,
         block_hash=block_hash(value["hash"], "block hash"),

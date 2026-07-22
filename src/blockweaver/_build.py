@@ -1,4 +1,4 @@
-"""Acquire, extend, verify, and publish Corpus objects."""
+"""Acquire, enrich, extend, verify, and publish Corpus objects."""
 
 from __future__ import annotations
 
@@ -17,6 +17,7 @@ from ._corpus import (
     corpus_path,
     discard_work,
     load_corpus,
+    load_enrichment_source,
     locked_work,
     pair_hashes,
     prepare_work,
@@ -25,6 +26,7 @@ from ._corpus import (
     save_ready,
     write_candidate,
     write_checkpoint,
+    write_enriched_candidate,
 )
 from ._rpc import Rpc
 
@@ -82,6 +84,66 @@ async def extend_corpus(
         extension=ExtensionSource(corpus, source_hashes),
         publication=publication,
     )
+
+
+async def enrich_corpus(
+    source_path: Path,
+    *,
+    storage_root: Path,
+    corpus_id: UUID,
+    rpc_url: str,
+    verify_rpc_url: str,
+    batch_size: int,
+    concurrency: int,
+    progress: Progress,
+    publication: Publication,
+) -> dict[str, object]:
+    if rpc_url == verify_rpc_url:
+        raise ValueError("Primary and verifier RPC endpoints must be independent")
+    source = load_enrichment_source(source_path)
+    if corpus_id == source.request.corpus_id:
+        raise ValueError("Enrichment requires a new corpus_id")
+    request = Request(corpus_id, source.request.chain_id, source.request.first_block, source.request.last_block)
+    destination = corpus_path(storage_root.resolve(), corpus_id)
+    with locked_work(storage_root.resolve(), corpus_id) as hidden:
+        try:
+            priority_fees: list[int] = []
+            async with (
+                Rpc(rpc_url, batch_size=batch_size, concurrency=concurrency) as primary,
+                Rpc(verify_rpc_url, batch_size=batch_size, concurrency=concurrency) as verifier,
+            ):
+                if await primary.chain_id() != request.chain_id or await verifier.chain_id() != request.chain_id:
+                    raise ValueError("RPC chain ID does not match the Corpus request")
+                for first in range(request.first_block, request.last_block + 1, _CHECKPOINT_SIZE):
+                    last = min(first + _CHECKPOINT_SIZE - 1, request.last_block)
+                    fees = await primary.priority_fees(first, last)
+                    if fees != await verifier.priority_fees(first, last):
+                        raise ValueError("RPC endpoints disagree on priority fee P50")
+                    priority_fees.extend(fees)
+            candidate_path = hidden / "ready"
+            write_enriched_candidate(candidate_path, source, request, priority_fees)
+            candidate = load_corpus(candidate_path)
+            samples = [candidate.fact(number) for number in _sample_numbers(request, None)]
+            receipt = _receipt(
+                operation="enrich",
+                request=request,
+                path=destination,
+                source_id=source.request.corpus_id,
+                source_rows=source.rows,
+                reused=source.rows,
+                acquired=0,
+                anchor=source.anchor,
+                hashes=pair_hashes(candidate_path),
+                samples=samples,
+                verifier={"mode": "fee_history", "chain_id": request.chain_id},
+            )
+            publication("publishing")
+            publish(hidden, destination)
+            publication("committed")
+            progress({"event": "published", "corpus_id": str(corpus_id)})
+            return receipt
+        finally:
+            discard_work(hidden)
 
 
 async def acquire_corpus(
@@ -142,9 +204,10 @@ async def acquire_corpus(
                     while next_block <= request.last_block:
                         last = min(next_block + _CHECKPOINT_SIZE - 1, request.last_block)
                         blocks = await primary.blocks(range(next_block, last + 1), chain_id=request.chain_id)
+                        priority_fees = await primary.priority_fees(next_block, last)
                         validate_links(blocks, previous or boundary)
                         path = work.chunks / f"{next_block:020d}-{last:020d}.parquet"
-                        write_checkpoint(path, blocks)
+                        write_checkpoint(path, blocks, priority_fees)
                         paths.append(path)
                         previous, next_block = blocks[-1], last + 1
                         progress({"event": "checkpoint", "first_block": blocks[0].block_number, "last_block": last})
@@ -247,7 +310,9 @@ async def _validate_source_boundary(source: LoadedCorpus, primary: Rpc, verifier
     )
     if primary_block[0] != verifier_block[0]:
         raise ValueError("RPC endpoints disagree on the source boundary")
-    if primary_block[0].durable_row() != source.fact(number):
+    source_fact = source.fact(number)
+    source_headers = {name: source_fact[name] for name in primary_block[0].durable_row()}
+    if primary_block[0].durable_row() != source_headers:
         raise ValueError("Source boundary does not match RPC")
     return primary_block[0]
 
@@ -322,15 +387,21 @@ async def _check_samples(
     iterator = iter(numbers)
     while batch := list(islice(iterator, _CHECKPOINT_SIZE)):
         remote = await rpc.blocks(batch, chain_id=corpus.request.chain_id)
+        if contiguous:
+            values = await rpc.priority_fees(batch[0], batch[-1])
+            priority_fees = dict(zip(batch, values, strict=True))
+        else:
+            priority_fees = {number: (await rpc.priority_fees(number, number))[0] for number in batch}
         local = corpus.facts(batch)
         if contiguous:
             validate_links(remote, previous)
             previous = remote[-1]
         for block in remote:
-            if block.durable_row() != local[block.block_number]:
+            durable = block.corpus_row(priority_fees[block.block_number])
+            if durable != local[block.block_number]:
                 raise ValueError(f"Corpus row {block.block_number} does not match RPC")
             if receipt_numbers is None or block.block_number in receipt_numbers:
-                facts.append({**block.durable_row(), "block_hash": block.block_hash})
+                facts.append({**durable, "block_hash": block.block_hash})
     return facts
 
 

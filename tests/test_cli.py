@@ -21,6 +21,7 @@ from blockweaver.cli import app
 
 CORPUS_ID = "11111111-1111-4111-8111-111111111111"
 EXTENDED_ID = "22222222-2222-4222-8222-222222222222"
+ENRICHED_ID = "33333333-3333-4333-8333-333333333333"
 
 
 def acquire_arguments(
@@ -54,11 +55,12 @@ def acquire_arguments(
     return arguments
 
 
-def test_cli_exposes_the_three_operations() -> None:
+def test_cli_exposes_the_four_operations() -> None:
     result = CliRunner().invoke(app, ["--help"])
 
     assert result.exit_code == 0
     assert "acquire" in result.stdout
+    assert "enrich" in result.stdout
     assert "extend" in result.stdout
     assert "verify" in result.stdout
 
@@ -189,6 +191,7 @@ def test_acquire_publishes_exact_corpus_and_machine_receipt(
     primary.http_failures = 1
     primary.omit_once = {12}
     primary.null_once = {13}
+    primary.priority_fees[12] = 0
 
     result = CliRunner().invoke(
         app,
@@ -235,8 +238,12 @@ def test_acquire_publishes_exact_corpus_and_machine_receipt(
         "gas_used": pl.Int64,
         "gas_limit": pl.Int64,
         "tx_count": pl.Int64,
+        "effective_priority_fee_per_gas_p50": pl.Int64,
     }
     assert frame["block_number"].to_list() == [10, 11, 12, 13, 14]
+    assert frame["effective_priority_fee_per_gas_p50"].to_list() == [1000, 1100, 0, 1300, 1400]
+    fee_calls = [call for batch in primary.requests for call in batch if call["method"] == "eth_feeHistory"]
+    assert any(call["params"] == ["0x5", "0xe", [50]] for call in fee_calls)
     assert receipt["operation"] == "acquire"
     assert receipt["rows"] == 5
     assert {fact["block_number"] for fact in receipt["samples"]} == {10, 11, 12, 13, 14}
@@ -244,6 +251,31 @@ def test_acquire_publishes_exact_corpus_and_machine_receipt(
     assert primary.url not in result.output
     assert verifier.url not in result.output
     assert all(json.loads(line)["event"] for line in result.stderr.splitlines())
+
+
+@pytest.mark.parametrize(
+    ("change", "message"),
+    [
+        ({"oldestBlock": "0xb"}, "oldestBlock"),
+        ({"reward": [["0x1"]]}, "reward coverage"),
+        ({"reward": [["0x1", "0x2"]] * 2}, "reward row"),
+        ({"reward": [[hex(2**63)], ["0x1"]]}, "signed Int64"),
+    ],
+)
+def test_acquire_rejects_invalid_fee_history(
+    tmp_path: Path,
+    chains: tuple[ChainServer, ChainServer],
+    change: dict[str, object],
+    message: str,
+) -> None:
+    primary, verifier = chains
+    primary.fee_history_changes = change
+
+    result = CliRunner().invoke(app, acquire_arguments(tmp_path, primary, verifier, last=11))
+
+    assert result.exit_code == 1
+    assert message in result.stderr
+    assert not (tmp_path / "corpora" / CORPUS_ID).exists()
 
 
 def test_acquire_rejects_non_uuid4_as_a_machine_error(tmp_path: Path) -> None:
@@ -422,6 +454,55 @@ def test_acquire_returns_receipt_when_sigint_arrives_after_atomic_publication(
     assert result.exit_code == 0, result.output
     assert json.loads(result.stdout)["corpus_id"] == CORPUS_ID
     assert destination.is_dir()
+
+
+def test_enrich_copies_validated_legacy_facts_and_acquires_only_p50(
+    tmp_path: Path,
+    chains: tuple[ChainServer, ChainServer],
+) -> None:
+    primary, verifier = chains
+    seeded = CliRunner().invoke(app, acquire_arguments(tmp_path, primary, verifier))
+    assert seeded.exit_code == 0, seeded.output
+    source = tmp_path / "corpora" / CORPUS_ID
+    legacy = pl.read_parquet(source / "blocks.parquet").drop("effective_priority_fee_per_gas_p50")
+    legacy.write_parquet(source / "blocks.parquet")
+    source_before = {path.name: path.read_bytes() for path in source.iterdir()}
+    source_facts = legacy.to_dict(as_series=False)
+    primary.requests.clear()
+    verifier.requests.clear()
+
+    rejected = CliRunner().invoke(app, ["verify", str(source)])
+    enriched = CliRunner().invoke(
+        app,
+        [
+            "enrich",
+            str(source),
+            "--storage-root",
+            str(tmp_path),
+            "--corpus-id",
+            ENRICHED_ID,
+            "--rpc-url",
+            primary.url,
+            "--verify-rpc-url",
+            verifier.url,
+        ],
+    )
+
+    assert rejected.exit_code == 1
+    assert "noncanonical schema" in rejected.stderr
+    assert enriched.exit_code == 0, enriched.output
+    assert {path.name: path.read_bytes() for path in source.iterdir()} == source_before
+    destination = tmp_path / "corpora" / ENRICHED_ID
+    frame = pl.read_parquet(destination / "blocks.parquet")
+    assert frame.select(legacy.columns).to_dict(as_series=False) == source_facts
+    assert frame["effective_priority_fee_per_gas_p50"].to_list() == [1000, 1100, 1200, 1300, 1400]
+    methods = {call["method"] for server in chains for batch in server.requests for call in batch}
+    assert methods == {"eth_chainId", "eth_feeHistory"}
+    receipt = json.loads(enriched.stdout)
+    assert receipt["operation"] == "enrich"
+    assert receipt["source_corpus_id"] == CORPUS_ID
+    assert receipt["rows"] == receipt["reused_rows"] == receipt["source_rows"] == 5
+    assert receipt["acquired_rows"] == 0
 
 
 def test_extend_keeps_source_immutable_and_includes_boundary_samples(
