@@ -115,16 +115,16 @@ async def enrich_corpus(
             ):
                 if await primary.chain_id() != request.chain_id or await verifier.chain_id() != request.chain_id:
                     raise ValueError("RPC chain ID does not match the Corpus request")
-                for first in range(request.first_block, request.last_block + 1, _CHECKPOINT_SIZE):
-                    last = min(first + _CHECKPOINT_SIZE - 1, request.last_block)
-                    fees, verified = await asyncio.gather(
-                        primary.priority_fees(first, last),
-                        verifier.priority_fees(first, last),
-                    )
-                    if fees != verified:
-                        raise ValueError("RPC endpoints disagree on priority fee P50")
-                    priority_fees.extend(fees)
-                    progress({"event": "priority_fees", "first_block": first, "last_block": last})
+                ranges = [
+                    (first, min(first + _CHECKPOINT_SIZE - 1, request.last_block))
+                    for first in range(request.first_block, request.last_block + 1, _CHECKPOINT_SIZE)
+                ]
+                for offset in range(0, len(ranges), concurrency):
+                    group = ranges[offset : offset + concurrency]
+                    results = await asyncio.gather(*(_verified_priority_fees(primary, verifier, first, last) for first, last in group))
+                    for (first, last), fees in zip(group, results, strict=True):
+                        priority_fees.extend(fees)
+                        progress({"event": "priority_fees", "first_block": first, "last_block": last})
             candidate_path = hidden / "ready"
             write_enriched_candidate(candidate_path, source, request, priority_fees)
             candidate = load_corpus(candidate_path)
@@ -149,6 +149,16 @@ async def enrich_corpus(
             return receipt
         finally:
             discard_work(hidden)
+
+
+async def _verified_priority_fees(primary: Rpc, verifier: Rpc, first: int, last: int) -> list[int]:
+    fees, verified = await asyncio.gather(
+        primary.priority_fees(first, last),
+        verifier.priority_fees(first, last),
+    )
+    if fees != verified:
+        raise ValueError("RPC endpoints disagree on priority fee P50")
+    return fees
 
 
 async def acquire_corpus(
