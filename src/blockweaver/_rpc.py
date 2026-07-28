@@ -60,9 +60,16 @@ class Rpc:
             replies.update(part)
         return [replies[call["id"]] for call in calls]
 
-    async def priority_fees(self, first_block: int, last_block: int) -> list[int]:
+    async def priority_fees(
+        self,
+        first_block: int,
+        last_block: int,
+    ) -> list[tuple[int, int]]:
         count = last_block - first_block + 1
-        call = self._calls("eth_feeHistory", [[hex(count), hex(last_block), [50]]])[0]
+        call = self._calls(
+            "eth_feeHistory",
+            [[hex(count), hex(last_block), [50, 90]]],
+        )[0]
         item_id = call["id"]
         reply = await self._run([call], {item_id: lambda value: _parse_fee_history(value, first_block, count)})
         return reply[item_id]
@@ -179,7 +186,11 @@ def _retry_after(value: str | None) -> float | None:
             return None
 
 
-def _parse_fee_history(value: Any, first_block: int, count: int) -> list[int]:
+def _parse_fee_history(
+    value: Any,
+    first_block: int,
+    count: int,
+) -> list[tuple[int, int]]:
     if not isinstance(value, dict):
         raise ValueError("Invalid fee history response shape")
     if quantity(value.get("oldestBlock"), "fee history oldestBlock") != first_block:
@@ -187,6 +198,12 @@ def _parse_fee_history(value: Any, first_block: int, count: int) -> list[int]:
     rewards = value.get("reward")
     if not isinstance(rewards, list) or len(rewards) != count:
         raise ValueError("fee history reward coverage does not match the requested range")
-    if any(not isinstance(row, list) or len(row) != 1 for row in rewards):
-        raise ValueError("fee history reward row must contain exactly P50")
-    return [quantity(row[0], "priority fee P50") for row in rewards]
+    if any(not isinstance(row, list) or len(row) != 2 for row in rewards):
+        raise ValueError("fee history reward row must contain exactly P50 and P90")
+    return [
+        (
+            quantity(row[0], "priority fee P50"),
+            quantity(row[1], "priority fee P90"),
+        )
+        for row in rewards
+    ]

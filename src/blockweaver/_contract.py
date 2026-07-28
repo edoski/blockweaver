@@ -63,12 +63,24 @@ class Block:
             "tx_count": self.tx_count,
         }
 
-    def corpus_row(self, priority_fee_p50: int) -> dict[str, int]:
-        return {**self.durable_row(), "effective_priority_fee_per_gas_p50": priority_fee_p50}
-
-    def checkpoint_row(self, priority_fee_p50: int) -> dict[str, int | str]:
+    def corpus_row(
+        self,
+        priority_fee_p50: int,
+        priority_fee_p90: int,
+    ) -> dict[str, int]:
         return {
-            **self.corpus_row(priority_fee_p50),
+            **self.durable_row(),
+            "effective_priority_fee_per_gas_p50": priority_fee_p50,
+            "effective_priority_fee_per_gas_p90": priority_fee_p90,
+        }
+
+    def checkpoint_row(
+        self,
+        priority_fee_p50: int,
+        priority_fee_p90: int,
+    ) -> dict[str, int | str]:
+        return {
+            **self.corpus_row(priority_fee_p50, priority_fee_p90),
             "block_hash": self.block_hash,
             "parent_hash": self.parent_hash,
         }

@@ -10,7 +10,13 @@ import typer
 from typer._click.exceptions import ClickException
 from typer.core import TyperGroup
 
-from ._build import Publication, acquire_corpus, enrich_avalanche_bigquery, enrich_corpus, extend_corpus, verify_corpus
+from ._build import (
+    Publication,
+    acquire_avalanche_bigquery,
+    acquire_corpus,
+    extend_corpus,
+    verify_corpus,
+)
 from ._contract import Request
 
 
@@ -71,52 +77,27 @@ def acquire(
     )
 
 
-@app.command()
-def enrich(
-    source_corpus: Path,
+@app.command("acquire-bigquery")
+def acquire_bigquery(
     *,
     storage_root: Annotated[Path, typer.Option()],
     corpus_id: Annotated[UUID, typer.Option()],
-    rpc_url: RpcUrl,
-    verify_rpc_url: VerifyRpcUrl,
-    batch_size: Annotated[int, typer.Option(min=1)] = 20,
-    concurrency: Annotated[int, typer.Option(min=1)] = 6,
-) -> None:
-    """Add priority-fee P50 to a validated seven-column Corpus."""
-    _execute(
-        lambda publication: enrich_corpus(
-            source_corpus,
-            storage_root=storage_root,
-            corpus_id=corpus_id,
-            rpc_url=rpc_url,
-            verify_rpc_url=verify_rpc_url,
-            batch_size=batch_size,
-            concurrency=concurrency,
-            progress=_progress,
-            publication=publication,
-        ),
-        [rpc_url, verify_rpc_url],
-    )
-
-
-@app.command("enrich-bigquery")
-def enrich_bigquery(
-    source_corpus: Path,
-    *,
-    storage_root: Annotated[Path, typer.Option()],
-    corpus_id: Annotated[UUID, typer.Option()],
+    first_block: Annotated[int, typer.Option(min=0)],
     last_block: Annotated[int, typer.Option(min=0)],
     gcp_project: Annotated[str, typer.Option()],
     maximum_bytes_billed: Annotated[int, typer.Option(min=1)],
     rpc_url: RpcUrl,
 ) -> None:
-    """Enrich and optionally extend Avalanche through BigQuery."""
+    """Acquire an Avalanche C-Chain Corpus through BigQuery."""
+    try:
+        request = Request(corpus_id, 43_114, first_block, last_block)
+    except ValueError as error:
+        _progress({"event": "error", "message": str(error)})
+        raise typer.Exit(1) from None
     _execute(
-        lambda publication: enrich_avalanche_bigquery(
-            source_corpus,
+        lambda publication: acquire_avalanche_bigquery(
+            request,
             storage_root=storage_root,
-            corpus_id=corpus_id,
-            last_block=last_block,
             gcp_project=gcp_project,
             maximum_bytes_billed=maximum_bytes_billed,
             rpc_url=rpc_url,

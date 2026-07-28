@@ -34,6 +34,7 @@ class ChainServer:
         self.reject_batches_larger_than: int | None = None
         self.wrong_id_once = False
         self.priority_fees: dict[int, int] = {}
+        self.priority_fees_p90: dict[int, int] = {}
         self.fee_history_changes: dict[str, Any] = {}
         state = self
 
@@ -59,7 +60,13 @@ class ChainServer:
                         result = {
                             "oldestBlock": hex(oldest),
                             "baseFeePerGas": [],
-                            "reward": [[hex(state.priority_fees.get(number, number * 100))] for number in range(oldest, newest + 1)],
+                            "reward": [
+                                [
+                                    hex(state.priority_fees.get(number, number * 100)),
+                                    hex(state.priority_fees_p90.get(number, number * 200)),
+                                ]
+                                for number in range(oldest, newest + 1)
+                            ],
                             **state.fee_history_changes,
                         }
                         replies.append({"jsonrpc": "2.0", "id": call["id"], "result": result})

@@ -62,43 +62,15 @@ def test_cli_exposes_the_operations() -> None:
 
     assert result.exit_code == 0
     assert "acquire" in result.stdout
-    assert "enrich" in result.stdout
-    assert "enrich-bigquery" in result.stdout
+    assert "acquire-bigquery" in result.stdout
     assert "extend" in result.stdout
     assert "verify" in result.stdout
 
 
-def test_enrich_bigquery_preserves_source_facts_and_appends_avalanche_rows(
+def test_acquire_bigquery_publishes_avalanche_priority_fee_corpus(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    with ChainServer(chain_id=43_114) as primary, ChainServer(chain_id=43_114) as verifier:
-        seeded = CliRunner().invoke(
-            app,
-            [
-                "acquire",
-                "--storage-root",
-                str(tmp_path),
-                "--corpus-id",
-                CORPUS_ID,
-                "--chain-id",
-                "43114",
-                "--first-block",
-                "10",
-                "--last-block",
-                "14",
-                "--rpc-url",
-                primary.url,
-                "--verify-rpc-url",
-                verifier.url,
-            ],
-        )
-    assert seeded.exit_code == 0, seeded.output
-    source = tmp_path / "corpora" / CORPUS_ID
-    legacy = pl.read_parquet(source / "blocks.parquet").drop("effective_priority_fee_per_gas_p50")
-    legacy.write_parquet(source / "blocks.parquet")
-    source_before = {path.name: path.read_bytes() for path in source.iterdir()}
-
     query_rows = [
         {
             "block_number": number,
@@ -110,6 +82,7 @@ def test_enrich_bigquery_preserves_source_facts_and_appends_avalanche_rows(
             "tx_count": number % (4 if number <= 14 else 3),
             "receipt_gas_used": (20_000_000 if number <= 14 else 15_000_000) + number,
             "effective_priority_fee_per_gas_p50": number * 1_000,
+            "effective_priority_fee_per_gas_p90": number * 2_000,
             "block_hash": f"0x{number + 1:064x}",
             "parent_hash": f"0x{number:064x}",
         }
@@ -145,14 +118,15 @@ def test_enrich_bigquery_preserves_source_facts_and_appends_avalanche_rows(
 
     monkeypatch.setattr(_build.bigquery, "Client", FakeClient)
 
-    def arguments(corpus_id: str, rpc_url: str) -> list[str]:
+    def arguments(rpc_url: str) -> list[str]:
         return [
-            "enrich-bigquery",
-            str(source),
+            "acquire-bigquery",
             "--storage-root",
             str(tmp_path),
             "--corpus-id",
-            corpus_id,
+            ENRICHED_ID,
+            "--first-block",
+            "10",
             "--last-block",
             "16",
             "--gcp-project",
@@ -163,35 +137,36 @@ def test_enrich_bigquery_preserves_source_facts_and_appends_avalanche_rows(
             rpc_url,
         ]
 
-    query_rows[0]["receipt_gas_used"] = 1
-    rejected = CliRunner().invoke(app, arguments(EXTENDED_ID, "http://unused"))
-    assert rejected.exit_code == 1
-    assert "receipts are incomplete for block 10" in rejected.stderr
-    query_rows[0]["receipt_gas_used"] = query_rows[0]["gas_used"]
-
     with ChainServer(chain_id=43_114) as rpc:
-        result = CliRunner().invoke(app, arguments(ENRICHED_ID, rpc.url))
+        query_rows[0]["receipt_gas_used"] = 1
+        rejected = CliRunner().invoke(app, arguments(rpc.url))
+        assert rejected.exit_code == 1
+        assert "receipts are incomplete for block 10" in rejected.stderr
+        query_rows[0]["receipt_gas_used"] = query_rows[0]["gas_used"]
+
+        result = CliRunner().invoke(app, arguments(rpc.url))
+        duplicate = CliRunner().invoke(app, arguments(rpc.url))
 
     assert result.exit_code == 0, result.output
-    assert {path.name: path.read_bytes() for path in source.iterdir()} == source_before
     destination = tmp_path / "corpora" / ENRICHED_ID
     assert {path.name for path in destination.iterdir()} == {"blocks.parquet", "corpus.json"}
     frame = pl.read_parquet(destination / "blocks.parquet")
-    assert frame.head(5).select(legacy.columns).equals(legacy)
+    assert frame["block_number"].to_list() == list(range(10, 17))
     assert frame["effective_priority_fee_per_gas_p50"].to_list() == [number * 1_000 for number in range(10, 17)]
-    assert frame.tail(2).select(legacy.columns).to_dicts() == [{name: row[name] for name in legacy.columns} for row in query_rows[-2:]]
+    assert frame["effective_priority_fee_per_gas_p90"].to_list() == [number * 2_000 for number in range(10, 17)]
     document = json.loads((destination / "corpus.json").read_text())
     assert document["request"]["definition"] == {"chain_id": 43_114, "first_block": 10, "last_block": 16}
     assert document["finalized_anchor"] == {"block_number": 30, "block_hash": f"{31:064x}"}
     receipt = json.loads(result.stdout)
-    assert receipt["operation"] == "enrich-bigquery"
-    assert receipt["reused_rows"] == 5
-    assert receipt["acquired_rows"] == 2
+    assert receipt["operation"] == "acquire-bigquery"
+    assert receipt["reused_rows"] == 0
+    assert receipt["acquired_rows"] == 7
     assert receipt["verifier"]["mode"] == "bigquery_rpc"
 
     client = FakeClient.instance
     assert client.location == "US"
     assert "cumulative_gas_used >= DIV(block_gas_used, 2)" in client.query_text
+    assert "cumulative_gas_used >= DIV(block_gas_used * 9, 10)" in client.query_text
     assert client.query_text.count("block_timestamp >= TIMESTAMP_SECONDS(@first_timestamp)") == 2
     assert client.query_text.count("block_timestamp < TIMESTAMP_SECONDS(@after_timestamp)") == 2
     config = client.job_config
@@ -200,12 +175,8 @@ def test_enrich_bigquery_preserves_source_facts_and_appends_avalanche_rows(
     parameters = {parameter.name: parameter.value for parameter in config.query_parameters}
     assert parameters["first_block"] == 10
     assert parameters["last_block"] == 16
-    assert parameters["first_timestamp"] == legacy["timestamp"].min()
-    last_timestamp = legacy["timestamp"].max()
-    assert isinstance(last_timestamp, int)
-    assert parameters["after_timestamp"] >= last_timestamp + 1
-
-    duplicate = CliRunner().invoke(app, arguments(ENRICHED_ID, "http://unused"))
+    assert parameters["first_timestamp"] == 1_700_000_010
+    assert parameters["after_timestamp"] == 1_700_000_017
     assert duplicate.exit_code == 1
     assert FakeClient.queries == 2
 
@@ -384,11 +355,13 @@ def test_acquire_publishes_exact_corpus_and_machine_receipt(
         "gas_limit": pl.Int64,
         "tx_count": pl.Int64,
         "effective_priority_fee_per_gas_p50": pl.Int64,
+        "effective_priority_fee_per_gas_p90": pl.Int64,
     }
     assert frame["block_number"].to_list() == [10, 11, 12, 13, 14]
     assert frame["effective_priority_fee_per_gas_p50"].to_list() == [1000, 1100, 0, 1300, 1400]
+    assert frame["effective_priority_fee_per_gas_p90"].to_list() == [2000, 2200, 2400, 2600, 2800]
     fee_calls = [call for batch in primary.requests for call in batch if call["method"] == "eth_feeHistory"]
-    assert any(call["params"] == ["0x5", "0xe", [50]] for call in fee_calls)
+    assert any(call["params"] == ["0x5", "0xe", [50, 90]] for call in fee_calls)
     assert receipt["operation"] == "acquire"
     assert receipt["rows"] == 5
     assert {fact["block_number"] for fact in receipt["samples"]} == {10, 11, 12, 13, 14}
@@ -403,8 +376,11 @@ def test_acquire_publishes_exact_corpus_and_machine_receipt(
     [
         ({"oldestBlock": "0xb"}, "oldestBlock"),
         ({"reward": [["0x1"]]}, "reward coverage"),
-        ({"reward": [["0x1", "0x2"]] * 2}, "reward row"),
-        ({"reward": [[hex(2**63)], ["0x1"]]}, "signed Int64"),
+        ({"reward": [["0x1", "0x2", "0x3"]] * 2}, "reward row"),
+        (
+            {"reward": [[hex(2**63), "0x2"], ["0x1", "0x2"]]},
+            "signed Int64",
+        ),
     ],
 )
 def test_acquire_rejects_invalid_fee_history(
@@ -599,55 +575,6 @@ def test_acquire_returns_receipt_when_sigint_arrives_after_atomic_publication(
     assert result.exit_code == 0, result.output
     assert json.loads(result.stdout)["corpus_id"] == CORPUS_ID
     assert destination.is_dir()
-
-
-def test_enrich_copies_validated_legacy_facts_and_acquires_only_p50(
-    tmp_path: Path,
-    chains: tuple[ChainServer, ChainServer],
-) -> None:
-    primary, verifier = chains
-    seeded = CliRunner().invoke(app, acquire_arguments(tmp_path, primary, verifier))
-    assert seeded.exit_code == 0, seeded.output
-    source = tmp_path / "corpora" / CORPUS_ID
-    legacy = pl.read_parquet(source / "blocks.parquet").drop("effective_priority_fee_per_gas_p50")
-    legacy.write_parquet(source / "blocks.parquet")
-    source_before = {path.name: path.read_bytes() for path in source.iterdir()}
-    source_facts = legacy.to_dict(as_series=False)
-    primary.requests.clear()
-    verifier.requests.clear()
-
-    rejected = CliRunner().invoke(app, ["verify", str(source)])
-    enriched = CliRunner().invoke(
-        app,
-        [
-            "enrich",
-            str(source),
-            "--storage-root",
-            str(tmp_path),
-            "--corpus-id",
-            ENRICHED_ID,
-            "--rpc-url",
-            primary.url,
-            "--verify-rpc-url",
-            verifier.url,
-        ],
-    )
-
-    assert rejected.exit_code == 1
-    assert "noncanonical schema" in rejected.stderr
-    assert enriched.exit_code == 0, enriched.output
-    assert {path.name: path.read_bytes() for path in source.iterdir()} == source_before
-    destination = tmp_path / "corpora" / ENRICHED_ID
-    frame = pl.read_parquet(destination / "blocks.parquet")
-    assert frame.select(legacy.columns).to_dict(as_series=False) == source_facts
-    assert frame["effective_priority_fee_per_gas_p50"].to_list() == [1000, 1100, 1200, 1300, 1400]
-    methods = {call["method"] for server in chains for batch in server.requests for call in batch}
-    assert methods == {"eth_chainId", "eth_feeHistory"}
-    receipt = json.loads(enriched.stdout)
-    assert receipt["operation"] == "enrich"
-    assert receipt["source_corpus_id"] == CORPUS_ID
-    assert receipt["rows"] == receipt["reused_rows"] == receipt["source_rows"] == 5
-    assert receipt["acquired_rows"] == 0
 
 
 def test_extend_keeps_source_immutable_and_includes_boundary_samples(
