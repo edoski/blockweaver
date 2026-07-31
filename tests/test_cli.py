@@ -694,6 +694,25 @@ def test_verify_always_checks_every_local_row_and_full_rpc(
     assert "invalid block values" in invalid.stderr
 
 
+def test_verify_rejects_negative_p90_priority_fee(
+    tmp_path: Path,
+    chains: tuple[ChainServer, ChainServer],
+) -> None:
+    primary, verifier = chains
+    acquired = CliRunner().invoke(app, acquire_arguments(tmp_path, primary, verifier))
+    assert acquired.exit_code == 0, acquired.output
+    corpus = tmp_path / "corpora" / CORPUS_ID
+    frame = pl.read_parquet(corpus / "blocks.parquet").with_columns(
+        pl.when(pl.col("block_number") == 10).then(-1).otherwise(pl.col("effective_priority_fee_per_gas_p90")).alias("effective_priority_fee_per_gas_p90")
+    )
+    frame.write_parquet(corpus / "blocks.parquet")
+
+    result = CliRunner().invoke(app, ["verify", str(corpus)])
+
+    assert result.exit_code == 1
+    assert "invalid block values" in result.stderr
+
+
 def test_large_full_verify_and_extension_use_bounded_rpc_batches(
     tmp_path: Path,
     chains: tuple[ChainServer, ChainServer],

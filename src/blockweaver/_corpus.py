@@ -256,6 +256,7 @@ def validate_blocks(path: Path, request: Request) -> int:
             | (pl.col("gas_used") > pl.col("gas_limit"))
             | (pl.col("tx_count") < 0)
             | (pl.col("effective_priority_fee_per_gas_p50") < 0)
+            | (pl.col("effective_priority_fee_per_gas_p90") < 0)
         )
         summary = (
             scan.select(
