@@ -118,7 +118,7 @@ blocks.parquet
 | `gas_limit` | Positive gas |
 | `tx_count` | Nonnegative transaction count |
 | `effective_priority_fee_per_gas_p50` | Nonnegative gas-used-weighted P50 among included transactions, in wei/gas |
-| `effective_priority_fee_per_gas_p90` | Gas-used-weighted P90 among included transactions, in wei/gas |
+| `effective_priority_fee_per_gas_p90` | Nonnegative gas-used-weighted P90 among included transactions, in wei/gas |
 
 ## Output and trust
 
