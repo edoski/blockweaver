@@ -595,8 +595,6 @@ def _validate_url(value: str) -> None:
         or parsed.scheme not in {"http", "https"}
         or not parsed.netloc
         or hostname is None
-        or parsed.username is not None
-        or parsed.password is not None
         or parsed.fragment
         or parsed.netloc.endswith(":")
         or (port is not None and not 1 <= port <= 65535)

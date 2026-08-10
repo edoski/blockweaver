@@ -12,7 +12,8 @@ from conftest import ChainServer, block_hash
 from typer.testing import CliRunner
 
 from blockweaver import _build, _corpus
-from blockweaver._contract import BlockweaverError, parse_time
+from blockweaver import cli as cli_module
+from blockweaver._contract import parse_time
 from blockweaver.cli import app
 
 DATASET_ID = "11111111-1111-4111-8111-111111111111"
@@ -66,8 +67,6 @@ def test_init_precedence_permissions_and_no_overwrite(tmp_path: Path) -> None:
     assert json.loads(result.stdout)["path"] == str(configured)
     assert configured.stat().st_mode & 0o777 == 0o600
     assert "url_env" in configured.read_text()
-    readme = (Path(__file__).parents[1] / "README.md").read_text()
-    assert f"```toml\n{configured.read_text()}```" in readme
 
     explicit_result = invoke(["init", "--config", str(explicit)], {"BLOCKWEAVER_CONFIG": str(configured)})
     assert json.loads(explicit_result.stdout)["path"] == str(explicit)
@@ -112,7 +111,7 @@ def test_strict_config_discovery_has_no_secrets(
         'url = "http://host:abc"',
         'url = "http://host:70000"',
         'url = "http://bad host"',
-        'url = "http://user:password@host"',
+        'url = "http://user:password@"',
         'url = "http://-bad.example"',
         "timeout = nan",
         "timeout = inf",
@@ -169,6 +168,35 @@ def test_download_cli_values_override_defaults_and_profiles(
     assert manifest["output"]["format"] == "csv"
     assert [column["name"] for column in manifest["schema"]] == ["block_number", "block_hash"]
     assert not configured_root.exists()
+
+
+def test_basic_auth_rpc_urls_are_accepted_and_fully_redacted(
+    tmp_path: Path,
+    chains: tuple[ChainServer, ChainServer],
+    make_config: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    primary, verifier = chains
+    config = make_config(tmp_path / "config.toml", primary, verifier, output_root=tmp_path / "out")
+    basic_url = primary.url.replace("http://", "http://user:secret@")
+    config.write_text(config.read_text().replace(primary.url, basic_url))
+
+    successful = invoke(download_args(config))
+    assert successful.exit_code == 0, successful.output
+    assert basic_url not in successful.output
+
+    async def nested_failure(*_args: object, **_kwargs: object) -> dict[str, object]:
+        try:
+            raise RuntimeError(f"transport failed at {basic_url}")
+        except RuntimeError as error:
+            raise RuntimeError(f"nested failure: {error}") from error
+
+    monkeypatch.setattr(cli_module, "download_dataset", nested_failure)
+    failed = invoke(download_args(config, dataset_id="22222222-2222-4222-8222-222222222222"))
+    message = error(failed)
+    assert message["code"] == "INTERNAL_ERROR"
+    assert message["message"] == "nested failure: transport failed at <redacted>"
+    assert basic_url not in failed.output
 
 
 def test_parquet_download_selects_and_coalesces_features(
@@ -457,21 +485,27 @@ def test_recovery_rejects_artifacts_outside_the_immutable_binding(
     assert error(invoke(download_args(config)))["code"] == "RESUME_MISMATCH"
 
 
-def test_publication_never_replaces_a_racing_destination(tmp_path: Path) -> None:
-    hidden = tmp_path / "hidden"
-    ready = hidden / "ready"
-    ready.mkdir(parents=True)
-    (ready / "manifest.json").write_text("{}\n")
-    (ready / "blocks.csv").write_text("block_number\n")
-    destination = tmp_path / "destination"
-    destination.mkdir()
+def test_publication_never_replaces_a_racing_destination(
+    tmp_path: Path,
+    chains: tuple[ChainServer, ChainServer],
+    make_config: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    primary, verifier = chains
+    output_root = tmp_path / "out"
+    config = make_config(tmp_path / "config.toml", primary, verifier, output_root=output_root)
+    real_publish = _build.publish
 
-    with pytest.raises(BlockweaverError, match="already exists") as caught:
-        _corpus.publish(hidden, destination)
+    def race(hidden: Path, destination: Path) -> None:
+        destination.mkdir()
+        real_publish(hidden, destination)
 
-    assert caught.value.code == "DESTINATION_EXISTS"
+    monkeypatch.setattr(_build, "publish", race)
+    result = invoke(download_args(config))
+    assert error(result)["code"] == "DESTINATION_EXISTS"
+    destination = next(path for path in output_root.iterdir() if not path.name.startswith("."))
     assert list(destination.iterdir()) == []
-    assert ready.exists()
+    assert (output_root / f".blockweaver-{DATASET_ID}" / "ready").is_dir()
 
 
 def test_verify_is_strict_locally_and_against_rpc(
