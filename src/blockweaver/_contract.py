@@ -6,6 +6,7 @@ import os
 import re
 import sys
 import tomllib
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from ipaddress import ip_address
@@ -53,14 +54,15 @@ class Feature:
     domain: str = ""
 
     def document(self, *, available_sources: tuple[Source, ...] = ("rpc",)) -> dict[str, object]:
+        definitions = source_definitions()
         return {
             "name": self.name,
             "type": self.dtype,
             "unit": self.unit,
-            "source_support": ["rpc", "bigquery"],
-            "acquisition_families": {"rpc": self.family, "bigquery": self.bigquery_family},
+            "source_support": [source.name for source in definitions],
+            "acquisition_families": {source.name: getattr(self, source.feature_family_field) for source in definitions},
             "domain_rule": self.domain,
-            "hidden_dependencies": {"rpc": list(self.dependencies), "bigquery": list(self.bigquery_dependencies)},
+            "hidden_dependencies": {source.name: list(getattr(self, source.feature_dependencies_field)) for source in definitions},
             "configured_sources": list(available_sources),
         }
 
@@ -136,41 +138,152 @@ class Plan:
         ]
 
     def document(self, source: Source = "rpc") -> dict[str, object]:
-        if source == "bigquery":
-            fields = {"block_number", "block_timestamp", "block_hash", "parent_hash"}
-            fields.update(feature.bigquery_field for feature in self.features if feature.bigquery_field is not None)
-            fields.update(dependency for feature in self.features for dependency in feature.bigquery_dependencies)
-            if self.percentiles:
-                fields.update({"base_fee_per_gas", "gas_used"})
-            families: list[dict[str, object]] = [{"family": "blocks", "table": "blocks", "fields": sorted(fields)}]
-            if any(feature.bigquery_family == "transactions" for feature in self.features):
-                families.append({"family": "transactions", "table": "transactions", "fields": ["block_number", "block_timestamp"]})
-            if any(feature.bigquery_family == "receipts" for feature in self.features):
-                families.append(
-                    {
-                        "family": "receipts",
-                        "table": "receipts",
-                        "fields": ["block_number", "block_timestamp", "effective_gas_price", "gas_used", "transaction_index"],
-                        "reward_percentiles": list(self.percentiles),
-                    }
-                )
-            return {"families": families}
-        families: list[dict[str, object]] = [
+        return source_definition(source).plan_documenter(self)
+
+
+def _rpc_plan_document(plan: Plan) -> dict[str, object]:
+    families: list[dict[str, object]] = [{"family": "header", "method": "eth_getBlockByNumber", "fields": list(plan.header_fields)}]
+    if plan.percentiles:
+        families.append({"family": "fee_history", "method": "eth_feeHistory", "reward_percentiles": list(plan.percentiles)})
+    return {"families": families}
+
+
+def _bigquery_plan_document(plan: Plan) -> dict[str, object]:
+    fields = {"block_number", "block_timestamp", "block_hash", "parent_hash"}
+    fields.update(feature.bigquery_field for feature in plan.features if feature.bigquery_field is not None)
+    fields.update(dependency for feature in plan.features for dependency in feature.bigquery_dependencies)
+    if plan.percentiles:
+        fields.update({"base_fee_per_gas", "gas_used"})
+    families: list[dict[str, object]] = [{"family": "blocks", "table": "blocks", "fields": sorted(fields)}]
+    if any(feature.bigquery_family == "transactions" for feature in plan.features):
+        families.append({"family": "transactions", "table": "transactions", "fields": ["block_number", "block_timestamp"]})
+    if any(feature.bigquery_family == "receipts" for feature in plan.features):
+        families.append(
             {
-                "family": "header",
-                "method": "eth_getBlockByNumber",
-                "fields": list(self.header_fields),
+                "family": "receipts",
+                "table": "receipts",
+                "fields": ["block_number", "block_hash", "block_timestamp", "effective_gas_price", "gas_used", "transaction_index"],
+                "reward_percentiles": list(plan.percentiles),
             }
-        ]
-        if self.percentiles:
-            families.append(
-                {
-                    "family": "fee_history",
-                    "method": "eth_feeHistory",
-                    "reward_percentiles": list(self.percentiles),
-                }
-            )
-        return {"families": families}
+        )
+    return {"families": families}
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class SourceDefinition:
+    name: Source
+    runner: str
+    feature_family_field: str
+    feature_dependencies_field: str
+    chain_requirements: tuple[str, ...]
+    config_requirements: tuple[str, ...]
+    runtime_requirements: tuple[str, ...]
+    accepts_primary_options: bool
+    chain_document_fields: tuple[str, ...]
+    manifest_fields: tuple[tuple[str, str, Literal["name", "dataset"]], ...]
+    verification_chain_fields: tuple[str, ...]
+    verification_nonnegative_fields: tuple[str, ...]
+    plan_documenter: Callable[[Plan], dict[str, object]]
+
+    def configured(self, config: Config, chain: Chain) -> bool:
+        return all(getattr(chain, field) is not None for field in self.chain_requirements) and all(
+            getattr(config, field) is not None for field in self.config_requirements
+        )
+
+    def validate_runtime(self, chain: Chain, *, primary: Provider | None, bigquery: BigQuerySettings | None) -> None:
+        runtime = {"primary": primary, "bigquery": bigquery}
+        if {name for name, value in runtime.items() if value is not None} != set(self.runtime_requirements) or any(
+            getattr(chain, field) is None for field in self.chain_requirements
+        ):
+            raise BlockweaverError("SOURCE_UNAVAILABLE", f"{self.name} source is not fully configured")
+
+    def chain_document(self, chain: Chain) -> dict[str, object]:
+        return {field: value for field in self.chain_document_fields if (value := getattr(chain, field)) is not None}
+
+    def manifest_document(self, chain: Chain, primary: Provider | None, verifier: Provider) -> dict[str, object]:
+        roots: dict[str, object | None] = {"chain": chain, "primary": primary, "verifier": verifier}
+        document: dict[str, object] = {"type": self.name}
+        for field, path, _validator in self.manifest_fields:
+            root, *attributes = path.split(".")
+            value = roots[root]
+            for attribute in attributes:
+                value = getattr(value, attribute) if value is not None else None
+            if value is None:
+                raise BlockweaverError("SOURCE_UNAVAILABLE", f"{self.name} source is not fully configured")
+            document[field] = value
+        return document
+
+    def validate_manifest(self, value: object) -> dict[str, object]:
+        fields = {field for field, _context, _validator in self.manifest_fields}
+        if not isinstance(value, dict) or set(value) != {"type", *fields} or value.get("type") != self.name:
+            raise ValueError("Invalid manifest source")
+        for field, _context, validator in self.manifest_fields:
+            item = value[field]
+            if not isinstance(item, str) or (validator == "name" and _NAME.fullmatch(item) is None):
+                raise ValueError("Invalid manifest source")
+            if validator == "dataset":
+                validate_dataset_identifier(item)
+        return value
+
+    def validate_verification(self, value: object, chain_id: int) -> dict[str, object]:
+        fields = {"target_agreement", "sampled_blocks", *self.verification_chain_fields, *self.verification_nonnegative_fields}
+        if not isinstance(value, dict) or set(value) != fields:
+            raise ValueError("Invalid verification facts")
+        if value["target_agreement"] is not True or any(value[field] != chain_id for field in self.verification_chain_fields):
+            raise ValueError("Invalid verification facts")
+        if any(type(value[field]) is not int or value[field] < 0 for field in self.verification_nonnegative_fields):
+            raise ValueError("Invalid verification facts")
+        return value
+
+
+_SOURCES = (
+    SourceDefinition(
+        name="rpc",
+        runner="rpc",
+        feature_family_field="family",
+        feature_dependencies_field="dependencies",
+        chain_requirements=(),
+        config_requirements=(),
+        runtime_requirements=("primary",),
+        accepts_primary_options=True,
+        chain_document_fields=(),
+        manifest_fields=(("provider", "primary.name", "name"), ("verifier", "verifier.name", "name")),
+        verification_chain_fields=("primary_chain_id", "verifier_chain_id"),
+        verification_nonnegative_fields=(),
+        plan_documenter=_rpc_plan_document,
+    ),
+    SourceDefinition(
+        name="bigquery",
+        runner="bigquery",
+        feature_family_field="bigquery_family",
+        feature_dependencies_field="bigquery_dependencies",
+        chain_requirements=("bigquery_dataset",),
+        config_requirements=("bigquery",),
+        runtime_requirements=("bigquery",),
+        accepts_primary_options=False,
+        chain_document_fields=("bigquery_dataset",),
+        manifest_fields=(("dataset", "chain.bigquery_dataset", "dataset"), ("verifier", "verifier.name", "name")),
+        verification_chain_fields=("verifier_chain_id",),
+        verification_nonnegative_fields=("dry_run_bytes",),
+        plan_documenter=_bigquery_plan_document,
+    ),
+)
+_SOURCE_BY_NAME = {source.name: source for source in _SOURCES}
+
+
+def source_definitions() -> tuple[SourceDefinition, ...]:
+    return _SOURCES
+
+
+def source_definition(value: object) -> SourceDefinition:
+    try:
+        return _SOURCE_BY_NAME[value]  # type: ignore[index]
+    except (KeyError, TypeError):
+        raise BlockweaverError("SOURCE_UNAVAILABLE", f"Unknown source: {value}") from None
+
+
+def configured_sources(config: Config, chain: Chain) -> tuple[Source, ...]:
+    return tuple(source.name for source in _SOURCES if source.configured(config, chain))
 
 
 def plan_features(names: list[str] | tuple[str, ...]) -> Plan:
@@ -252,7 +365,6 @@ class BigQuerySpec:
 
     def resolve(self) -> BigQuerySettings:
         project = self.project
-        from_environment = project is None
         if project is None:
             assert self.project_env is not None
             project = os.environ.get(self.project_env)
@@ -262,14 +374,13 @@ class BigQuerySpec:
             validate_project(project)
         except ValueError as error:
             raise BlockweaverError("CONFIG_INVALID", str(error)) from None
-        return BigQuerySettings(project, self.maximum_bytes_billed, from_environment)
+        return BigQuerySettings(project, self.maximum_bytes_billed)
 
 
 @dataclass(frozen=True, slots=True)
 class BigQuerySettings:
     project: str
     maximum_bytes_billed: int
-    from_environment: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -354,9 +465,7 @@ def load_config(path: Path) -> Config:
             "defaults",
             required={"chain", "source", "provider", "verifier", "output_root", "format", "features"},
         )
-        source = _string(defaults_raw["source"], "defaults.source")
-        if source not in {"rpc", "bigquery"}:
-            raise BlockweaverError("SOURCE_UNAVAILABLE", f"Unknown source: {source}")
+        source = source_definition(_string(defaults_raw["source"], "defaults.source")).name
         output_format = _string(defaults_raw["format"], "defaults.format")
         if output_format not in {"parquet", "csv"}:
             raise ValueError("defaults.format must be parquet or csv")
@@ -384,9 +493,10 @@ def load_config(path: Path) -> Config:
                     raise ValueError(f"chain {chain.name} names an unknown provider: {provider_name}")
         if defaults.provider not in providers or defaults.verifier not in providers:
             raise ValueError("defaults provider profiles must be configured")
-        if defaults.source == "bigquery" and (chains[defaults.chain].bigquery_dataset is None or bigquery is None):
-            raise ValueError("default BigQuery source requires chains.<name>.bigquery_dataset and [bigquery]")
-        return Config(path, defaults, chains, providers, bigquery)
+        config = Config(path, defaults, chains, providers, bigquery)
+        if not source_definition(defaults.source).configured(config, chains[defaults.chain]):
+            raise ValueError(f"default {defaults.source} source is not fully configured")
+        return config
     except BlockweaverError:
         raise
     except (KeyError, TypeError, ValueError) as error:

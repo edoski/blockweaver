@@ -1,4 +1,4 @@
-"""Bounded asynchronous EVM JSON-RPC transport."""
+"""Bounded external RPC and BigQuery source adapters."""
 
 from __future__ import annotations
 
@@ -17,6 +17,7 @@ from ._contract import BlockweaverError, Header, Plan, parse_header, quantity
 
 _TRANSIENT_HTTP = {408, 425, 429, *range(500, 600)}
 Validator = Callable[[Any], Any]
+BigQuerySchema = dict[str, tuple[str, str]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -31,16 +32,16 @@ class BigQueryClient:
         self._module = module
         self._client = module.Client(project=project)
 
-    def table_schema(self, dataset: str, table: str) -> dict[str, str]:
+    def table_schema(self, dataset: str, table: str) -> BigQuerySchema:
         value = self._client.get_table(f"{dataset}.{table}")
-        return {field.name: field.field_type for field in value.schema}
+        return {field.name: (field.field_type, field.mode) for field in value.schema}
 
-    def dry_run(self, sql: str, parameters: dict[str, int]) -> tuple[int, dict[str, str]]:
+    def dry_run(self, sql: str, parameters: dict[str, int]) -> tuple[int, BigQuerySchema]:
         config = self._config(parameters, dry_run=True)
         job = self._client.query(sql, job_config=config)
         if type(job.total_bytes_processed) is not int or job.total_bytes_processed < 0:
             raise BlockweaverError("BIGQUERY_INVALID", "BigQuery dry run did not return a byte estimate")
-        return job.total_bytes_processed, {field.name: field.field_type for field in job.schema}
+        return job.total_bytes_processed, {field.name: (field.field_type, field.mode) for field in job.schema}
 
     def pages(
         self,
@@ -135,6 +136,7 @@ def compile_bigquery(dataset: str, plan: Plan) -> BigQueryPlan:
     if plan.percentiles:
         tables["receipts"] = {
             "block_number": "INTEGER",
+            "block_hash": "STRING",
             "block_timestamp": "TIMESTAMP",
             "transaction_index": "INTEGER",
             "gas_used": "INTEGER",
@@ -143,7 +145,7 @@ def compile_bigquery(dataset: str, plan: Plan) -> BigQueryPlan:
         ctes.extend(
             [
                 "requested_receipts AS (\n"
-                "  SELECT block_number, transaction_index, gas_used, effective_gas_price\n"
+                "  SELECT block_number, block_hash, transaction_index, gas_used, effective_gas_price\n"
                 f"  FROM `{dataset}.receipts`\n"
                 "  WHERE block_number BETWEEN @first_block AND @last_block\n"
                 "    AND block_timestamp BETWEEN TIMESTAMP_SECONDS(@from_timestamp) AND TIMESTAMP_SECONDS(@to_timestamp)\n"
@@ -154,7 +156,8 @@ def compile_bigquery(dataset: str, plan: Plan) -> BigQueryPlan:
                 "    SUM(r.gas_used) OVER (PARTITION BY r.block_number "
                 "ORDER BY r.effective_gas_price - b.base_fee_per_gas, r.transaction_index "
                 "ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS cumulative_gas\n"
-                "  FROM requested_receipts AS r JOIN requested_blocks AS b USING (block_number)\n"
+                "  FROM requested_receipts AS r JOIN requested_blocks AS b\n"
+                "    ON r.block_number = b.block_number AND r.block_hash = b.block_hash\n"
                 ")",
                 "receipt_stats AS (\n"
                 "  SELECT block_number, SUM(gas_used) AS receipt_gas_used,\n    "

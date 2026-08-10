@@ -25,6 +25,7 @@ class ChainServer:
         self.http_failures = 0
         self.omit_counts: dict[int, int] = {}
         self.changes: dict[int, dict[str, Any]] = {}
+        self.tag_changes: dict[str, Any] = {}
         self.fee_history_changes: dict[str, Any] = {}
         self.wrong_id_once = False
         state = self
@@ -63,6 +64,8 @@ class ChainServer:
                             state.omit_counts[number] -= 1
                             continue
                         result = state.block(number)
+                        if selector in {"finalized", "safe"}:
+                            result.update(state.tag_changes)
                     item_id = call["id"] + 10_000 if state.wrong_id_once else call["id"]
                     state.wrong_id_once = False
                     replies.append({"jsonrpc": "2.0", "id": item_id, "result": result})
@@ -108,29 +111,36 @@ class ChainServer:
 
 
 class FakeBigQuery:
-    TABLES: ClassVar[dict[str, dict[str, str]]] = {
-        "blocks": {"block_number": "INTEGER", "block_timestamp": "TIMESTAMP", "block_hash": "STRING", "parent_hash": "STRING"},
-        "block_features": {"base_fee_per_gas": "INTEGER", "gas_used": "INTEGER", "gas_limit": "INTEGER"},
-        "transactions": {"block_number": "INTEGER", "block_timestamp": "TIMESTAMP"},
-        "receipts": {"block_number": "INTEGER", "block_timestamp": "TIMESTAMP", "transaction_index": "INTEGER"},
-        "receipt_features": {"gas_used": "INTEGER", "effective_gas_price": "INTEGER"},
+    TABLES: ClassVar[dict[str, dict[str, tuple[str, str]]]] = {
+        "blocks": {
+            name: (dtype, "NULLABLE")
+            for name, dtype in {"block_number": "INTEGER", "block_timestamp": "TIMESTAMP", "block_hash": "STRING", "parent_hash": "STRING"}.items()
+        },
+        "block_features": {name: ("INTEGER", "NULLABLE") for name in ("base_fee_per_gas", "gas_used", "gas_limit")},
+        "transactions": {"block_number": ("INTEGER", "NULLABLE"), "block_timestamp": ("TIMESTAMP", "NULLABLE")},
+        "receipts": {
+            name: (dtype, "NULLABLE")
+            for name, dtype in {"block_number": "INTEGER", "block_hash": "STRING", "block_timestamp": "TIMESTAMP", "transaction_index": "INTEGER"}.items()
+        },
+        "receipt_features": {name: ("INTEGER", "NULLABLE") for name in ("gas_used", "effective_gas_price")},
     }
 
-    def __init__(self, chain: ChainServer, *, bytes_processed: int = 100) -> None:
+    def __init__(self, chain: ChainServer, *, bytes_processed: int = 100, wrong_hash_receipts: bool = False) -> None:
         self.chain = chain
         self.tables = {name: dict(fields) for name, fields in self.TABLES.items()}
         self.tables["blocks"].update(self.tables.pop("block_features"))
         self.tables["receipts"].update(self.tables.pop("receipt_features"))
         self.bytes_processed = bytes_processed
+        self.wrong_hash_receipts = wrong_hash_receipts
         self.calls: list[str] = []
         self.sql = ""
         self.page_size = 0
 
-    def table_schema(self, dataset: str, table: str) -> dict[str, str]:
+    def table_schema(self, dataset: str, table: str) -> dict[str, tuple[str, str]]:
         self.calls.append(f"schema:{dataset}.{table}")
         return self.tables[table]
 
-    def dry_run(self, sql: str, parameters: dict[str, int]) -> tuple[int, dict[str, str]]:
+    def dry_run(self, sql: str, parameters: dict[str, int]) -> tuple[int, dict[str, tuple[str, str]]]:
         self.calls.append("dry_run")
         self.sql = sql
         del parameters
@@ -139,10 +149,11 @@ class FakeBigQuery:
     def pages(self, sql: str, parameters: dict[str, int], maximum_bytes_billed: int, page_size: int):
         self.calls.append("execute")
         self.sql, self.page_size = sql, page_size
-        del parameters, maximum_bytes_billed
+        del maximum_bytes_billed
         columns = _query_schema(sql)
         rows = []
-        for number in range(10, 15):
+        receipt_join_is_fork_safe = "r.block_number = b.block_number AND r.block_hash = b.block_hash" in sql
+        for number in range(parameters["first_block"], parameters["last_block"] + 1):
             block = self.chain.block(number)
             values = {"block_number": number, "_proof_timestamp": self.chain.timestamp_base + number, "timestamp": self.chain.timestamp_base + number}
             values.update({"_proof_hash": block["hash"], "block_hash": block["hash"]})
@@ -150,19 +161,20 @@ class FakeBigQuery:
             values.update({"_proof_gas_used": 15_000_000 + number, "_receipt_gas_used": 15_000_000 + number, "gas_used": 15_000_000 + number})
             values["_proof_gas_limit"] = 30_000_000
             values.update({"base_fee_per_gas": 1_000_000_000 + number, "gas_limit": 30_000_000, "tx_count": number % 3})
-            values.update({"effective_priority_fee_per_gas_p50": number * 50, "effective_priority_fee_per_gas_p90": number * 90})
+            multiplier = 1 if receipt_join_is_fork_safe or not self.wrong_hash_receipts else 9
+            values.update({"effective_priority_fee_per_gas_p50": number * 50 * multiplier, "effective_priority_fee_per_gas_p90": number * 90 * multiplier})
             rows.append({name: values[name] for name in columns})
         for offset in range(0, len(rows), page_size):
             yield iter(rows[offset : offset + page_size])
 
 
-def _query_schema(sql: str) -> dict[str, str]:
+def _query_schema(sql: str) -> dict[str, tuple[str, str]]:
     strings = {"_proof_hash", "_proof_parent_hash", "block_hash", "parent_hash"}
     integers = (  # noqa: SIM905 - compact fake schema fixture
         "block_number _proof_timestamp _proof_gas_used _proof_gas_limit _receipt_gas_used timestamp base_fee_per_gas gas_used gas_limit tx_count "
         "effective_priority_fee_per_gas_p50 effective_priority_fee_per_gas_p90"
     ).split()
-    return {name: "STRING" if name in strings else "INTEGER" for name in [*strings, *integers] if f" AS {name}" in sql}
+    return {name: ("STRING" if name in strings else "INTEGER", "NULLABLE") for name in [*strings, *integers] if f" AS {name}" in sql}
 
 
 @pytest.fixture

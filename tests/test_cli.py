@@ -12,12 +12,13 @@ import pytest
 from conftest import ChainServer, FakeBigQuery, block_hash
 from typer.testing import CliRunner
 
-from blockweaver import _build, _corpus, _rpc
+from blockweaver import _build, _corpus, _sources
 from blockweaver import cli as cli_module
 from blockweaver._contract import parse_time
 from blockweaver.cli import app
 
 DATASET_ID = "11111111-1111-4111-8111-111111111111"
+BQ_DATASET = "bigquery-public-data.goog_blockchain_test_us"
 
 
 def invoke(arguments: list[str], env: dict[str, str] | None = None):
@@ -36,6 +37,10 @@ def download_args(config: Path, *, first: int = 10, last: int = 14, dataset_id: 
         "--to-block",
         str(last),
     ]
+
+
+def bigquery_config(make_config: Any, path: Path, primary: ChainServer, verifier: ChainServer, output_root: Path, **values: Any) -> Path:
+    return make_config(path, primary, verifier, output_root=output_root, source="bigquery", dataset=BQ_DATASET, **values)
 
 
 def artifact_from(result: Any) -> Path:
@@ -74,11 +79,7 @@ def test_init_precedence_permissions_and_no_overwrite(tmp_path: Path) -> None:
     assert error(invoke(["init", "--config", str(explicit)]))["code"] == "CONFIG_EXISTS"
 
 
-def test_strict_config_discovery_has_no_secrets(
-    tmp_path: Path,
-    chains: tuple[ChainServer, ChainServer],
-    make_config: Any,
-) -> None:
+def test_strict_config_discovery_has_no_secrets(tmp_path: Path, chains: tuple[ChainServer, ChainServer], make_config: Any) -> None:
     primary, verifier = chains
     config = make_config(tmp_path / "config.toml", primary, verifier, output_root=tmp_path / "out")
 
@@ -134,11 +135,7 @@ def test_config_rejects_malformed_urls_and_unbounded_timeouts(
     assert error(invoke(["chains", "--config", str(config)]))["code"] == "CONFIG_INVALID"
 
 
-def test_download_cli_values_override_defaults_and_profiles(
-    tmp_path: Path,
-    chains: tuple[ChainServer, ChainServer],
-    make_config: Any,
-) -> None:
+def test_download_cli_values_override_defaults_and_profiles(tmp_path: Path, chains: tuple[ChainServer, ChainServer], make_config: Any) -> None:
     primary, verifier = chains
     configured_root = tmp_path / "configured"
     override_root = tmp_path / "override"
@@ -200,11 +197,7 @@ def test_basic_auth_rpc_urls_are_accepted_and_fully_redacted(
     assert basic_url not in failed.output
 
 
-def test_parquet_download_selects_and_coalesces_features(
-    tmp_path: Path,
-    chains: tuple[ChainServer, ChainServer],
-    make_config: Any,
-) -> None:
+def test_parquet_download_selects_and_coalesces_features(tmp_path: Path, chains: tuple[ChainServer, ChainServer], make_config: Any) -> None:
     primary, verifier = chains
     config = make_config(tmp_path / "config.toml", primary, verifier, output_root=tmp_path / "out", features=())
     primary.http_failures = 1
@@ -257,11 +250,7 @@ def test_parquet_download_selects_and_coalesces_features(
     assert all(json.loads(line)["event"] for line in result.stderr.splitlines())
 
 
-def test_time_range_csv_and_reduced_precision(
-    tmp_path: Path,
-    chains: tuple[ChainServer, ChainServer],
-    make_config: Any,
-) -> None:
+def test_time_range_csv_and_reduced_precision(tmp_path: Path, chains: tuple[ChainServer, ChainServer], make_config: Any) -> None:
     primary, verifier = chains
     config = make_config(tmp_path / "config.toml", primary, verifier, output_root=tmp_path / "out", output_format="csv")
     start = datetime.fromtimestamp(primary.timestamp_base + 10, UTC).isoformat().replace("+00:00", "Z")
@@ -295,11 +284,7 @@ def test_time_range_csv_and_reduced_precision(
     assert invoke(["verify", str(artifact)]).exit_code == 0
 
 
-def test_time_resolution_requires_independent_adjacent_boundary_proof(
-    tmp_path: Path,
-    chains: tuple[ChainServer, ChainServer],
-    make_config: Any,
-) -> None:
+def test_time_resolution_requires_independent_adjacent_boundary_proof(tmp_path: Path, chains: tuple[ChainServer, ChainServer], make_config: Any) -> None:
     primary, verifier = chains
     config = make_config(tmp_path / "config.toml", primary, verifier, output_root=tmp_path / "out")
     primary.changes[10] = {"timestamp": hex(primary.timestamp_base + 9)}
@@ -410,11 +395,7 @@ def test_resume_integrity_binds_checkpoint_bytes_and_exported_proofs(
     assert error(invoke(download_args(config)))["code"] == "RESUME_INVALID"
 
 
-def test_verifier_disagreement_and_secret_redaction(
-    tmp_path: Path,
-    chains: tuple[ChainServer, ChainServer],
-    make_config: Any,
-) -> None:
+def test_verifier_disagreement_and_secret_redaction(tmp_path: Path, chains: tuple[ChainServer, ChainServer], make_config: Any) -> None:
     primary, verifier = chains
     config = make_config(tmp_path / "config.toml", primary, verifier, output_root=tmp_path / "out")
     verifier.changes[14] = {"hash": block_hash(999)}
@@ -509,11 +490,7 @@ def test_publication_never_replaces_a_racing_destination(
     assert (output_root / f".blockweaver-{DATASET_ID}" / "ready").is_dir()
 
 
-def test_verify_is_strict_locally_and_against_rpc(
-    tmp_path: Path,
-    chains: tuple[ChainServer, ChainServer],
-    make_config: Any,
-) -> None:
+def test_verify_is_strict_locally_and_against_rpc(tmp_path: Path, chains: tuple[ChainServer, ChainServer], make_config: Any) -> None:
     primary, verifier = chains
     config = make_config(tmp_path / "config.toml", primary, verifier, output_root=tmp_path / "out")
     artifact = artifact_from(invoke(download_args(config)))
@@ -582,11 +559,7 @@ def test_full_rpc_verification_is_chunked_and_checks_cross_chunk_ancestry(
     assert error(mismatch)["code"] == "RPC_MISMATCH"
 
 
-def test_rpc_protocol_failure_is_bounded_and_machine_readable(
-    tmp_path: Path,
-    chains: tuple[ChainServer, ChainServer],
-    make_config: Any,
-) -> None:
+def test_rpc_protocol_failure_is_bounded_and_machine_readable(tmp_path: Path, chains: tuple[ChainServer, ChainServer], make_config: Any) -> None:
     primary, verifier = chains
     config = make_config(tmp_path / "config.toml", primary, verifier, output_root=tmp_path / "out")
     primary.wrong_id_once = True
@@ -596,49 +569,33 @@ def test_rpc_protocol_failure_is_bounded_and_machine_readable(
 
 
 def test_bigquery_rejects_invalid_dataset_and_missing_optional_dependency(
-    tmp_path: Path,
-    chains: tuple[ChainServer, ChainServer],
-    make_config: Any,
-    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, chains: tuple[ChainServer, ChainServer], make_config: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     primary, verifier = chains
     config = make_config(tmp_path / "config.toml", primary, verifier, output_root=tmp_path / "out", source="bigquery", dataset="bad.dataset;drop")
     assert error(invoke(["chains", "--config", str(config)]))["code"] == "CONFIG_INVALID"
-    config = make_config(
-        tmp_path / "valid.toml",
-        primary,
-        verifier,
-        output_root=tmp_path / "out",
-        source="bigquery",
-        dataset="bigquery-public-data.goog_blockchain_test_us",
-    )
-
-    monkeypatch.setattr(_rpc, "import_module", Mock(side_effect=ModuleNotFoundError))
+    config = bigquery_config(make_config, tmp_path / "valid.toml", primary, verifier, tmp_path / "out")
+    monkeypatch.setattr(_sources, "import_module", Mock(side_effect=ModuleNotFoundError))
     assert error(invoke(download_args(config)))["code"] == "source_dependency_missing"
     assert primary.requests == verifier.requests == []
 
 
 def test_bigquery_schema_and_cost_fail_before_billable_query(
-    tmp_path: Path,
-    chains: tuple[ChainServer, ChainServer],
-    make_config: Any,
-    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, chains: tuple[ChainServer, ChainServer], make_config: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     primary, verifier = chains
-    config = make_config(
-        tmp_path / "config.toml",
-        primary,
-        verifier,
-        output_root=tmp_path / "out",
-        features=("effective_priority_fee_per_gas_p50",),
-        source="bigquery",
-        dataset="bigquery-public-data.goog_blockchain_test_us",
-    )
+    config = bigquery_config(make_config, tmp_path / "config.toml", primary, verifier, tmp_path / "out", features=("effective_priority_fee_per_gas_p50",))
     unavailable = FakeBigQuery(verifier)
-    unavailable.tables["receipts"] = {"block_number": "INTEGER"}
+    unavailable.tables["receipts"] = {"block_number": ("INTEGER", "NULLABLE")}
     monkeypatch.setattr(_build, "open_bigquery", lambda _project: unavailable)
     assert error(invoke(download_args(config)))["code"] == "SOURCE_FEATURE_UNAVAILABLE"
     assert "dry_run" not in unavailable.calls and "execute" not in unavailable.calls
+
+    repeated = FakeBigQuery(verifier)
+    repeated.tables["receipts"]["effective_gas_price"] = ("INTEGER", "REPEATED")
+    monkeypatch.setattr(_build, "open_bigquery", lambda _project: repeated)
+    assert error(invoke(download_args(config, dataset_id="33333333-3333-4333-8333-333333333333")))["code"] == "SOURCE_FEATURE_UNAVAILABLE"
+    assert "dry_run" not in repeated.calls and "execute" not in repeated.calls
 
     expensive = FakeBigQuery(verifier, bytes_processed=1001)
     monkeypatch.setattr(_build, "open_bigquery", lambda _project: expensive)
@@ -647,16 +604,12 @@ def test_bigquery_schema_and_cost_fail_before_billable_query(
 
 
 def test_bigquery_streams_selected_fields_and_matches_rpc_artifacts(
-    tmp_path: Path,
-    chains: tuple[ChainServer, ChainServer],
-    make_config: Any,
-    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, chains: tuple[ChainServer, ChainServer], make_config: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     primary, verifier = chains
     features = ("timestamp", "block_hash", "gas_used", "tx_count", "effective_priority_fee_per_gas_p50", "effective_priority_fee_per_gas_p90")
-    dataset = "bigquery-public-data.goog_blockchain_test_us"
-    config = make_config(tmp_path / "config.toml", primary, verifier, output_root=tmp_path / "out", features=features, source="bigquery", dataset=dataset)
-    clients = [FakeBigQuery(verifier), FakeBigQuery(verifier)]
+    config = bigquery_config(make_config, tmp_path / "config.toml", primary, verifier, tmp_path / "out", features=features)
+    clients = [FakeBigQuery(verifier, wrong_hash_receipts=True), FakeBigQuery(verifier, wrong_hash_receipts=True)]
     queued_clients = iter(clients)
     monkeypatch.setattr(_build, "open_bigquery", lambda _project: next(queued_clients))
     monkeypatch.setattr(_build, "_CHUNK_SIZE", 2)
@@ -667,10 +620,46 @@ def test_bigquery_streams_selected_fields_and_matches_rpc_artifacts(
     csv = artifact_from(invoke([*base, "--id", "22222222-2222-4222-8222-222222222222", "--format", "csv"]))
     assert pl.read_parquet(parquet / "blocks.parquet").equals(pl.read_csv(csv / "blocks.csv"))
     manifest = json.loads((parquet / "manifest.json").read_text())
-    assert manifest["source"] == {"type": "bigquery", "dataset": dataset, "verifier": "verifier"}
+    assert manifest["source"] == {"type": "bigquery", "dataset": BQ_DATASET, "verifier": "verifier"}
     assert manifest["verification"]["sampled_blocks"][0 :: len(manifest["verification"]["sampled_blocks"]) - 1] == [10, 14]
     assert all(client.page_size == 2 and client.calls[-1] == "execute" and "b.gas_limit AS _proof_gas_limit" in client.sql for client in clients)
     assert primary.requests == [] and verifier.requests
     rpc_config = make_config(tmp_path / "rpc.toml", primary, verifier, output_root=tmp_path / "rpc", features=features)
     rpc_artifact = artifact_from(invoke(download_args(rpc_config, dataset_id="33333333-3333-4333-8333-333333333333")))
     assert pl.read_parquet(parquet / "blocks.parquet").equals(pl.read_parquet(rpc_artifact / "blocks.parquet"))
+
+
+def test_bigquery_recovery_requires_exact_binding(
+    tmp_path: Path, chains: tuple[ChainServer, ChainServer], make_config: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    primary, verifier = chains
+    config = bigquery_config(make_config, tmp_path / "config.toml", primary, verifier, tmp_path / "out")
+    clients = iter(FakeBigQuery(primary) for _ in range(3))
+    monkeypatch.setattr(_build, "open_bigquery", lambda _project: next(clients))
+    real_publish = _build.publish
+
+    monkeypatch.setattr(_build, "publish", Mock(side_effect=KeyboardInterrupt))
+    assert error(invoke(download_args(config)))["code"] == "INTERRUPTED"
+    assert error(invoke([*download_args(config), "--format", "csv"]))["code"] == "RESUME_MISMATCH"
+    monkeypatch.setattr(_build, "publish", real_publish)
+    resumed = invoke(download_args(config))
+    assert Path(json.loads(resumed.stdout)["path"]).is_dir()
+    assert json.loads(resumed.stderr.splitlines()[-1])["recovered"] is True
+
+
+@pytest.mark.parametrize("disagreement", ["target", "sample", "ancestry", "finality"])
+def test_bigquery_rpc_disagreement_prevents_publication(
+    tmp_path: Path, chains: tuple[ChainServer, ChainServer], make_config: Any, monkeypatch: pytest.MonkeyPatch, disagreement: str
+) -> None:
+    primary, verifier = chains
+    config = bigquery_config(make_config, tmp_path / "config.toml", primary, verifier, tmp_path / "out", features=("base_fee_per_gas",))
+    changes = {"target": (14, {"hash": block_hash(99)}), "sample": (12, {"baseFeePerGas": hex(99)}), "ancestry": (16, {"parentHash": block_hash(1)})}
+    if disagreement == "finality":
+        verifier.tag_changes["hash"] = block_hash(99)
+    else:
+        number, change = changes[disagreement]
+        verifier.changes[number] = change
+    monkeypatch.setattr(_build, "open_bigquery", lambda _project: FakeBigQuery(primary))
+
+    assert error(invoke(download_args(config)))["code"] == "RPC_MISMATCH"
+    assert not any(path.name.endswith(DATASET_ID) and not path.name.startswith(".") for path in (tmp_path / "out").glob("*"))

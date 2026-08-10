@@ -21,6 +21,7 @@ from ._contract import (
     Provider,
     RequestedRange,
     ResolvedRange,
+    SourceDefinition,
     Value,
     block_hash,
     plan_features,
@@ -42,7 +43,7 @@ from ._corpus import (
     write_candidate,
     write_checkpoint,
 )
-from ._rpc import BigQueryClient, BigQueryPlan, Rpc, compile_bigquery, open_bigquery
+from ._sources import BigQueryClient, BigQueryPlan, Rpc, compile_bigquery, open_bigquery
 
 Progress = Callable[[dict[str, object]], None]
 Publication = Callable[[Literal["publishing", "committed"]], None]
@@ -59,7 +60,7 @@ class DownloadSpec:
     plan: Plan
     output_root: Path
     output_format: OutputFormat
-    source: Literal["rpc", "bigquery"]
+    source: SourceDefinition
     primary: Provider | None
     verifier: Provider
     bigquery: BigQuerySettings | None = None
@@ -67,14 +68,8 @@ class DownloadSpec:
 
 async def download(spec: DownloadSpec, *, progress: Progress, publication: Publication) -> dict[str, object]:
     validate_uuid(spec.dataset_id)
-    if spec.source == "bigquery":
-        if spec.bigquery is None or spec.chain.bigquery_dataset is None or spec.primary is not None:
-            raise BlockweaverError("SOURCE_UNAVAILABLE", "BigQuery source is not fully configured")
-        warehouse = open_bigquery(spec.bigquery.project)
-        return await _download_bigquery(spec, warehouse, progress=progress, publication=publication)
-    if spec.primary is None or spec.bigquery is not None:
-        raise BlockweaverError("SOURCE_UNAVAILABLE", "RPC source is not fully configured")
-    return await _download_rpc(spec, progress=progress, publication=publication)
+    spec.source.validate_runtime(spec.chain, primary=spec.primary, bigquery=spec.bigquery)
+    return await _DOWNLOADERS[spec.source.runner](spec, progress=progress, publication=publication)
 
 
 async def _download_rpc(spec: DownloadSpec, *, progress: Progress, publication: Publication) -> dict[str, object]:
@@ -117,13 +112,13 @@ async def _download_rpc(spec: DownloadSpec, *, progress: Progress, publication: 
 
 async def _download_bigquery(
     spec: DownloadSpec,
-    warehouse: BigQueryClient,
     *,
     progress: Progress,
     publication: Publication,
 ) -> dict[str, object]:
     assert spec.bigquery is not None and spec.chain.bigquery_dataset is not None
     settings, dataset = spec.bigquery, spec.chain.bigquery_dataset
+    warehouse = open_bigquery(settings.project)
     progress({"event": "request", "dataset_id": str(spec.dataset_id)})
     try:
         async with _rpc(spec.verifier) as verifier:
@@ -177,6 +172,9 @@ async def _download_bigquery(
         raise BlockweaverError("IO_FAILED", str(error)) from None
     except Exception as error:
         raise BlockweaverError("BIGQUERY_FAILED", str(error) or type(error).__name__) from None
+
+
+_DOWNLOADERS = {"rpc": _download_rpc, "bigquery": _download_bigquery}
 
 
 async def _materialize(
@@ -277,8 +275,9 @@ def _prepare_bigquery(
     return bytes_processed
 
 
-def _compatible_bigquery_type(actual: str, expected: str) -> bool:
-    return actual == expected or {actual, expected} <= {"INTEGER", "INT64"}
+def _compatible_bigquery_type(actual: tuple[str, str], expected: str) -> bool:
+    dtype, mode = actual
+    return mode in {"NULLABLE", "REQUIRED"} and (dtype == expected or {dtype, expected} <= {"INTEGER", "INT64"})
 
 
 def _bigquery_chunks(
@@ -518,7 +517,10 @@ async def _connect_ancestry(previous: Header, tagged: Header, rpc: Rpc) -> None:
     while cursor <= tagged.block_number:
         last = min(cursor + _CHUNK_SIZE - 1, tagged.block_number)
         segment = await rpc.headers(range(cursor, last + 1), _INTEGRITY_PLAN)
-        validate_links(segment, previous)
+        try:
+            validate_links(segment, previous)
+        except ValueError as error:
+            raise BlockweaverError("RPC_MISMATCH", str(error)) from None
         previous = segment[-1]
         cursor = last + 1
     reread = await rpc.header(tagged.block_number, _INTEGRITY_PLAN)
@@ -595,7 +597,7 @@ def _binding(spec: DownloadSpec, resolved: ResolvedRange) -> dict[str, object]:
         "version": 1,
         "dataset_id": str(spec.dataset_id),
         "chain": {"name": spec.chain.name, "chain_id": spec.chain.chain_id, "finality_tag": spec.chain.finality_tag},
-        "source": _source_document(spec),
+        "source": spec.source.manifest_document(spec.chain, spec.primary, spec.verifier),
         "requested_range": spec.requested_range.document(),
         "resolved_range": resolved.document(),
         "features": list(spec.plan.columns[1:]),
@@ -616,24 +618,16 @@ def _manifest(
         "tool_version": __version__,
         "dataset_id": str(spec.dataset_id),
         "chain": {"name": spec.chain.name, "chain_id": spec.chain.chain_id},
-        "source": _source_document(spec),
+        "source": spec.source.manifest_document(spec.chain, spec.primary, spec.verifier),
         "requested_range": spec.requested_range.document(),
         "resolved_range": resolved.document(),
         "schema": spec.plan.schema_document(),
-        "acquisition_plan": spec.plan.document(spec.source),
+        "acquisition_plan": spec.plan.document(spec.source.name),
         "row_count": resolved.last_block - resolved.first_block + 1,
         "target_hash": target_hash,
         "finalized_anchor": anchor.document(),
         "verification": verification,
     }
-
-
-def _source_document(spec: DownloadSpec) -> dict[str, object]:
-    if spec.source == "bigquery":
-        assert spec.chain.bigquery_dataset is not None
-        return {"type": "bigquery", "dataset": spec.chain.bigquery_dataset, "verifier": spec.verifier.name}
-    assert spec.primary is not None
-    return {"type": "rpc", "provider": spec.primary.name, "verifier": spec.verifier.name}
 
 
 def _sample_numbers(dataset_id: UUID, first_block: int, last_block: int) -> list[int]:

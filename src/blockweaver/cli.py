@@ -21,10 +21,13 @@ from ._contract import (
     FEATURES,
     BlockweaverError,
     Provider,
+    configured_sources,
     load_config,
     plan_features,
     requested_range,
     selected_config_path,
+    source_definition,
+    source_definitions,
 )
 
 _EXAMPLE_CONFIG = """[defaults]
@@ -109,20 +112,17 @@ def chains(config: ConfigPath = None) -> None:
         settings = load_config(selected_config_path(config))
         values = []
         for chain in settings.chains.values():
-            sources = ["rpc"]
-            if chain.bigquery_dataset is not None and settings.bigquery is not None:
-                sources.append("bigquery")
             value: dict[str, object] = {
                 "name": chain.name,
                 "chain_id": chain.chain_id,
                 "finality_tag": chain.finality_tag,
                 "provider": chain.provider or settings.defaults.provider,
                 "verifier": chain.verifier or settings.defaults.verifier,
-                "source_support": sources,
+                "source_support": list(configured_sources(settings, chain)),
                 "default": chain.name == settings.defaults.chain,
             }
-            if chain.bigquery_dataset is not None:
-                value["bigquery_dataset"] = chain.bigquery_dataset
+            for definition in source_definitions():
+                value.update(definition.chain_document(chain))
             values.append(value)
         _output({"version": 1, "chains": values})
     except BlockweaverError as error:
@@ -138,7 +138,7 @@ def features(
     try:
         settings = load_config(selected_config_path(config))
         selected_chain = settings.chain(chain)
-        sources = ("rpc", "bigquery") if selected_chain.bigquery_dataset is not None and settings.bigquery is not None else ("rpc",)
+        sources = configured_sources(settings, selected_chain)
         _output(
             {
                 "version": 1,
@@ -178,21 +178,23 @@ def download(
     try:
         settings = load_config(selected_config_path(config))
         selected_chain = settings.chain(chain)
-        selected_source = source or settings.defaults.source
+        selected_source = source_definition(source or settings.defaults.source)
+        if not selected_source.configured(settings, selected_chain):
+            raise BlockweaverError("SOURCE_UNAVAILABLE", f"Chain {selected_chain.name} does not configure source={selected_source.name}")
+        if not selected_source.accepts_primary_options and (provider is not None or rpc_url is not None):
+            raise BlockweaverError("SOURCE_OPTION_INVALID", f"--provider and --rpc-url do not apply to source={selected_source.name}")
         verifier_name = verifier or selected_chain.verifier or settings.defaults.verifier
         verifying = settings.provider(verifier_name, url=verify_rpc_url, batch_size=batch_size, concurrency=concurrency, timeout=timeout)
-        primary = None
-        bigquery = None
-        if selected_source == "rpc":
-            primary_name = provider or selected_chain.provider or settings.defaults.provider
-            primary = settings.provider(primary_name, url=rpc_url, batch_size=batch_size, concurrency=concurrency, timeout=timeout)
+        primary_name = provider or selected_chain.provider or settings.defaults.provider
+        primary = (
+            settings.provider(primary_name, url=rpc_url, batch_size=batch_size, concurrency=concurrency, timeout=timeout)
+            if "primary" in selected_source.runtime_requirements
+            else None
+        )
+        bigquery = settings.bigquery_settings() if "bigquery" in selected_source.runtime_requirements else None
+        if primary is not None:
             secrets.append(primary.url)
-        else:
-            if selected_chain.bigquery_dataset is None:
-                raise BlockweaverError("SOURCE_UNAVAILABLE", f"Chain {selected_chain.name} has no BigQuery dataset configured")
-            if provider is not None or rpc_url is not None:
-                raise BlockweaverError("SOURCE_OPTION_INVALID", "--provider and --rpc-url apply only to source=rpc")
-            bigquery = settings.bigquery_settings()
+        if bigquery is not None:
             secrets.append(bigquery.project)
         secrets.append(verifying.url)
         spec = DownloadSpec(
