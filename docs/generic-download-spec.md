@@ -129,10 +129,12 @@ Progress and errors remain JSON Lines on stderr; success is one JSON receipt on 
 
 ### Slice 1: Generic RPC download product
 
-- Status: pending
-- Baseline: to be pinned after this ledger is committed
-- Implementer: pending
-- Reviewer: pending
+- Status: green
+- Baseline: `888e76c620e2048a5e9d8058e152e159f05a40e6`
+- Final head: `b020dcef01e76559d6e416e8f9419f86bed36962`
+- Implementer: `/root/slice1_rpc`
+- Reviewer: `/root/slice1_review`
+- Review result: `GREEN LIGHT` after two correction rounds
 - Dependencies: none
 - External gates: no public RPC calls
 
@@ -162,10 +164,20 @@ Checks:
 - `uv run pytest`
 - Ruff lint and format, Pyright, Vulture, `git diff --check`, locked dependency check, residue search for removed commands/schema.
 
+Execution:
+
+- Initial implementation `a44326fd79796182bbd178c02b988ea1144822e7`: 14 tests and all static/lock/residue gates passed. Fixed-range review rejected it with six Standards and six Spec findings, including one duplicate across axes.
+- Original findings: noncanonical manifest acceptance; malformed URLs and non-finite timeouts; overwrite race at publication; README/init mismatch; unused parameter; unbounded full RPC verification; unproved time-range edges; checkpoint proof/export divergence; incomplete recovery binding validation; and an early completion timestamp.
+- Correction 1 `1bebe8ed0bea80f32fceef567386e6791ba5d2a5`: closed all original findings and passed 30 tests plus all gates. Delta review found three correction-introduced findings: a private-helper publication test, brittle README byte coupling, and rejection of valid Basic-auth RPC URLs.
+- Correction 2 `b020dcef01e76559d6e416e8f9419f86bed36962`: moved the race test through the CLI seam, removed Markdown byte coupling, and accepted/redacted valid credentialed RPC URLs. It passed 31 tests plus Ruff lint/format, Pyright, Vulture, `uv lock --check`, and `git diff --check`.
+- Final proportional integration: 31 tests passed; CLI exposes only `init`, `chains`, `features`, `download`, and `verify`; legacy/fixed-schema/Avalanche/Google implementation residue search was empty; checkout was clean.
+- Final limits: five implementation modules, three core runtime dependencies, 752 test lines.
+- Not run: public RPC, archival-provider, quota, or real cross-provider validation.
+
 ### Slice 2: Generic BigQuery source
 
 - Status: pending
-- Baseline: Slice 1 green head
+- Baseline: to be pinned after the Slice 1 ledger update commit
 - Implementer: pending
 - Reviewer: pending
 - Dependencies: Slice 1
