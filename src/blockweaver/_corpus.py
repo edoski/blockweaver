@@ -22,7 +22,18 @@ from uuid import UUID
 
 import polars as pl
 
-from ._contract import Anchor, BlockweaverError, Header, Plan, ResolvedRange, Value, format_utc, plan_features, validate_links
+from ._contract import (
+    Anchor,
+    BlockweaverError,
+    Header,
+    Plan,
+    ResolvedRange,
+    Value,
+    format_utc,
+    plan_features,
+    validate_dataset_identifier,
+    validate_links,
+)
 
 _CHUNK = re.compile(r"(\d{20})-(\d{20})-([0-9a-f]{64})\.parquet\Z")
 _HASH = re.compile(r"0x[0-9a-f]{64}\Z")
@@ -390,8 +401,20 @@ def _load_dataset(path: Path, *, work: bool) -> LoadedDataset:
     chain = _exact_table(manifest["chain"], {"name", "chain_id"}, "chain")
     if not isinstance(chain["name"], str) or _NAME.fullmatch(chain["name"]) is None or type(chain["chain_id"]) is not int or chain["chain_id"] <= 0:
         raise ValueError("Invalid manifest chain")
-    source = _exact_table(manifest["source"], {"type", "provider", "verifier"}, "source")
-    if source["type"] != "rpc" or any(not isinstance(source[key], str) or _NAME.fullmatch(source[key]) is None for key in ("provider", "verifier")):
+    source_value = manifest["source"]
+    if not isinstance(source_value, dict):
+        raise ValueError("Invalid manifest source")
+    source_type = source_value.get("type")
+    if source_type == "rpc":
+        source = _exact_table(source_value, {"type", "provider", "verifier"}, "source")
+        if any(not isinstance(source[key], str) or _NAME.fullmatch(source[key]) is None for key in ("provider", "verifier")):
+            raise ValueError("Invalid manifest source")
+    elif source_type == "bigquery":
+        source = _exact_table(source_value, {"type", "dataset", "verifier"}, "source")
+        if not isinstance(source["dataset"], str) or not isinstance(source["verifier"], str) or _NAME.fullmatch(source["verifier"]) is None:
+            raise ValueError("Invalid manifest source")
+        validate_dataset_identifier(source["dataset"])
+    else:
         raise ValueError("Invalid manifest source")
     requested = manifest["requested_range"]
     if not isinstance(requested, dict) or requested.get("kind") not in {"block", "time"}:
@@ -432,7 +455,7 @@ def _load_dataset(path: Path, *, work: bool) -> LoadedDataset:
     if names[0] != "block_number":
         raise ValueError("block_number must be the first schema column")
     plan = plan_features(names[1:])
-    if schema != plan.schema_document() or manifest["acquisition_plan"] != plan.document():
+    if schema != plan.schema_document() or manifest["acquisition_plan"] != plan.document(source_type):
         raise ValueError("Schema or acquisition plan is not canonical")
     output = _exact_table(manifest["output"], {"filename", "format", "bytes", "sha256"}, "output")
     if output["format"] not in {"parquet", "csv"} or output["filename"] != f"blocks.{output['format']}":
@@ -461,16 +484,21 @@ def _load_dataset(path: Path, *, work: bool) -> LoadedDataset:
         raise ValueError("Invalid finalized anchor")
     if not isinstance(manifest["target_hash"], str) or _HASH.fullmatch(manifest["target_hash"]) is None:
         raise ValueError("Invalid target hash")
-    verification = _exact_table(
-        manifest["verification"],
-        {"primary_chain_id", "verifier_chain_id", "target_agreement", "sampled_blocks"},
-        "verification",
-    )
-    if (
-        verification["primary_chain_id"] != chain["chain_id"]
-        or verification["verifier_chain_id"] != chain["chain_id"]
-        or verification["target_agreement"] is not True
-    ):
+    if source_type == "rpc":
+        verification = _exact_table(
+            manifest["verification"],
+            {"primary_chain_id", "verifier_chain_id", "target_agreement", "sampled_blocks"},
+            "verification",
+        )
+        valid_verification = verification["primary_chain_id"] == chain["chain_id"]
+    else:
+        verification = _exact_table(
+            manifest["verification"],
+            {"verifier_chain_id", "target_agreement", "sampled_blocks", "dry_run_bytes"},
+            "verification",
+        )
+        valid_verification = type(verification["dry_run_bytes"]) is int and verification["dry_run_bytes"] >= 0
+    if not valid_verification or verification["verifier_chain_id"] != chain["chain_id"] or verification["target_agreement"] is not True:
         raise ValueError("Invalid verification facts")
     samples = verification["sampled_blocks"]
     if (

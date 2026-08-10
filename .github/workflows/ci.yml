@@ -23,6 +23,7 @@ jobs:
       - run: uv python install 3.11
       - run: uv sync --locked --dev --python 3.11
       - run: uv run --python 3.11 pytest
+      - run: uv run --python 3.11 --extra bigquery python -c "from google.cloud import bigquery"
       - run: uv run --python 3.11 ruff check src tests
       - run: uv run --python 3.11 ruff format --check src tests
       - run: uv run --python 3.11 pyright

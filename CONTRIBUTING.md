@@ -11,6 +11,6 @@ uv run pyright
 uv run vulture src tests --min-confidence 80
 ```
 
-Tests must use local fake JSON-RPC servers. Never add a test that contacts a public provider or requires credentials. Test behavior through the CLI, published dataset pair, or fake external JSON-RPC boundary. Keep changes within five implementation modules, five runtime dependencies, and 900 test code lines.
+Tests must use local fake JSON-RPC and BigQuery clients. Never add a test that contacts a public provider, submits a BigQuery job, or requires credentials. Test behavior through the CLI, published dataset pair, or fake external-service boundary. Keep changes within five implementation modules, five runtime dependencies including extras, and 900 test code lines.
 
 Open an issue before broadening the CLI, durable format, dependency set, or provider model. Submit focused changes with documentation for user-visible behavior.

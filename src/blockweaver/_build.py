@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -12,6 +12,7 @@ from uuid import UUID
 from . import __version__
 from ._contract import (
     Anchor,
+    BigQuerySettings,
     BlockweaverError,
     Chain,
     Header,
@@ -21,6 +22,7 @@ from ._contract import (
     RequestedRange,
     ResolvedRange,
     Value,
+    block_hash,
     plan_features,
     validate_links,
     validate_uuid,
@@ -40,10 +42,11 @@ from ._corpus import (
     write_candidate,
     write_checkpoint,
 )
-from ._rpc import Rpc
+from ._rpc import BigQueryClient, BigQueryPlan, Rpc, compile_bigquery, open_bigquery
 
 Progress = Callable[[dict[str, object]], None]
 Publication = Callable[[Literal["publishing", "committed"]], None]
+ChunkStream = Callable[[int, int], AsyncIterator[tuple[list[Header], list[dict[str, Value]]]]]
 _CHUNK_SIZE = 1024
 _INTEGRITY_PLAN = plan_features([])
 
@@ -56,12 +59,26 @@ class DownloadSpec:
     plan: Plan
     output_root: Path
     output_format: OutputFormat
-    primary: Provider
+    source: Literal["rpc", "bigquery"]
+    primary: Provider | None
     verifier: Provider
+    bigquery: BigQuerySettings | None = None
 
 
 async def download(spec: DownloadSpec, *, progress: Progress, publication: Publication) -> dict[str, object]:
     validate_uuid(spec.dataset_id)
+    if spec.source == "bigquery":
+        if spec.bigquery is None or spec.chain.bigquery_dataset is None or spec.primary is not None:
+            raise BlockweaverError("SOURCE_UNAVAILABLE", "BigQuery source is not fully configured")
+        warehouse = open_bigquery(spec.bigquery.project)
+        return await _download_bigquery(spec, warehouse, progress=progress, publication=publication)
+    if spec.primary is None or spec.bigquery is not None:
+        raise BlockweaverError("SOURCE_UNAVAILABLE", "RPC source is not fully configured")
+    return await _download_rpc(spec, progress=progress, publication=publication)
+
+
+async def _download_rpc(spec: DownloadSpec, *, progress: Progress, publication: Publication) -> dict[str, object]:
+    assert spec.primary is not None
     if spec.primary.name == spec.verifier.name:
         raise BlockweaverError("PROVIDER_INVALID", "Primary and verifier must be distinct provider profiles")
     if spec.primary.url == spec.verifier.url:
@@ -79,77 +96,15 @@ async def download(spec: DownloadSpec, *, progress: Progress, publication: Publi
             resolved = await _resolve_range(spec.requested_range, primary, min(primary_tag.block_number, verifier_tag.block_number))
             if spec.requested_range.kind == "time":
                 await _verify_time_boundaries(spec.requested_range, resolved, primary, verifier, verifier_tag.block_number)
-            destination = dataset_path(spec.output_root.resolve(), spec.chain.name, resolved, spec.dataset_id)
-            binding = _binding(spec, resolved)
-            with locked_work(spec.output_root.resolve(), spec.dataset_id, destination) as hidden:
-                work = prepare_work(hidden, destination, binding)
-                candidate_path, receipt = work.candidate, work.receipt
-                recovered = candidate_path is not None
-                paths: list[Path] = []
-                next_block = resolved.first_block
-                previous: Header | None = None
-                reused = 0
-                if candidate_path is None:
-                    paths, next_block, previous = checkpoint_paths(
-                        work.chunks,
-                        first_block=resolved.first_block,
-                        last_block=resolved.last_block,
-                        size=_CHUNK_SIZE,
-                        plan=spec.plan,
-                    )
-                    reused = next_block - resolved.first_block
-                    progress({"event": "resume", "reused_rows": reused})
-                if receipt is None:
-                    if candidate_path is None:
-                        while next_block <= resolved.last_block:
-                            last = min(next_block + _CHUNK_SIZE - 1, resolved.last_block)
-                            headers, rows = await primary.rows(next_block, last, spec.plan)
-                            validate_links(headers, previous)
-                            chunk_path = write_checkpoint(work.chunks, next_block, last, spec.plan, headers, rows)
-                            paths.append(chunk_path)
-                            previous, next_block = headers[-1], last + 1
-                            progress({"event": "checkpoint", "from_block": headers[0].block_number, "to_block": last})
-                        assert previous is not None
-                        anchor, verifier_target = await _prove_finality(previous, verifier, spec.chain)
-                        sample_numbers = _sample_numbers(spec.dataset_id, resolved.first_block, resolved.last_block)
-                        local_samples = checkpoint_facts(paths, spec.plan, sample_numbers)
-                        await _check_rows(local_samples, sample_numbers, spec.plan, verifier)
-                        verification = {
-                            "primary_chain_id": primary_chain_id,
-                            "verifier_chain_id": verifier_chain_id,
-                            "target_agreement": previous == verifier_target,
-                            "sampled_blocks": sample_numbers,
-                        }
-                        manifest = _manifest(spec, resolved, previous.block_hash, anchor, verification)
-                        candidate_path = hidden / "ready.tmp"
-                        candidate = write_candidate(
-                            candidate_path,
-                            plan=spec.plan,
-                            output_format=spec.output_format,
-                            sources=paths,
-                            manifest=manifest,
-                        )
-                        acquired = candidate.rows - reused
-                    else:
-                        candidate = load_dataset(candidate_path, work=candidate_path.name in {"ready", "ready.tmp"})
-                        await _validate_candidate(candidate, primary, verifier, spec.chain)
-                        anchor = candidate.anchor
-                        acquired, reused = 0, candidate.rows
-                    receipt = _receipt("download", candidate, destination, reused, acquired, anchor)
-                assert candidate_path is not None and receipt is not None
-                if work.published:
-                    publication("committed")
-                else:
-                    save_ready(hidden, candidate_path, receipt)
-                    publication("publishing")
-                    publish(hidden, destination)
-                    publication("committed")
-                discard_work(hidden)
-                event: dict[str, object] = {"event": "published", "dataset_id": str(spec.dataset_id), "path": str(destination)}
-                if recovered:
-                    event["recovered"] = True
-                progress(event)
-                return receipt
+
+            async def chunks(first: int, last: int) -> AsyncIterator[tuple[list[Header], list[dict[str, Value]]]]:
+                while first <= last:
+                    end = min(first + _CHUNK_SIZE - 1, last)
+                    yield await primary.rows(first, end, spec.plan)
+                    first = end + 1
+
+            verification: dict[str, object] = {"primary_chain_id": primary_chain_id, "verifier_chain_id": verifier_chain_id}
+            return await _materialize(spec, resolved, verifier, primary, chunks, verification, progress, publication)
     except BlockweaverError:
         raise
     except ValueError as error:
@@ -158,6 +113,233 @@ async def download(spec: DownloadSpec, *, progress: Progress, publication: Publi
         raise BlockweaverError("RPC_FAILED", str(error)) from None
     except OSError as error:
         raise BlockweaverError("IO_FAILED", str(error)) from None
+
+
+async def _download_bigquery(
+    spec: DownloadSpec,
+    warehouse: BigQueryClient,
+    *,
+    progress: Progress,
+    publication: Publication,
+) -> dict[str, object]:
+    assert spec.bigquery is not None and spec.chain.bigquery_dataset is not None
+    settings, dataset = spec.bigquery, spec.chain.bigquery_dataset
+    progress({"event": "request", "dataset_id": str(spec.dataset_id)})
+    try:
+        async with _rpc(spec.verifier) as verifier:
+            verifier_chain_id = await verifier.chain_id()
+            if verifier_chain_id != spec.chain.chain_id:
+                raise BlockweaverError("RPC_CHAIN_MISMATCH", "Verifier RPC chain ID does not match the configured chain")
+            tagged = await verifier.tagged_header(spec.chain.finality_tag, _INTEGRITY_PLAN)
+            resolved = await _resolve_range(spec.requested_range, verifier, tagged.block_number)
+            if spec.requested_range.kind == "time":
+                await _verify_time_boundaries(spec.requested_range, resolved, verifier, verifier, tagged.block_number)
+            verification: dict[str, object] = {"verifier_chain_id": verifier_chain_id, "dry_run_bytes": 0}
+
+            async def chunks(first: int, last: int) -> AsyncIterator[tuple[list[Header], list[dict[str, Value]]]]:
+                if first > last:
+                    return
+                query = compile_bigquery(dataset, spec.plan)
+                parameters = {
+                    "first_block": first,
+                    "last_block": last,
+                    "from_timestamp": resolved.first_timestamp,
+                    "to_timestamp": resolved.last_timestamp,
+                }
+                dry_run_bytes = _prepare_bigquery(
+                    warehouse,
+                    dataset,
+                    query,
+                    parameters,
+                    settings.maximum_bytes_billed,
+                )
+                verification["dry_run_bytes"] = dry_run_bytes
+                progress({"event": "bigquery_dry_run", "bytes_processed": dry_run_bytes})
+                for chunk in _bigquery_chunks(
+                    warehouse,
+                    query,
+                    parameters,
+                    settings.maximum_bytes_billed,
+                    first,
+                    last,
+                    spec.plan,
+                ):
+                    yield chunk
+
+            return await _materialize(spec, resolved, verifier, None, chunks, verification, progress, publication)
+    except BlockweaverError:
+        raise
+    except ValueError as error:
+        raise BlockweaverError("BIGQUERY_INVALID", str(error)) from None
+    except RuntimeError as error:
+        raise BlockweaverError("RPC_FAILED", str(error)) from None
+    except OSError as error:
+        raise BlockweaverError("IO_FAILED", str(error)) from None
+    except Exception as error:
+        raise BlockweaverError("BIGQUERY_FAILED", str(error) or type(error).__name__) from None
+
+
+async def _materialize(
+    spec: DownloadSpec,
+    resolved: ResolvedRange,
+    verifier: Rpc,
+    primary: Rpc | None,
+    chunks: ChunkStream,
+    verification: dict[str, object],
+    progress: Progress,
+    publication: Publication,
+) -> dict[str, object]:
+    root = spec.output_root.resolve()
+    destination = dataset_path(root, spec.chain.name, resolved, spec.dataset_id)
+    with locked_work(root, spec.dataset_id, destination) as hidden:
+        work = prepare_work(hidden, destination, _binding(spec, resolved))
+        candidate_path, receipt = work.candidate, work.receipt
+        recovered = candidate_path is not None
+        paths: list[Path] = []
+        next_block = resolved.first_block
+        previous: Header | None = None
+        reused = 0
+        if candidate_path is None:
+            paths, next_block, previous = checkpoint_paths(
+                work.chunks,
+                first_block=resolved.first_block,
+                last_block=resolved.last_block,
+                size=_CHUNK_SIZE,
+                plan=spec.plan,
+            )
+            reused = next_block - resolved.first_block
+            progress({"event": "resume", "reused_rows": reused})
+        if receipt is None:
+            if candidate_path is None:
+                async for headers, rows in chunks(next_block, resolved.last_block):
+                    expected_last = min(next_block + _CHUNK_SIZE - 1, resolved.last_block)
+                    if not headers or len(headers) != len(rows) or (headers[0].block_number, headers[-1].block_number) != (next_block, expected_last):
+                        raise ValueError("Source did not return a deterministic complete chunk")
+                    validate_links(headers, previous)
+                    if next_block == resolved.first_block and headers[0].timestamp != resolved.first_timestamp:
+                        raise ValueError("Source start timestamp does not match the resolved range")
+                    paths.append(write_checkpoint(work.chunks, next_block, expected_last, spec.plan, headers, rows))
+                    previous, next_block = headers[-1], expected_last + 1
+                    progress({"event": "checkpoint", "from_block": headers[0].block_number, "to_block": expected_last})
+                if previous is None or next_block != resolved.last_block + 1 or previous.timestamp != resolved.last_timestamp:
+                    raise ValueError("Source did not return the exact resolved range")
+                anchor, verifier_target = await _prove_finality(previous, verifier, spec.chain)
+                sample_numbers = _sample_numbers(spec.dataset_id, resolved.first_block, resolved.last_block)
+                await _check_rows(checkpoint_facts(paths, spec.plan, sample_numbers), sample_numbers, spec.plan, verifier)
+                verification.update({"target_agreement": previous == verifier_target, "sampled_blocks": sample_numbers})
+                candidate_path = hidden / "ready.tmp"
+                candidate = write_candidate(
+                    candidate_path,
+                    plan=spec.plan,
+                    output_format=spec.output_format,
+                    sources=paths,
+                    manifest=_manifest(spec, resolved, previous.block_hash, anchor, verification),
+                )
+                acquired = candidate.rows - reused
+            else:
+                candidate = load_dataset(candidate_path, work=candidate_path.name in {"ready", "ready.tmp"})
+                await _validate_candidate(candidate, primary, verifier, spec.chain)
+                anchor = candidate.anchor
+                acquired, reused = 0, candidate.rows
+            receipt = _receipt("download", candidate, destination, reused, acquired, anchor)
+        assert candidate_path is not None and receipt is not None
+        if work.published:
+            publication("committed")
+        else:
+            save_ready(hidden, candidate_path, receipt)
+            publication("publishing")
+            publish(hidden, destination)
+            publication("committed")
+        discard_work(hidden)
+        event: dict[str, object] = {"event": "published", "dataset_id": str(spec.dataset_id), "path": str(destination)}
+        if recovered:
+            event["recovered"] = True
+        progress(event)
+        return receipt
+
+
+def _prepare_bigquery(
+    warehouse: BigQueryClient,
+    dataset: str,
+    query: BigQueryPlan,
+    parameters: dict[str, int],
+    maximum_bytes_billed: int,
+) -> int:
+    for table, expected in query.table_fields.items():
+        actual = warehouse.table_schema(dataset, table)
+        if any(field not in actual or not _compatible_bigquery_type(actual[field], dtype) for field, dtype in expected.items()):
+            raise BlockweaverError("SOURCE_FEATURE_UNAVAILABLE", f"Configured BigQuery dataset does not support the selected features in {table}")
+    bytes_processed, schema = warehouse.dry_run(query.sql, parameters)
+    if set(schema) != set(query.result_schema) or any(not _compatible_bigquery_type(schema[name], dtype) for name, dtype in query.result_schema.items()):
+        raise BlockweaverError("BIGQUERY_SCHEMA_INVALID", "BigQuery dry-run result schema does not match the selected feature plan")
+    if bytes_processed > maximum_bytes_billed:
+        raise BlockweaverError("BIGQUERY_COST_LIMIT", "BigQuery dry run exceeds maximum_bytes_billed")
+    return bytes_processed
+
+
+def _compatible_bigquery_type(actual: str, expected: str) -> bool:
+    return actual == expected or {actual, expected} <= {"INTEGER", "INT64"}
+
+
+def _bigquery_chunks(
+    warehouse: BigQueryClient,
+    query: BigQueryPlan,
+    parameters: dict[str, int],
+    maximum_bytes_billed: int,
+    first_block: int,
+    last_block: int,
+    plan: Plan,
+) -> Iterator[tuple[list[Header], list[dict[str, Value]]]]:
+    headers: list[Header] = []
+    rows: list[dict[str, Value]] = []
+    expected = first_block
+    for page in warehouse.pages(query.sql, parameters, maximum_bytes_billed, _CHUNK_SIZE):
+        for value in page:
+            header, row = _parse_bigquery_row(value, query.result_schema, plan, expected)
+            headers.append(header)
+            rows.append(row)
+            expected += 1
+            if len(headers) == _CHUNK_SIZE:
+                yield headers, rows
+                headers, rows = [], []
+    if headers:
+        yield headers, rows
+    if expected != last_block + 1:
+        raise BlockweaverError("BIGQUERY_INVALID", "BigQuery did not return the exact contiguous requested range")
+
+
+def _parse_bigquery_row(value: Mapping[str, object], schema: dict[str, str], plan: Plan, expected: int) -> tuple[Header, dict[str, Value]]:
+    if set(value) != set(schema):
+        raise BlockweaverError("BIGQUERY_INVALID", "BigQuery returned a noncanonical row shape")
+    number = _bigquery_int(value["block_number"], "block_number")
+    if number != expected:
+        raise BlockweaverError("BIGQUERY_INVALID", "BigQuery did not return the exact contiguous requested range")
+    timestamp = _bigquery_int(value["_proof_timestamp"], "timestamp")
+    header = Header(
+        number,
+        block_hash(value["_proof_hash"], "block hash"),
+        block_hash(value["_proof_parent_hash"], "parent hash"),
+        timestamp,
+        {},
+    )
+    if "_proof_gas_limit" in schema:
+        gas_used = _bigquery_int(value["_proof_gas_used"], "gas used")
+        gas_limit = _bigquery_int(value["_proof_gas_limit"], "gas limit")
+        if gas_limit == 0 or gas_used > gas_limit:
+            raise BlockweaverError("BIGQUERY_INVALID", f"BigQuery returned an invalid gas domain for block {number}")
+    if plan.percentiles and _bigquery_int(value["_receipt_gas_used"], "receipt gas used") != _bigquery_int(value["_proof_gas_used"], "block gas used"):
+        raise BlockweaverError("BIGQUERY_INVALID", f"BigQuery receipts are incomplete for block {number}")
+    row: dict[str, Value] = {"block_number": number}
+    for feature in plan.features:
+        raw = value[feature.name]
+        row[feature.name] = block_hash(raw, feature.name) if feature.dtype == "UTF-8" else _bigquery_int(raw, feature.name)
+    return header, row
+
+
+def _bigquery_int(value: object, label: str) -> int:
+    if type(value) is not int or value < 0 or value > 2**63 - 1:
+        raise BlockweaverError("BIGQUERY_INVALID", f"BigQuery returned an invalid {label}")
+    return value
 
 
 async def verify_dataset(
@@ -393,15 +575,16 @@ async def _check_full_dataset(dataset: LoadedDataset, rpc: Rpc) -> None:
         raise BlockweaverError("ARTIFACT_INVALID", "Dataset streaming coverage changed during verification")
 
 
-async def _validate_candidate(dataset: LoadedDataset, primary: Rpc, verifier: Rpc, chain: Chain) -> None:
+async def _validate_candidate(dataset: LoadedDataset, primary: Rpc | None, verifier: Rpc, chain: Chain) -> None:
     if dataset.chain_id != chain.chain_id:
         raise BlockweaverError("RESUME_MISMATCH", "Ready candidate chain does not match the request")
-    target = await primary.header(dataset.last_block, dataset.plan)
-    if target.block_hash != dataset.manifest["target_hash"]:
-        raise BlockweaverError("RPC_MISMATCH", "Ready candidate target hash does not match primary RPC")
     verifier_target = await verifier.header(dataset.last_block, dataset.plan)
-    if not _same_header(target, verifier_target):
-        raise BlockweaverError("RPC_MISMATCH", "RPC endpoints disagree on the ready candidate target")
+    if verifier_target.block_hash != dataset.manifest["target_hash"]:
+        raise BlockweaverError("RPC_MISMATCH", "Ready candidate target hash does not match verifier RPC")
+    if primary is not None:
+        target = await primary.header(dataset.last_block, dataset.plan)
+        if not _same_header(target, verifier_target):
+            raise BlockweaverError("RPC_MISMATCH", "RPC endpoints disagree on the ready candidate target")
     await _refresh_finality(verifier_target, dataset.anchor, verifier)
     numbers = _sample_numbers(UUID(dataset.manifest["dataset_id"]), dataset.first_block, dataset.last_block)
     await _check_rows(dataset.facts(numbers), numbers, dataset.plan, verifier)
@@ -412,7 +595,7 @@ def _binding(spec: DownloadSpec, resolved: ResolvedRange) -> dict[str, object]:
         "version": 1,
         "dataset_id": str(spec.dataset_id),
         "chain": {"name": spec.chain.name, "chain_id": spec.chain.chain_id, "finality_tag": spec.chain.finality_tag},
-        "source": {"type": "rpc", "provider": spec.primary.name, "verifier": spec.verifier.name},
+        "source": _source_document(spec),
         "requested_range": spec.requested_range.document(),
         "resolved_range": resolved.document(),
         "features": list(spec.plan.columns[1:]),
@@ -433,16 +616,24 @@ def _manifest(
         "tool_version": __version__,
         "dataset_id": str(spec.dataset_id),
         "chain": {"name": spec.chain.name, "chain_id": spec.chain.chain_id},
-        "source": {"type": "rpc", "provider": spec.primary.name, "verifier": spec.verifier.name},
+        "source": _source_document(spec),
         "requested_range": spec.requested_range.document(),
         "resolved_range": resolved.document(),
         "schema": spec.plan.schema_document(),
-        "acquisition_plan": spec.plan.document(),
+        "acquisition_plan": spec.plan.document(spec.source),
         "row_count": resolved.last_block - resolved.first_block + 1,
         "target_hash": target_hash,
         "finalized_anchor": anchor.document(),
         "verification": verification,
     }
+
+
+def _source_document(spec: DownloadSpec) -> dict[str, object]:
+    if spec.source == "bigquery":
+        assert spec.chain.bigquery_dataset is not None
+        return {"type": "bigquery", "dataset": spec.chain.bigquery_dataset, "verifier": spec.verifier.name}
+    assert spec.primary is not None
+    return {"type": "rpc", "provider": spec.primary.name, "verifier": spec.verifier.name}
 
 
 def _sample_numbers(dataset_id: UUID, first_block: int, last_block: int) -> list[int]:

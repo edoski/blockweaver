@@ -24,6 +24,7 @@ features = ["timestamp", "block_hash", "base_fee_per_gas", "gas_used", "gas_limi
 [chains.local]
 chain_id = 31337
 finality_tag = "finalized"
+# bigquery_dataset = "project.dataset"
 
 [providers.primary]
 url_env = "BLOCKWEAVER_PRIMARY_RPC_URL"
@@ -36,11 +37,15 @@ url_env = "BLOCKWEAVER_VERIFIER_RPC_URL"
 batch_size = 20
 concurrency = 6
 timeout = 30
+
+# [bigquery]
+# project_env = "GOOGLE_CLOUD_PROJECT"
+# maximum_bytes_billed = 1000000000
 ```
 
 Configuration is strict: unknown keys, unknown profiles, invalid URLs, ambiguous `url`/`url_env` pairs, and non-finite or greater-than-one-hour timeouts fail before network access. Chain profiles may override `provider` and `verifier`. CLI values override the selected chain and provider profiles, which override global defaults.
 
-Inspect configuration and the closed feature catalog without exposing endpoints:
+Inspect configuration and the closed feature catalog without exposing endpoints. `chains` reports `bigquery` only for chains with a dataset and billing configuration; `features` reports each source supported by the tool and configured for the selected chain.
 
 ```console
 blockweaver chains
@@ -100,11 +105,43 @@ Progress and errors are JSON Lines on stderr. Errors include stable `code` and `
 
 Providers must implement EVM JSON-RPC batch requests, historical `eth_getBlockByNumber`, the configured `finalized` or `safe` tag, and `eth_feeHistory` when priority-fee features are selected. Independent verification consumes quota. Blockweaver checks provider agreement, numbered ancestry to the tagged anchor, a numbered anchor reread, and deterministic row samples; this is strong operational verification, not a trustless consensus client.
 
+## BigQuery source
+
+Google Blockchain Analytics is an optional acquisition route for history that an RPC provider cannot serve. Install it explicitly; ordinary RPC installs do not include Google libraries:
+
+```console
+uv tool install 'blockweaver[bigquery]'
+```
+
+Configure a strictly validated `project.dataset` identifier on the chain and one billing project or environment reference. The byte cap is mandatory.
+
+```toml
+[chains.my_chain]
+chain_id = 12345
+finality_tag = "finalized"
+bigquery_dataset = "project.dataset"
+
+[bigquery]
+project_env = "GOOGLE_CLOUD_PROJECT"
+maximum_bytes_billed = 1000000000
+```
+
+Select it globally with `defaults.source = "bigquery"` or per request:
+
+```console
+blockweaver download --source bigquery --from-block 1000000 --to-block 1000999
+```
+
+The same ranges, features, formats, resume state, receipts, and two-file artifacts apply to both sources. Time ranges are resolved against the configured verifier RPC before BigQuery planning. Blockweaver reads the required `blocks`, `transactions`, and `receipts` schemas, rejects unavailable selected features, then performs a dry run and checks its result schema and estimated bytes. Only then does it execute the fixed whitelisted query with `maximum_bytes_billed` enforced again by BigQuery. Results stream through bounded pages into the normal checkpoints.
+
+BigQuery rows are not trusted as chain truth. The verifier RPC checks chain ID, resolved edges, target hash, deterministic row samples, numbered ancestry, and a reread finalized or safe anchor before publication. The manifest records the dataset identifier and verifier profile, never the billing project, environment value, credentials, or SQL text. The configured dataset must expose the recognized common Google Blockchain Analytics schema; arbitrary SQL and field mappings are not supported.
+
 For development:
 
 ```console
 uv sync --locked --dev
 uv run pytest
+uv run --extra bigquery python -c 'from google.cloud import bigquery'
 uv run ruff check src tests
 uv run ruff format --check src tests
 uv run pyright

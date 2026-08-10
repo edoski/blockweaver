@@ -39,6 +39,7 @@ features = ["timestamp", "block_hash", "base_fee_per_gas", "gas_used", "gas_limi
 [chains.local]
 chain_id = 31337
 finality_tag = "finalized"
+# bigquery_dataset = "project.dataset"
 
 [providers.primary]
 url_env = "BLOCKWEAVER_PRIMARY_RPC_URL"
@@ -51,6 +52,10 @@ url_env = "BLOCKWEAVER_VERIFIER_RPC_URL"
 batch_size = 20
 concurrency = 6
 timeout = 30
+
+# [bigquery]
+# project_env = "GOOGLE_CLOUD_PROJECT"
+# maximum_bytes_billed = 1000000000
 """
 
 
@@ -104,17 +109,21 @@ def chains(config: ConfigPath = None) -> None:
         settings = load_config(selected_config_path(config))
         values = []
         for chain in settings.chains.values():
-            values.append(
-                {
-                    "name": chain.name,
-                    "chain_id": chain.chain_id,
-                    "finality_tag": chain.finality_tag,
-                    "provider": chain.provider or settings.defaults.provider,
-                    "verifier": chain.verifier or settings.defaults.verifier,
-                    "source_support": ["rpc"],
-                    "default": chain.name == settings.defaults.chain,
-                }
-            )
+            sources = ["rpc"]
+            if chain.bigquery_dataset is not None and settings.bigquery is not None:
+                sources.append("bigquery")
+            value: dict[str, object] = {
+                "name": chain.name,
+                "chain_id": chain.chain_id,
+                "finality_tag": chain.finality_tag,
+                "provider": chain.provider or settings.defaults.provider,
+                "verifier": chain.verifier or settings.defaults.verifier,
+                "source_support": sources,
+                "default": chain.name == settings.defaults.chain,
+            }
+            if chain.bigquery_dataset is not None:
+                value["bigquery_dataset"] = chain.bigquery_dataset
+            values.append(value)
         _output({"version": 1, "chains": values})
     except BlockweaverError as error:
         _abort(error)
@@ -129,12 +138,13 @@ def features(
     try:
         settings = load_config(selected_config_path(config))
         selected_chain = settings.chain(chain)
+        sources = ("rpc", "bigquery") if selected_chain.bigquery_dataset is not None and settings.bigquery is not None else ("rpc",)
         _output(
             {
                 "version": 1,
                 "chain": selected_chain.name,
                 "mandatory": {"name": "block_number", "type": "Int64", "unit": "block"},
-                "features": [feature.document(available=True) for feature in FEATURES],
+                "features": [feature.document(available_sources=sources) for feature in FEATURES],
             }
         )
     except BlockweaverError as error:
@@ -146,7 +156,7 @@ def download(
     *,
     config: ConfigPath = None,
     chain: Annotated[str | None, typer.Option("--chain")] = None,
-    source: Annotated[Literal["rpc"] | None, typer.Option("--source")] = None,
+    source: Annotated[Literal["rpc", "bigquery"] | None, typer.Option("--source")] = None,
     provider: Annotated[str | None, typer.Option("--provider")] = None,
     verifier: Annotated[str | None, typer.Option("--verifier")] = None,
     rpc_url: Annotated[str | None, typer.Option("--rpc-url")] = None,
@@ -169,22 +179,33 @@ def download(
         settings = load_config(selected_config_path(config))
         selected_chain = settings.chain(chain)
         selected_source = source or settings.defaults.source
-        if selected_source != "rpc":
-            raise BlockweaverError("SOURCE_UNAVAILABLE", f"Source is not available in this installation: {selected_source}")
-        primary_name = provider or selected_chain.provider or settings.defaults.provider
         verifier_name = verifier or selected_chain.verifier or settings.defaults.verifier
-        primary = settings.provider(primary_name, url=rpc_url, batch_size=batch_size, concurrency=concurrency, timeout=timeout)
         verifying = settings.provider(verifier_name, url=verify_rpc_url, batch_size=batch_size, concurrency=concurrency, timeout=timeout)
-        secrets.extend([primary.url, verifying.url])
+        primary = None
+        bigquery = None
+        if selected_source == "rpc":
+            primary_name = provider or selected_chain.provider or settings.defaults.provider
+            primary = settings.provider(primary_name, url=rpc_url, batch_size=batch_size, concurrency=concurrency, timeout=timeout)
+            secrets.append(primary.url)
+        else:
+            if selected_chain.bigquery_dataset is None:
+                raise BlockweaverError("SOURCE_UNAVAILABLE", f"Chain {selected_chain.name} has no BigQuery dataset configured")
+            if provider is not None or rpc_url is not None:
+                raise BlockweaverError("SOURCE_OPTION_INVALID", "--provider and --rpc-url apply only to source=rpc")
+            bigquery = settings.bigquery_settings()
+            secrets.append(bigquery.project)
+        secrets.append(verifying.url)
         spec = DownloadSpec(
-            dataset_id or uuid4(),
-            selected_chain,
-            requested_range(from_block, to_block, from_time, to_time),
-            plan_features(feature if feature is not None else settings.defaults.features),
-            (output_root or settings.defaults.output_root).expanduser(),
-            output_format or settings.defaults.output_format,
-            primary,
-            verifying,
+            dataset_id=dataset_id or uuid4(),
+            chain=selected_chain,
+            requested_range=requested_range(from_block, to_block, from_time, to_time),
+            plan=plan_features(feature if feature is not None else settings.defaults.features),
+            output_root=(output_root or settings.defaults.output_root).expanduser(),
+            output_format=output_format or settings.defaults.output_format,
+            source=selected_source,
+            primary=primary,
+            verifier=verifying,
+            bigquery=bigquery,
         )
     except BlockweaverError as error:
         _abort(error, secrets)

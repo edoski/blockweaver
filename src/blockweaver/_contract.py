@@ -16,7 +16,7 @@ from urllib.parse import urlsplit
 from uuid import UUID
 
 OutputFormat = Literal["parquet", "csv"]
-Source = Literal["rpc"]
+Source = Literal["rpc", "bigquery"]
 Value = int | str
 
 _INT64_MAX = 2**63 - 1
@@ -26,6 +26,8 @@ _NAME = re.compile(r"[a-z0-9][a-z0-9_-]*\Z")
 _ENV = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 _DATE = re.compile(r"\d{4}-\d{2}-\d{2}\Z")
 _DATETIME = re.compile(r"(\d{4}-\d{2}-\d{2})T(\d{2})(?::(\d{2})(?::(\d{2}))?)?(Z|[+-]\d{2}:\d{2})\Z")
+_PROJECT = re.compile(r"[a-z][a-z0-9-]{4,61}[a-z0-9]\Z")
+_DATASET = re.compile(r"([a-z][a-z0-9-]{4,61}[a-z0-9])\.([A-Za-z_][A-Za-z0-9_]{0,1023})\Z")
 
 
 class BlockweaverError(Exception):
@@ -44,32 +46,71 @@ class Feature:
     family: Literal["header", "fee_history"]
     rpc_field: str | None = None
     dependencies: tuple[str, ...] = ()
+    bigquery_family: Literal["blocks", "transactions", "receipts"] = "blocks"
+    bigquery_field: str | None = None
+    bigquery_dependencies: tuple[str, ...] = ()
     percentile: int | None = None
     domain: str = ""
 
-    def document(self, *, available: bool = True) -> dict[str, object]:
+    def document(self, *, available_sources: tuple[Source, ...] = ("rpc",)) -> dict[str, object]:
         return {
             "name": self.name,
             "type": self.dtype,
             "unit": self.unit,
-            "source_support": ["rpc"],
-            "acquisition_family": self.family,
+            "source_support": ["rpc", "bigquery"],
+            "acquisition_families": {"rpc": self.family, "bigquery": self.bigquery_family},
             "domain_rule": self.domain,
-            "hidden_dependencies": list(self.dependencies),
-            "available": available,
+            "hidden_dependencies": {"rpc": list(self.dependencies), "bigquery": list(self.bigquery_dependencies)},
+            "configured_sources": list(available_sources),
         }
 
 
 FEATURES = (
-    Feature("timestamp", "Int64", "unix_second", "header", "timestamp", domain="nonnegative, nondecreasing"),
-    Feature("block_hash", "UTF-8", "hex", "header", "hash", domain="lowercase 0x-prefixed 32-byte hash"),
-    Feature("parent_hash", "UTF-8", "hex", "header", "parentHash", domain="lowercase 0x-prefixed 32-byte hash"),
-    Feature("base_fee_per_gas", "Int64", "wei/gas", "header", "baseFeePerGas", domain="positive"),
-    Feature("gas_used", "Int64", "gas", "header", "gasUsed", ("gasLimit",), domain="nonnegative and at most gas_limit"),
-    Feature("gas_limit", "Int64", "gas", "header", "gasLimit", ("gasUsed",), domain="positive"),
-    Feature("tx_count", "Int64", "transaction", "header", "transactions", domain="nonnegative"),
-    Feature("effective_priority_fee_per_gas_p50", "Int64", "wei/gas", "fee_history", percentile=50, domain="nonnegative"),
-    Feature("effective_priority_fee_per_gas_p90", "Int64", "wei/gas", "fee_history", percentile=90, domain="nonnegative"),
+    Feature("timestamp", "Int64", "unix_second", "header", "timestamp", bigquery_field="block_timestamp", domain="nonnegative, nondecreasing"),
+    Feature("block_hash", "UTF-8", "hex", "header", "hash", bigquery_field="block_hash", domain="lowercase 0x-prefixed 32-byte hash"),
+    Feature("parent_hash", "UTF-8", "hex", "header", "parentHash", bigquery_field="parent_hash", domain="lowercase 0x-prefixed 32-byte hash"),
+    Feature("base_fee_per_gas", "Int64", "wei/gas", "header", "baseFeePerGas", bigquery_field="base_fee_per_gas", domain="positive"),
+    Feature(
+        "gas_used",
+        "Int64",
+        "gas",
+        "header",
+        "gasUsed",
+        ("gasLimit",),
+        bigquery_field="gas_used",
+        bigquery_dependencies=("gas_limit",),
+        domain="nonnegative and at most gas_limit",
+    ),
+    Feature(
+        "gas_limit",
+        "Int64",
+        "gas",
+        "header",
+        "gasLimit",
+        ("gasUsed",),
+        bigquery_field="gas_limit",
+        bigquery_dependencies=("gas_used",),
+        domain="positive",
+    ),
+    Feature("tx_count", "Int64", "transaction", "header", "transactions", bigquery_family="transactions", domain="nonnegative"),
+    Feature(
+        "effective_priority_fee_per_gas_p50",
+        "Int64",
+        "wei/gas",
+        "fee_history",
+        bigquery_family="receipts",
+        percentile=50,
+        domain="nonnegative",
+    ),
+    Feature(
+        "effective_priority_fee_per_gas_p90",
+        "Int64",
+        "wei/gas",
+        "fee_history",
+        bigquery_family="receipts",
+        percentile=90,
+        domain="nonnegative",
+    ),
 )
 FEATURE_BY_NAME = {feature.name: feature for feature in FEATURES}
 
@@ -94,7 +135,26 @@ class Plan:
             *({"name": feature.name, "type": feature.dtype, "unit": feature.unit} for feature in self.features),
         ]
 
-    def document(self) -> dict[str, object]:
+    def document(self, source: Source = "rpc") -> dict[str, object]:
+        if source == "bigquery":
+            fields = {"block_number", "block_timestamp", "block_hash", "parent_hash"}
+            fields.update(feature.bigquery_field for feature in self.features if feature.bigquery_field is not None)
+            fields.update(dependency for feature in self.features for dependency in feature.bigquery_dependencies)
+            if self.percentiles:
+                fields.update({"base_fee_per_gas", "gas_used"})
+            families: list[dict[str, object]] = [{"family": "blocks", "table": "blocks", "fields": sorted(fields)}]
+            if any(feature.bigquery_family == "transactions" for feature in self.features):
+                families.append({"family": "transactions", "table": "transactions", "fields": ["block_number", "block_timestamp"]})
+            if any(feature.bigquery_family == "receipts" for feature in self.features):
+                families.append(
+                    {
+                        "family": "receipts",
+                        "table": "receipts",
+                        "fields": ["block_number", "block_timestamp", "effective_gas_price", "gas_used", "transaction_index"],
+                        "reward_percentiles": list(self.percentiles),
+                    }
+                )
+            return {"families": families}
         families: list[dict[str, object]] = [
             {
                 "family": "header",
@@ -170,6 +230,7 @@ class Chain:
     finality_tag: Literal["finalized", "safe"]
     provider: str | None
     verifier: str | None
+    bigquery_dataset: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -184,11 +245,40 @@ class Defaults:
 
 
 @dataclass(frozen=True, slots=True)
+class BigQuerySpec:
+    project: str | None
+    project_env: str | None
+    maximum_bytes_billed: int
+
+    def resolve(self) -> BigQuerySettings:
+        project = self.project
+        from_environment = project is None
+        if project is None:
+            assert self.project_env is not None
+            project = os.environ.get(self.project_env)
+            if project is None:
+                raise BlockweaverError("CONFIG_ENV_MISSING", f"BigQuery project environment variable is not set: {self.project_env}")
+        try:
+            validate_project(project)
+        except ValueError as error:
+            raise BlockweaverError("CONFIG_INVALID", str(error)) from None
+        return BigQuerySettings(project, self.maximum_bytes_billed, from_environment)
+
+
+@dataclass(frozen=True, slots=True)
+class BigQuerySettings:
+    project: str
+    maximum_bytes_billed: int
+    from_environment: bool
+
+
+@dataclass(frozen=True, slots=True)
 class Config:
     path: Path
     defaults: Defaults
     chains: dict[str, Chain]
     providers: dict[str, ProviderSpec]
+    bigquery: BigQuerySpec | None
 
     def chain(self, name: str | None) -> Chain:
         selected = name or self.defaults.chain
@@ -225,6 +315,11 @@ class Config:
             _positive_number(timeout if timeout is not None else spec.timeout, "timeout"),
         )
 
+    def bigquery_settings(self) -> BigQuerySettings:
+        if self.bigquery is None:
+            raise BlockweaverError("SOURCE_UNAVAILABLE", "BigQuery source requires a [bigquery] configuration")
+        return self.bigquery.resolve()
+
 
 def default_config_path() -> Path:
     if sys.platform == "darwin":
@@ -251,7 +346,7 @@ def load_config(path: Path) -> Config:
     except (OSError, tomllib.TOMLDecodeError) as error:
         raise BlockweaverError("CONFIG_INVALID", f"Cannot read configuration: {error}") from None
     try:
-        _keys(document, {"defaults", "chains", "providers"}, "configuration", required={"defaults", "chains", "providers"})
+        _keys(document, {"defaults", "chains", "providers", "bigquery"}, "configuration", required={"defaults", "chains", "providers"})
         defaults_raw = _table(document["defaults"], "defaults")
         _keys(
             defaults_raw,
@@ -260,8 +355,8 @@ def load_config(path: Path) -> Config:
             required={"chain", "source", "provider", "verifier", "output_root", "format", "features"},
         )
         source = _string(defaults_raw["source"], "defaults.source")
-        if source != "rpc":
-            raise BlockweaverError("SOURCE_UNAVAILABLE", f"Source is not available in this installation: {source}")
+        if source not in {"rpc", "bigquery"}:
+            raise BlockweaverError("SOURCE_UNAVAILABLE", f"Unknown source: {source}")
         output_format = _string(defaults_raw["format"], "defaults.format")
         if output_format not in {"parquet", "csv"}:
             raise ValueError("defaults.format must be parquet or csv")
@@ -271,7 +366,7 @@ def load_config(path: Path) -> Config:
         plan_features(feature_values)
         defaults = Defaults(
             _name(defaults_raw["chain"], "defaults.chain"),
-            "rpc",
+            source,  # type: ignore[arg-type]
             _name(defaults_raw["provider"], "defaults.provider"),
             _name(defaults_raw["verifier"], "defaults.verifier"),
             Path(_string(defaults_raw["output_root"], "defaults.output_root")).expanduser(),
@@ -280,6 +375,7 @@ def load_config(path: Path) -> Config:
         )
         chains = _parse_chains(document["chains"])
         providers = _parse_providers(document["providers"])
+        bigquery = _parse_bigquery(document["bigquery"]) if "bigquery" in document else None
         if defaults.chain not in chains:
             raise ValueError("defaults.chain does not name a configured chain")
         for chain in chains.values():
@@ -288,7 +384,9 @@ def load_config(path: Path) -> Config:
                     raise ValueError(f"chain {chain.name} names an unknown provider: {provider_name}")
         if defaults.provider not in providers or defaults.verifier not in providers:
             raise ValueError("defaults provider profiles must be configured")
-        return Config(path, defaults, chains, providers)
+        if defaults.source == "bigquery" and (chains[defaults.chain].bigquery_dataset is None or bigquery is None):
+            raise ValueError("default BigQuery source requires chains.<name>.bigquery_dataset and [bigquery]")
+        return Config(path, defaults, chains, providers, bigquery)
     except BlockweaverError:
         raise
     except (KeyError, TypeError, ValueError) as error:
@@ -303,7 +401,12 @@ def _parse_chains(value: object) -> dict[str, Chain]:
     for raw_name, raw_value in table.items():
         name = _name(raw_name, "chain name")
         item = _table(raw_value, f"chains.{name}")
-        _keys(item, {"chain_id", "finality_tag", "provider", "verifier"}, f"chains.{name}", required={"chain_id", "finality_tag"})
+        _keys(
+            item,
+            {"chain_id", "finality_tag", "provider", "verifier", "bigquery_dataset"},
+            f"chains.{name}",
+            required={"chain_id", "finality_tag"},
+        )
         finality_tag = _string(item["finality_tag"], f"chains.{name}.finality_tag")
         if finality_tag not in {"finalized", "safe"}:
             raise ValueError(f"chains.{name}.finality_tag must be finalized or safe")
@@ -313,6 +416,7 @@ def _parse_chains(value: object) -> dict[str, Chain]:
             finality_tag,  # type: ignore[arg-type]
             _name(item["provider"], f"chains.{name}.provider") if "provider" in item else None,
             _name(item["verifier"], f"chains.{name}.verifier") if "verifier" in item else None,
+            validate_dataset_identifier(_string(item["bigquery_dataset"], f"chains.{name}.bigquery_dataset")) if "bigquery_dataset" in item else None,
         )
     return chains
 
@@ -343,6 +447,32 @@ def _parse_providers(value: object) -> dict[str, ProviderSpec]:
             _positive_number(item.get("timeout", 30), f"providers.{name}.timeout"),
         )
     return providers
+
+
+def _parse_bigquery(value: object) -> BigQuerySpec:
+    item = _table(value, "bigquery")
+    _keys(item, {"project", "project_env", "maximum_bytes_billed"}, "bigquery", required={"maximum_bytes_billed"})
+    if ("project" in item) == ("project_env" in item):
+        raise ValueError("bigquery must define exactly one of project or project_env")
+    project = _string(item["project"], "bigquery.project") if "project" in item else None
+    if project is not None:
+        validate_project(project)
+    project_env = _string(item["project_env"], "bigquery.project_env") if "project_env" in item else None
+    if project_env is not None and _ENV.fullmatch(project_env) is None:
+        raise ValueError("bigquery.project_env is not a valid environment name")
+    return BigQuerySpec(project, project_env, _positive_int(item["maximum_bytes_billed"], "bigquery.maximum_bytes_billed"))
+
+
+def validate_dataset_identifier(value: str) -> str:
+    if _DATASET.fullmatch(value) is None:
+        raise ValueError("BigQuery dataset must be a project.dataset identifier")
+    return value
+
+
+def validate_project(value: str) -> str:
+    if _PROJECT.fullmatch(value) is None:
+        raise ValueError("BigQuery billing project is not a valid project ID")
+    return value
 
 
 @dataclass(frozen=True, slots=True)

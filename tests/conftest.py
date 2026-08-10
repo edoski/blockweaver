@@ -6,7 +6,7 @@ from collections.abc import Callable, Iterator
 from contextlib import suppress
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 import pytest
 
@@ -107,6 +107,64 @@ class ChainServer:
         self._thread.join()
 
 
+class FakeBigQuery:
+    TABLES: ClassVar[dict[str, dict[str, str]]] = {
+        "blocks": {"block_number": "INTEGER", "block_timestamp": "TIMESTAMP", "block_hash": "STRING", "parent_hash": "STRING"},
+        "block_features": {"base_fee_per_gas": "INTEGER", "gas_used": "INTEGER", "gas_limit": "INTEGER"},
+        "transactions": {"block_number": "INTEGER", "block_timestamp": "TIMESTAMP"},
+        "receipts": {"block_number": "INTEGER", "block_timestamp": "TIMESTAMP", "transaction_index": "INTEGER"},
+        "receipt_features": {"gas_used": "INTEGER", "effective_gas_price": "INTEGER"},
+    }
+
+    def __init__(self, chain: ChainServer, *, bytes_processed: int = 100) -> None:
+        self.chain = chain
+        self.tables = {name: dict(fields) for name, fields in self.TABLES.items()}
+        self.tables["blocks"].update(self.tables.pop("block_features"))
+        self.tables["receipts"].update(self.tables.pop("receipt_features"))
+        self.bytes_processed = bytes_processed
+        self.calls: list[str] = []
+        self.sql = ""
+        self.page_size = 0
+
+    def table_schema(self, dataset: str, table: str) -> dict[str, str]:
+        self.calls.append(f"schema:{dataset}.{table}")
+        return self.tables[table]
+
+    def dry_run(self, sql: str, parameters: dict[str, int]) -> tuple[int, dict[str, str]]:
+        self.calls.append("dry_run")
+        self.sql = sql
+        del parameters
+        return self.bytes_processed, _query_schema(sql)
+
+    def pages(self, sql: str, parameters: dict[str, int], maximum_bytes_billed: int, page_size: int):
+        self.calls.append("execute")
+        self.sql, self.page_size = sql, page_size
+        del parameters, maximum_bytes_billed
+        columns = _query_schema(sql)
+        rows = []
+        for number in range(10, 15):
+            block = self.chain.block(number)
+            values = {"block_number": number, "_proof_timestamp": self.chain.timestamp_base + number, "timestamp": self.chain.timestamp_base + number}
+            values.update({"_proof_hash": block["hash"], "block_hash": block["hash"]})
+            values.update({"_proof_parent_hash": block["parentHash"], "parent_hash": block["parentHash"]})
+            values.update({"_proof_gas_used": 15_000_000 + number, "_receipt_gas_used": 15_000_000 + number, "gas_used": 15_000_000 + number})
+            values["_proof_gas_limit"] = 30_000_000
+            values.update({"base_fee_per_gas": 1_000_000_000 + number, "gas_limit": 30_000_000, "tx_count": number % 3})
+            values.update({"effective_priority_fee_per_gas_p50": number * 50, "effective_priority_fee_per_gas_p90": number * 90})
+            rows.append({name: values[name] for name in columns})
+        for offset in range(0, len(rows), page_size):
+            yield iter(rows[offset : offset + page_size])
+
+
+def _query_schema(sql: str) -> dict[str, str]:
+    strings = {"_proof_hash", "_proof_parent_hash", "block_hash", "parent_hash"}
+    integers = (  # noqa: SIM905 - compact fake schema fixture
+        "block_number _proof_timestamp _proof_gas_used _proof_gas_limit _receipt_gas_used timestamp base_fee_per_gas gas_used gas_limit tx_count "
+        "effective_priority_fee_per_gas_p50 effective_priority_fee_per_gas_p90"
+    ).split()
+    return {name: "STRING" if name in strings else "INTEGER" for name in [*strings, *integers] if f" AS {name}" in sql}
+
+
 @pytest.fixture
 def chains() -> Iterator[tuple[ChainServer, ChainServer]]:
     with ChainServer() as primary, ChainServer() as verifier:
@@ -123,12 +181,16 @@ def make_config() -> Callable[..., Path]:
         output_root: Path,
         features: tuple[str, ...] = ("timestamp", "block_hash"),
         output_format: str = "parquet",
+        source: str = "rpc",
+        dataset: str | None = None,
     ) -> Path:
         quoted_features = ", ".join(json.dumps(feature) for feature in features)
+        chain_dataset = f"bigquery_dataset = {json.dumps(dataset)}" if dataset else ""
+        bigquery_config = '\n[bigquery]\nproject = "billing-project"\nmaximum_bytes_billed = 1000\n' if dataset else ""
         path.write_text(
             f"""[defaults]
 chain = "test"
-source = "rpc"
+source = {json.dumps(source)}
 provider = "primary"
 verifier = "verifier"
 output_root = {json.dumps(str(output_root))}
@@ -138,6 +200,7 @@ features = [{quoted_features}]
 [chains.test]
 chain_id = 1
 finality_tag = "finalized"
+{chain_dataset}
 
 [providers.primary]
 url = {json.dumps(primary.url)}
@@ -150,6 +213,7 @@ url = {json.dumps(verifier.url)}
 batch_size = 3
 concurrency = 2
 timeout = 2
+{bigquery_config}
 """,
             encoding="utf-8",
         )

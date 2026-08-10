@@ -4,17 +4,189 @@ from __future__ import annotations
 
 import asyncio
 import random
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Iterator
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
+from importlib import import_module
 from typing import Any
 
 import aiohttp
 
-from ._contract import Header, Plan, parse_header, quantity
+from ._contract import BlockweaverError, Header, Plan, parse_header, quantity
 
 _TRANSIENT_HTTP = {408, 425, 429, *range(500, 600)}
 Validator = Callable[[Any], Any]
+
+
+@dataclass(frozen=True, slots=True)
+class BigQueryPlan:
+    sql: str
+    table_fields: dict[str, dict[str, str]]
+    result_schema: dict[str, str]
+
+
+class BigQueryClient:
+    def __init__(self, module: Any, project: str) -> None:
+        self._module = module
+        self._client = module.Client(project=project)
+
+    def table_schema(self, dataset: str, table: str) -> dict[str, str]:
+        value = self._client.get_table(f"{dataset}.{table}")
+        return {field.name: field.field_type for field in value.schema}
+
+    def dry_run(self, sql: str, parameters: dict[str, int]) -> tuple[int, dict[str, str]]:
+        config = self._config(parameters, dry_run=True)
+        job = self._client.query(sql, job_config=config)
+        if type(job.total_bytes_processed) is not int or job.total_bytes_processed < 0:
+            raise BlockweaverError("BIGQUERY_INVALID", "BigQuery dry run did not return a byte estimate")
+        return job.total_bytes_processed, {field.name: field.field_type for field in job.schema}
+
+    def pages(
+        self,
+        sql: str,
+        parameters: dict[str, int],
+        maximum_bytes_billed: int,
+        page_size: int,
+    ) -> Iterator[Iterator[dict[str, object]]]:
+        config = self._config(parameters, maximum_bytes_billed=maximum_bytes_billed)
+        rows = self._client.query(sql, job_config=config).result(page_size=page_size)
+        for page in rows.pages:
+            yield (dict(row.items()) for row in page)
+
+    def _config(self, parameters: dict[str, int], *, dry_run: bool = False, maximum_bytes_billed: int | None = None) -> Any:
+        return self._module.QueryJobConfig(
+            dry_run=dry_run,
+            use_query_cache=False,
+            maximum_bytes_billed=maximum_bytes_billed,
+            query_parameters=[self._module.ScalarQueryParameter(name, "INT64", value) for name, value in parameters.items()],
+        )
+
+
+def open_bigquery(project: str) -> BigQueryClient:
+    try:
+        module = import_module("google.cloud.bigquery")
+    except ModuleNotFoundError:
+        raise BlockweaverError(
+            "source_dependency_missing",
+            "BigQuery source requires the optional blockweaver[bigquery] dependency",
+        ) from None
+    try:
+        return BigQueryClient(module, project)
+    except Exception as error:
+        raise BlockweaverError("BIGQUERY_FAILED", f"Cannot initialize BigQuery client: {type(error).__name__}") from None
+
+
+def compile_bigquery(dataset: str, plan: Plan) -> BigQueryPlan:
+    block_fields = {
+        "block_number": "INTEGER",
+        "block_timestamp": "TIMESTAMP",
+        "block_hash": "STRING",
+        "parent_hash": "STRING",
+    }
+    result_schema = {
+        "block_number": "INTEGER",
+        "_proof_timestamp": "INTEGER",
+        "_proof_hash": "STRING",
+        "_proof_parent_hash": "STRING",
+    }
+    for feature in plan.features:
+        if feature.bigquery_field is not None:
+            block_fields[feature.bigquery_field] = (
+                "TIMESTAMP" if feature.bigquery_field == "block_timestamp" else "STRING" if feature.dtype == "UTF-8" else "INTEGER"
+            )
+        block_fields.update({dependency: "INTEGER" for dependency in feature.bigquery_dependencies})
+    if plan.percentiles:
+        block_fields.update({"base_fee_per_gas": "INTEGER", "gas_used": "INTEGER"})
+    gas_proof = any(feature.bigquery_dependencies for feature in plan.features)
+    if gas_proof:
+        block_fields.update({"gas_used": "INTEGER", "gas_limit": "INTEGER"})
+    tables = {"blocks": block_fields}
+    ctes = [
+        "requested_blocks AS (\n"
+        f"  SELECT {', '.join(sorted(block_fields))}\n"
+        f"  FROM `{dataset}.blocks`\n"
+        "  WHERE block_number BETWEEN @first_block AND @last_block\n"
+        "    AND block_timestamp BETWEEN TIMESTAMP_SECONDS(@from_timestamp) AND TIMESTAMP_SECONDS(@to_timestamp)\n"
+        ")"
+    ]
+    joins: list[str] = []
+    projections = [
+        "b.block_number AS block_number",
+        "UNIX_SECONDS(b.block_timestamp) AS _proof_timestamp",
+        "b.block_hash AS _proof_hash",
+        "b.parent_hash AS _proof_parent_hash",
+    ]
+    if gas_proof:
+        projections.extend(["b.gas_used AS _proof_gas_used", "b.gas_limit AS _proof_gas_limit"])
+        result_schema.update({"_proof_gas_used": "INTEGER", "_proof_gas_limit": "INTEGER"})
+    if any(feature.bigquery_family == "transactions" for feature in plan.features):
+        tables["transactions"] = {"block_number": "INTEGER", "block_timestamp": "TIMESTAMP"}
+        ctes.append(
+            "tx_counts AS (\n"
+            "  SELECT block_number, COUNT(*) AS tx_count\n"
+            f"  FROM `{dataset}.transactions`\n"
+            "  WHERE block_number BETWEEN @first_block AND @last_block\n"
+            "    AND block_timestamp BETWEEN TIMESTAMP_SECONDS(@from_timestamp) AND TIMESTAMP_SECONDS(@to_timestamp)\n"
+            "  GROUP BY block_number\n"
+            ")"
+        )
+        joins.append("LEFT JOIN tx_counts AS t USING (block_number)")
+    if plan.percentiles:
+        tables["receipts"] = {
+            "block_number": "INTEGER",
+            "block_timestamp": "TIMESTAMP",
+            "transaction_index": "INTEGER",
+            "gas_used": "INTEGER",
+            "effective_gas_price": "INTEGER",
+        }
+        ctes.extend(
+            [
+                "requested_receipts AS (\n"
+                "  SELECT block_number, transaction_index, gas_used, effective_gas_price\n"
+                f"  FROM `{dataset}.receipts`\n"
+                "  WHERE block_number BETWEEN @first_block AND @last_block\n"
+                "    AND block_timestamp BETWEEN TIMESTAMP_SECONDS(@from_timestamp) AND TIMESTAMP_SECONDS(@to_timestamp)\n"
+                ")",
+                "weighted_receipts AS (\n"
+                "  SELECT r.block_number, r.transaction_index, r.gas_used, b.gas_used AS block_gas_used,\n"
+                "    r.effective_gas_price - b.base_fee_per_gas AS priority_fee,\n"
+                "    SUM(r.gas_used) OVER (PARTITION BY r.block_number "
+                "ORDER BY r.effective_gas_price - b.base_fee_per_gas, r.transaction_index "
+                "ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS cumulative_gas\n"
+                "  FROM requested_receipts AS r JOIN requested_blocks AS b USING (block_number)\n"
+                ")",
+                "receipt_stats AS (\n"
+                "  SELECT block_number, SUM(gas_used) AS receipt_gas_used,\n    "
+                + ",\n    ".join(
+                    f"MIN(IF(cumulative_gas >= CAST(CEIL(CAST(block_gas_used AS BIGNUMERIC) * {percentile} / 100) AS INT64), "
+                    f"priority_fee, NULL)) AS effective_priority_fee_per_gas_p{percentile}"
+                    for percentile in plan.percentiles
+                )
+                + "\n  FROM weighted_receipts GROUP BY block_number\n)",
+            ]
+        )
+        joins.append("LEFT JOIN receipt_stats AS r USING (block_number)")
+        if not gas_proof:
+            projections.append("b.gas_used AS _proof_gas_used")
+            result_schema["_proof_gas_used"] = "INTEGER"
+        projections.append("COALESCE(r.receipt_gas_used, 0) AS _receipt_gas_used")
+        result_schema["_receipt_gas_used"] = "INTEGER"
+    for feature in plan.features:
+        if feature.bigquery_family == "blocks":
+            assert feature.bigquery_field is not None
+            expression = "UNIX_SECONDS(b.block_timestamp)" if feature.bigquery_field == "block_timestamp" else f"b.{feature.bigquery_field}"
+            projections.append(f"{expression} AS {feature.name}")
+        elif feature.bigquery_family == "transactions":
+            projections.append(f"COALESCE(t.tx_count, 0) AS {feature.name}")
+        else:
+            projections.append(f"COALESCE(r.{feature.name}, 0) AS {feature.name}")
+        result_schema[feature.name] = "STRING" if feature.dtype == "UTF-8" else "INTEGER"
+    sql = "WITH " + ",\n".join(ctes) + "\nSELECT\n  " + ",\n  ".join(projections) + "\nFROM requested_blocks AS b\n"
+    if joins:
+        sql += "\n".join(joins) + "\n"
+    sql += "ORDER BY block_number"
+    return BigQueryPlan(sql, tables, result_schema)
 
 
 class Rpc:
