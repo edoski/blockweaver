@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import csv
+import ctypes
+import errno
 import fcntl
 import hashlib
 import json
 import os
 import re
 import shutil
+import sys
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -21,7 +24,7 @@ import polars as pl
 
 from ._contract import Anchor, BlockweaverError, Header, Plan, ResolvedRange, Value, format_utc, plan_features, validate_links
 
-_CHUNK = re.compile(r"(\d{20})-(\d{20})\.parquet\Z")
+_CHUNK = re.compile(r"(\d{20})-(\d{20})-([0-9a-f]{64})\.parquet\Z")
 _HASH = re.compile(r"0x[0-9a-f]{64}\Z")
 _DECIMAL = re.compile(r"0|[1-9][0-9]*\Z")
 _NAME = re.compile(r"[a-z0-9][a-z0-9_-]*\Z")
@@ -43,6 +46,19 @@ _MANIFEST_KEYS = {
     "target_hash",
     "finalized_anchor",
     "verification",
+}
+_RECEIPT_KEYS = {
+    "version",
+    "operation",
+    "dataset_id",
+    "path",
+    "chain",
+    "resolved_range",
+    "rows",
+    "reused_rows",
+    "acquired_rows",
+    "finalized_anchor",
+    "artifact_sha256",
 }
 
 
@@ -77,6 +93,16 @@ class LoadedDataset:
         if selected["block_number"].to_list() != numbers:
             raise BlockweaverError("ARTIFACT_INVALID", "Requested dataset rows are missing")
         return {int(row["block_number"]): {name: value for name, value in row.items()} for row in selected.iter_rows(named=True)}
+
+    def fact_chunks(self, size: int) -> Iterator[dict[int, dict[str, Value]]]:
+        batches = _scan_data(self.data_path, self.plan, self.manifest["output"]["format"]).collect_batches(
+            chunk_size=size,
+            maintain_order=True,
+            engine="streaming",
+        )
+        for batch in batches:
+            for frame in batch.iter_slices(n_rows=size):
+                yield {int(row["block_number"]): {name: value for name, value in row.items()} for row in frame.iter_rows(named=True)}
 
 
 @dataclass(frozen=True, slots=True)
@@ -120,20 +146,22 @@ def prepare_work(hidden: Path, destination: Path, binding: dict[str, object]) ->
             raise BlockweaverError("RESUME_MISMATCH", "Incomplete work belongs to a different immutable request")
         if destination.exists():
             dataset = load_dataset(destination)
-            receipt = _read_json(receipt_path) if receipt_path.is_file() else None
-            if receipt is not None and receipt.get("artifact_sha256") != pair_hashes(destination):
-                raise BlockweaverError("RESUME_INVALID", "Published recovery receipt does not match the dataset")
+            _validate_dataset_binding(dataset, binding)
+            receipt = _read_receipt(receipt_path) if receipt_path.is_file() else None
+            if receipt is not None:
+                _validate_recovery_receipt(receipt, dataset, destination)
             return WorkState(chunks, dataset.path, receipt, True)
         if ready.exists():
             try:
                 dataset = load_dataset(ready, work=True)
-                receipt = _read_json(receipt_path) if receipt_path.is_file() else None
-                if receipt is not None and receipt.get("artifact_sha256") != pair_hashes(ready):
-                    raise ValueError
             except (BlockweaverError, OSError, ValueError):
                 shutil.rmtree(ready) if ready.is_dir() else ready.unlink()
                 receipt_path.unlink(missing_ok=True)
             else:
+                _validate_dataset_binding(dataset, binding)
+                receipt = _read_receipt(receipt_path) if receipt_path.is_file() else None
+                if receipt is not None:
+                    _validate_recovery_receipt(receipt, dataset, destination)
                 return WorkState(chunks, dataset.path, receipt)
         receipt_path.unlink(missing_ok=True)
         return WorkState(chunks)
@@ -145,6 +173,53 @@ def prepare_work(hidden: Path, destination: Path, binding: dict[str, object]) ->
     _write_json(binding_path, binding)
     _fsync_directory(hidden)
     return WorkState(chunks)
+
+
+def _validate_dataset_binding(dataset: LoadedDataset, binding: dict[str, object]) -> None:
+    chain = binding["chain"]
+    source = binding["source"]
+    if not isinstance(chain, dict) or not isinstance(source, dict):
+        raise BlockweaverError("RESUME_MISMATCH", "Stored work binding is invalid")
+    matches = (
+        dataset.manifest["dataset_id"] == binding["dataset_id"]
+        and dataset.manifest["chain"] == {"name": chain.get("name"), "chain_id": chain.get("chain_id")}
+        and dataset.manifest["finalized_anchor"]["tag"] == chain.get("finality_tag")
+        and dataset.manifest["source"] == source
+        and dataset.manifest["requested_range"] == binding["requested_range"]
+        and dataset.manifest["resolved_range"] == binding["resolved_range"]
+        and list(dataset.plan.columns[1:]) == binding["features"]
+        and dataset.manifest["output"]["format"] == binding["format"]
+    )
+    if not matches:
+        raise BlockweaverError("RESUME_MISMATCH", "Recovered dataset does not match the immutable work binding")
+
+
+def _validate_recovery_receipt(receipt: dict[str, Any], dataset: LoadedDataset, destination: Path) -> None:
+    if (
+        set(receipt) != _RECEIPT_KEYS
+        or receipt.get("version") != 1
+        or receipt.get("operation") != "download"
+        or receipt.get("dataset_id") != dataset.manifest["dataset_id"]
+        or receipt.get("path") != str(destination)
+        or receipt.get("chain") != dataset.manifest["chain"]
+        or receipt.get("resolved_range") != dataset.manifest["resolved_range"]
+        or receipt.get("rows") != dataset.rows
+        or receipt.get("finalized_anchor") != dataset.manifest["finalized_anchor"]
+        or receipt.get("artifact_sha256") != pair_hashes(dataset.path)
+        or type(receipt.get("reused_rows")) is not int
+        or type(receipt.get("acquired_rows")) is not int
+        or receipt["reused_rows"] < 0
+        or receipt["acquired_rows"] < 0
+        or receipt["reused_rows"] + receipt["acquired_rows"] != dataset.rows
+    ):
+        raise BlockweaverError("RESUME_INVALID", "Recovery receipt does not match the immutable dataset")
+
+
+def _read_receipt(path: Path) -> dict[str, Any]:
+    try:
+        return _read_json(path)
+    except ValueError:
+        raise BlockweaverError("RESUME_INVALID", "Recovery receipt is invalid") from None
 
 
 def checkpoint_paths(
@@ -160,6 +235,7 @@ def checkpoint_paths(
         match = _CHUNK.fullmatch(path.name)
         if match is None:
             raise BlockweaverError("RESUME_INVALID", f"Unexpected checkpoint file: {path.name}")
+        _validate_checkpoint_digest(path, match)
         parsed.append((int(match.group(1)), int(match.group(2)), path))
     parsed.sort()
     expected = first_block
@@ -191,8 +267,8 @@ def checkpoint_schema(plan: Plan):
     }
 
 
-def write_checkpoint(path: Path, plan: Plan, headers: list[Header], rows: list[dict[str, Value]]) -> None:
-    temporary = path.with_suffix(".parquet.tmp")
+def write_checkpoint(chunks: Path, first: int, last: int, plan: Plan, headers: list[Header], rows: list[dict[str, Value]]) -> Path:
+    temporary = chunks / f".{first:020d}-{last:020d}.parquet.tmp"
     try:
         values = [
             {
@@ -205,18 +281,31 @@ def write_checkpoint(path: Path, plan: Plan, headers: list[Header], rows: list[d
         ]
         pl.DataFrame(values, schema=checkpoint_schema(plan)).write_parquet(temporary, compression="zstd", row_group_size=4096)
         _fsync_file(temporary)
+        path = chunks / f"{first:020d}-{last:020d}-{file_hash(temporary)}.parquet"
         os.replace(temporary, path)
-        _fsync_directory(path.parent)
+        _fsync_directory(chunks)
+        return path
     finally:
         temporary.unlink(missing_ok=True)
 
 
 def read_checkpoint(path: Path, plan: Plan) -> list[Header]:
     try:
+        match = _CHUNK.fullmatch(path.name)
+        if match is None:
+            raise ValueError
+        _validate_checkpoint_digest(path, match)
         frame = pl.read_parquet(path)
         if frame.schema != checkpoint_schema(plan) or frame.is_empty() or frame.null_count().row(0) != (0,) * len(frame.columns):
             raise ValueError
         _validate_eager_frame(frame.select(plan.columns), plan, None)
+        for row in frame.iter_rows(named=True):
+            if "timestamp" in plan.columns and row["timestamp"] != row["_proof_timestamp"]:
+                raise ValueError
+            if "block_hash" in plan.columns and row["block_hash"] != row["_proof_hash"]:
+                raise ValueError
+            if "parent_hash" in plan.columns and row["parent_hash"] != row["_proof_parent_hash"]:
+                raise ValueError
         headers = [
             Header(row["block_number"], row["_proof_hash"], row["_proof_parent_hash"], row["_proof_timestamp"], {}) for row in frame.iter_rows(named=True)
         ]
@@ -228,6 +317,8 @@ def read_checkpoint(path: Path, plan: Plan) -> list[Header]:
 
 
 def checkpoint_facts(paths: list[Path], plan: Plan, numbers: list[int]) -> dict[int, dict[str, Value]]:
+    for path in paths:
+        read_checkpoint(path, plan)
     frame = pl.concat([pl.scan_parquet(path).select(plan.columns) for path in paths], how="vertical")
     selected = frame.filter(pl.col("block_number").is_in(numbers)).collect(engine="streaming")
     if selected["block_number"].to_list() != numbers:
@@ -247,6 +338,8 @@ def write_candidate(
     filename = f"blocks.{output_format}"
     data_path = candidate / filename
     temporary = candidate / f"{filename}.tmp"
+    for path in sources:
+        read_checkpoint(path, plan)
     scans = [pl.scan_parquet(path).select(plan.columns) for path in sources]
     combined = pl.concat(scans, how="vertical")
     if output_format == "parquet":
@@ -261,7 +354,7 @@ def write_candidate(
         "bytes": data_path.stat().st_size,
         "sha256": file_hash(data_path),
     }
-    _write_json(candidate / "manifest.json", {**manifest, "output": output})
+    _write_json(candidate / "manifest.json", {**manifest, "completed_at": _completion_time(), "output": output})
     _fsync_directory(candidate)
     return load_dataset(candidate, work=True)
 
@@ -282,7 +375,13 @@ def _load_dataset(path: Path, *, work: bool) -> LoadedDataset:
     manifest_path = path / "manifest.json"
     if not manifest_path.is_file():
         raise ValueError("Dataset must contain manifest.json")
-    manifest = _read_json(manifest_path)
+    try:
+        manifest_bytes = manifest_path.read_bytes()
+    except OSError as error:
+        raise ValueError("Invalid JSON file: manifest.json") from error
+    manifest = _decode_json(manifest_bytes, "manifest.json")
+    if manifest_bytes != _canonical_json(manifest):
+        raise ValueError("manifest.json is not canonical JSON")
     if set(manifest) != _MANIFEST_KEYS:
         raise ValueError("manifest.json has a noncanonical shape")
     if manifest["manifest_version"] != 1 or manifest["dataset_version"] != 1 or not isinstance(manifest["tool_version"], str) or not manifest["tool_version"]:
@@ -507,7 +606,7 @@ def publish(hidden: Path, destination: Path) -> None:
     if len(list(ready.iterdir())) != 2 or not (ready / "manifest.json").is_file():
         raise BlockweaverError("PUBLICATION_FAILED", "Candidate does not contain exactly the canonical artifact pair")
     _fsync_directory(ready)
-    os.rename(ready, destination)
+    _rename_no_replace(ready, destination)
     _fsync_directory(destination.parent)
 
 
@@ -525,6 +624,11 @@ def file_hash(path: Path) -> str:
         while chunk := stream.read(1024 * 1024):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _validate_checkpoint_digest(path: Path, match: re.Match[str]) -> None:
+    if file_hash(path) != match.group(3):
+        raise BlockweaverError("RESUME_INVALID", f"Checkpoint digest does not match its filename: {path.name}")
 
 
 def _canonical_uuid(value: object) -> UUID:
@@ -553,23 +657,39 @@ def _exact_table(value: object, keys: set[str], label: str) -> dict[str, Any]:
 
 def _read_json(path: Path) -> dict[str, Any]:
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as error:
+        data = path.read_bytes()
+    except OSError as error:
         raise ValueError(f"Invalid JSON file: {path.name}") from error
+    return _decode_json(data, path.name)
+
+
+def _decode_json(data: bytes, name: str) -> dict[str, Any]:
+    try:
+        value = json.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError(f"Invalid JSON file: {name}") from error
     if not isinstance(value, dict):
-        raise ValueError(f"Invalid JSON object: {path.name}")
+        raise ValueError(f"Invalid JSON object: {name}")
     return value
 
 
 def _write_json(path: Path, value: object) -> None:
-    data = json.dumps(value, ensure_ascii=True, allow_nan=False, sort_keys=True, separators=(",", ":")) + "\n"
+    data = _canonical_json(value)
     temporary = path.with_suffix(path.suffix + ".tmp")
     try:
-        temporary.write_text(data, encoding="utf-8")
+        temporary.write_bytes(data)
         _fsync_file(temporary)
         os.replace(temporary, path)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def _canonical_json(value: object) -> bytes:
+    return (json.dumps(value, ensure_ascii=True, allow_nan=False, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+
+
+def _completion_time() -> str:
+    return datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
 def _fsync_file(path: Path) -> None:
@@ -583,3 +703,35 @@ def _fsync_directory(path: Path) -> None:
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
+
+
+def _rename_no_replace(source: Path, destination: Path) -> None:
+    if sys.platform == "darwin":
+        library = ctypes.CDLL(None, use_errno=True)
+        rename = library.renamex_np
+        rename.argtypes = (ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint)
+        rename.restype = ctypes.c_int
+        result = rename(os.fsencode(source), os.fsencode(destination), 0x00000004)
+    elif sys.platform.startswith("linux"):
+        library = ctypes.CDLL(None, use_errno=True)
+        try:
+            rename = library.renameat2
+        except AttributeError as error:
+            raise OSError(errno.ENOTSUP, "Atomic no-replace publication is unavailable") from error
+        rename.argtypes = (ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint)
+        rename.restype = ctypes.c_int
+        result = rename(-100, os.fsencode(source), -100, os.fsencode(destination), 1)
+    elif os.name == "nt":
+        try:
+            os.rename(source, destination)
+        except FileExistsError:
+            raise BlockweaverError("DESTINATION_EXISTS", f"Destination already exists: {destination}") from None
+        return
+    else:
+        raise OSError(errno.ENOTSUP, "Atomic no-replace publication is unavailable")
+    if result == 0:
+        return
+    code = ctypes.get_errno()
+    if code in {errno.EEXIST, errno.ENOTEMPTY}:
+        raise BlockweaverError("DESTINATION_EXISTS", f"Destination already exists: {destination}")
+    raise OSError(code, os.strerror(code), destination)

@@ -8,6 +8,8 @@ import sys
 import tomllib
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
+from ipaddress import ip_address
+from math import isfinite
 from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import urlsplit
@@ -151,11 +153,14 @@ class Provider:
     timeout: float
 
     def __post_init__(self) -> None:
-        _name(self.name, "provider name")
-        _validate_url(self.url)
-        _positive_int(self.batch_size, "batch_size")
-        _positive_int(self.concurrency, "concurrency")
-        _positive_number(self.timeout, "timeout")
+        try:
+            _name(self.name, "provider name")
+            _validate_url(self.url)
+            _positive_int(self.batch_size, "batch_size")
+            _positive_int(self.concurrency, "concurrency")
+            _positive_number(self.timeout, "timeout")
+        except ValueError as error:
+            raise BlockweaverError("CONFIG_INVALID", str(error)) from None
 
 
 @dataclass(frozen=True, slots=True)
@@ -573,12 +578,39 @@ def _positive_int(value: object, label: str) -> int:
 
 
 def _positive_number(value: object, label: str) -> float:
-    if not isinstance(value, (int, float)) or isinstance(value, bool) or value <= 0:
-        raise ValueError(f"{label} must be positive")
+    if not isinstance(value, (int, float)) or isinstance(value, bool) or not isfinite(value) or value <= 0 or value > 3600:
+        raise BlockweaverError("CONFIG_INVALID", f"{label} must be finite and between 0 and 3600 seconds")
     return float(value)
 
 
 def _validate_url(value: str) -> None:
-    parsed = urlsplit(value)
-    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+    try:
+        parsed = urlsplit(value)
+        hostname = parsed.hostname
+        port = parsed.port
+    except ValueError:
+        raise BlockweaverError("CONFIG_INVALID", "RPC provider URL is malformed") from None
+    if (
+        any(character.isspace() for character in value)
+        or parsed.scheme not in {"http", "https"}
+        or not parsed.netloc
+        or hostname is None
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.fragment
+        or parsed.netloc.endswith(":")
+        or (port is not None and not 1 <= port <= 65535)
+    ):
         raise BlockweaverError("CONFIG_INVALID", "RPC provider URL must be an absolute HTTP or HTTPS URL")
+    try:
+        ip_address(hostname)
+    except ValueError:
+        try:
+            encoded = hostname.encode("idna").decode("ascii")
+        except UnicodeError:
+            raise BlockweaverError("CONFIG_INVALID", "RPC provider URL has an invalid hostname") from None
+        labels = encoded.removesuffix(".").split(".")
+        if len(encoded) > 253 or any(
+            not label or len(label) > 63 or re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?", label) is None for label in labels
+        ):
+            raise BlockweaverError("CONFIG_INVALID", "RPC provider URL has an invalid hostname") from None

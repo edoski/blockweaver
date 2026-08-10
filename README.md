@@ -13,7 +13,7 @@ blockweaver init
 
 ```toml
 [defaults]
-chain = "ethereum"
+chain = "local"
 source = "rpc"
 provider = "primary"
 verifier = "verifier"
@@ -21,30 +21,30 @@ output_root = "./downloads"
 format = "parquet"
 features = ["timestamp", "block_hash", "base_fee_per_gas", "gas_used", "gas_limit", "tx_count"]
 
-[chains.ethereum]
-chain_id = 1
+[chains.local]
+chain_id = 31337
 finality_tag = "finalized"
 
 [providers.primary]
-url_env = "ETHEREUM_PRIMARY_RPC_URL"
+url_env = "BLOCKWEAVER_PRIMARY_RPC_URL"
 batch_size = 20
 concurrency = 6
 timeout = 30
 
 [providers.verifier]
-url_env = "ETHEREUM_VERIFIER_RPC_URL"
+url_env = "BLOCKWEAVER_VERIFIER_RPC_URL"
 batch_size = 20
 concurrency = 6
 timeout = 30
 ```
 
-Configuration is strict: unknown keys, unknown profiles, invalid URLs, and ambiguous `url`/`url_env` pairs fail before network access. Chain profiles may override `provider` and `verifier`. CLI values override the selected chain and provider profiles, which override global defaults.
+Configuration is strict: unknown keys, unknown profiles, invalid URLs, ambiguous `url`/`url_env` pairs, and non-finite or greater-than-one-hour timeouts fail before network access. Chain profiles may override `provider` and `verifier`. CLI values override the selected chain and provider profiles, which override global defaults.
 
 Inspect configuration and the closed feature catalog without exposing endpoints:
 
 ```console
 blockweaver chains
-blockweaver features --chain ethereum
+blockweaver features --chain local
 ```
 
 ## Download
@@ -79,7 +79,7 @@ ROOT/<chain>-<resolved-start-UTC>-<uuid4>/
 
 Parquet is the typed default. CSV uses canonical decimal integers and UTF-8 strings; `manifest.json` is its type authority. The version-1 manifest records the request, resolved range, ordered schema and units, acquisition plan, chain identity, non-secret provider profile names, finality proof, verification samples, byte size, and SHA-256 digest. JSON is sorted, compact, UTF-8, and newline-terminated.
 
-Work is checkpointed under a hidden directory. Complete chunks are validated before reuse. The fully assembled candidate is validated, synced, and atomically renamed; existing destinations are never overwritten.
+Work is checkpointed under a hidden directory. Complete chunks are digest-bound and validated before reuse. The fully assembled candidate is validated, synced, and atomically renamed without replacement; existing destinations are never overwritten.
 
 ## Verify
 
@@ -89,7 +89,7 @@ Local verification is strict and needs no provider:
 blockweaver verify ./downloads/ethereum-20260101T000000Z-11111111-1111-4111-8111-111111111111
 ```
 
-RPC verification uses a configured profile or a direct URL. It checks deterministic samples and refreshes the stored finality proof. `--full-rpc` checks every row.
+RPC verification uses a configured profile or a direct URL. It checks deterministic samples and refreshes the stored finality proof. `--full-rpc` checks every row in bounded chunks, including ancestry across chunk boundaries.
 
 ```console
 blockweaver verify DATASET --provider verifier

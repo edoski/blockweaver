@@ -5,7 +5,6 @@ from __future__ import annotations
 import hashlib
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal
 from uuid import UUID
@@ -78,6 +77,8 @@ async def download(spec: DownloadSpec, *, progress: Progress, publication: Publi
                 await verifier.tagged_header(spec.chain.finality_tag, _INTEGRITY_PLAN),
             )
             resolved = await _resolve_range(spec.requested_range, primary, min(primary_tag.block_number, verifier_tag.block_number))
+            if spec.requested_range.kind == "time":
+                await _verify_time_boundaries(spec.requested_range, resolved, primary, verifier, verifier_tag.block_number)
             destination = dataset_path(spec.output_root.resolve(), spec.chain.name, resolved, spec.dataset_id)
             binding = _binding(spec, resolved)
             with locked_work(spec.output_root.resolve(), spec.dataset_id, destination) as hidden:
@@ -104,8 +105,7 @@ async def download(spec: DownloadSpec, *, progress: Progress, publication: Publi
                             last = min(next_block + _CHUNK_SIZE - 1, resolved.last_block)
                             headers, rows = await primary.rows(next_block, last, spec.plan)
                             validate_links(headers, previous)
-                            chunk_path = work.chunks / f"{next_block:020d}-{last:020d}.parquet"
-                            write_checkpoint(chunk_path, spec.plan, headers, rows)
+                            chunk_path = write_checkpoint(work.chunks, next_block, last, spec.plan, headers, rows)
                             paths.append(chunk_path)
                             previous, next_block = headers[-1], last + 1
                             progress({"event": "checkpoint", "from_block": headers[0].block_number, "to_block": last})
@@ -183,20 +183,17 @@ async def verify_dataset(
                 target = await rpc.header(dataset.last_block, dataset.plan)
                 if target.block_hash != dataset.manifest["target_hash"]:
                     raise BlockweaverError("RPC_MISMATCH", "Dataset target hash does not match RPC")
-                fresh = await _refresh_finality(target, anchor, rpc, dataset.chain_id)
-                numbers = (
-                    list(range(dataset.first_block, dataset.last_block + 1))
-                    if full_rpc
-                    else _sample_numbers(UUID(dataset.manifest["dataset_id"]), dataset.first_block, dataset.last_block)
-                )
-                await _check_rows(dataset.facts(numbers), numbers, dataset.plan, rpc, contiguous=full_rpc)
+                fresh = await _refresh_finality(target, anchor, rpc)
+                sample_numbers = _sample_numbers(UUID(dataset.manifest["dataset_id"]), dataset.first_block, dataset.last_block)
+                if full_rpc:
+                    await _check_full_dataset(dataset, rpc)
+                else:
+                    await _check_rows(dataset.facts(sample_numbers), sample_numbers, dataset.plan, rpc)
                 verification = {
                     "mode": "full_rpc" if full_rpc else "sample_rpc",
                     "provider": provider.name,
                     "chain_id": chain_id,
-                    "sampled_blocks": numbers
-                    if not full_rpc
-                    else _sample_numbers(UUID(dataset.manifest["dataset_id"]), dataset.first_block, dataset.last_block),
+                    "sampled_blocks": sample_numbers,
                     "finalized_anchor": fresh.document(),
                 }
         except BlockweaverError:
@@ -259,6 +256,38 @@ async def _lower_bound_timestamp(target: int, high: int, header: Callable[[int],
     return low
 
 
+async def _verify_time_boundaries(
+    request: RequestedRange,
+    resolved: ResolvedRange,
+    primary: Rpc,
+    verifier: Rpc,
+    verifier_finalized: int,
+) -> None:
+    boundary_numbers = sorted({resolved.first_block, resolved.last_block})
+    primary_boundaries, verifier_boundaries = (
+        await primary.headers(boundary_numbers, _INTEGRITY_PLAN),
+        await verifier.headers(boundary_numbers, _INTEGRITY_PLAN),
+    )
+    if any(not _same_core(left, right) for left, right in zip(primary_boundaries, verifier_boundaries, strict=True)):
+        raise BlockweaverError("RPC_MISMATCH", "RPC endpoints disagree on a resolved time boundary")
+    adjacent_numbers = []
+    if resolved.first_block > 0:
+        adjacent_numbers.append(resolved.first_block - 1)
+    if resolved.last_block < verifier_finalized:
+        adjacent_numbers.append(resolved.last_block + 1)
+    adjacent = {header.block_number: header for header in await verifier.headers(adjacent_numbers, _INTEGRITY_PLAN)}
+    first, last = verifier_boundaries[0], verifier_boundaries[-1]
+    if (
+        first.timestamp != resolved.first_timestamp
+        or last.timestamp != resolved.last_timestamp
+        or first.timestamp < request.start
+        or last.timestamp > request.end
+        or (resolved.first_block > 0 and adjacent[resolved.first_block - 1].timestamp >= request.start)
+        or (resolved.last_block < verifier_finalized and adjacent[resolved.last_block + 1].timestamp <= request.end)
+    ):
+        raise BlockweaverError("RPC_MISMATCH", "Verifier RPC does not prove the resolved time-range edges")
+
+
 async def _prove_finality(target: Header, verifier: Rpc, chain: Chain) -> tuple[Anchor, Header]:
     verifier_target = await verifier.header(target.block_number, plan_features_for_header(target))
     if not _same_header(target, verifier_target):
@@ -290,8 +319,7 @@ def _same_header(left: Header, right: Header) -> bool:
     )
 
 
-async def _refresh_finality(target: Header, anchor: Anchor, rpc: Rpc, chain_id: int) -> Anchor:
-    del chain_id
+async def _refresh_finality(target: Header, anchor: Anchor, rpc: Rpc) -> Anchor:
     stored = await rpc.header(anchor.block_number, _INTEGRITY_PLAN)
     if stored.block_hash != anchor.block_hash:
         raise BlockweaverError("RPC_MISMATCH", "Stored finalized anchor no longer matches RPC")
@@ -331,11 +359,15 @@ async def _check_rows(
     plan: Plan,
     rpc: Rpc,
     *,
-    contiguous: bool = False,
-) -> None:
+    previous: Header | None = None,
+) -> Header | None:
+    contiguous = numbers == list(range(numbers[0], numbers[-1] + 1))
     if contiguous:
         headers, rows = await rpc.rows(numbers[0], numbers[-1], plan)
-        validate_links(headers)
+        try:
+            validate_links(headers, previous)
+        except ValueError as error:
+            raise BlockweaverError("RPC_MISMATCH", str(error)) from None
     else:
         headers = await rpc.headers(numbers, plan)
         rows = []
@@ -345,6 +377,20 @@ async def _check_rows(
     for number, row in zip(numbers, rows, strict=True):
         if local[number] != row:
             raise BlockweaverError("RPC_MISMATCH", f"Dataset row {number} does not match verifier RPC")
+    return headers[-1] if contiguous else None
+
+
+async def _check_full_dataset(dataset: LoadedDataset, rpc: Rpc) -> None:
+    previous: Header | None = None
+    expected = dataset.first_block
+    for local in dataset.fact_chunks(_CHUNK_SIZE):
+        numbers = list(local)
+        if not numbers or numbers[0] != expected:
+            raise BlockweaverError("ARTIFACT_INVALID", "Dataset streaming order changed during verification")
+        previous = await _check_rows(local, numbers, dataset.plan, rpc, previous=previous)
+        expected = numbers[-1] + 1
+    if expected != dataset.last_block + 1:
+        raise BlockweaverError("ARTIFACT_INVALID", "Dataset streaming coverage changed during verification")
 
 
 async def _validate_candidate(dataset: LoadedDataset, primary: Rpc, verifier: Rpc, chain: Chain) -> None:
@@ -356,7 +402,7 @@ async def _validate_candidate(dataset: LoadedDataset, primary: Rpc, verifier: Rp
     verifier_target = await verifier.header(dataset.last_block, dataset.plan)
     if not _same_header(target, verifier_target):
         raise BlockweaverError("RPC_MISMATCH", "RPC endpoints disagree on the ready candidate target")
-    await _refresh_finality(verifier_target, dataset.anchor, verifier, chain.chain_id)
+    await _refresh_finality(verifier_target, dataset.anchor, verifier)
     numbers = _sample_numbers(UUID(dataset.manifest["dataset_id"]), dataset.first_block, dataset.last_block)
     await _check_rows(dataset.facts(numbers), numbers, dataset.plan, verifier)
 
@@ -386,7 +432,6 @@ def _manifest(
         "dataset_version": 1,
         "tool_version": __version__,
         "dataset_id": str(spec.dataset_id),
-        "completed_at": datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z"),
         "chain": {"name": spec.chain.name, "chain_id": spec.chain.chain_id},
         "source": {"type": "rpc", "provider": spec.primary.name, "verifier": spec.verifier.name},
         "requested_range": spec.requested_range.document(),

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from datetime import UTC, datetime
 from pathlib import Path
@@ -10,8 +11,8 @@ import pytest
 from conftest import ChainServer, block_hash
 from typer.testing import CliRunner
 
-from blockweaver import _build
-from blockweaver._contract import parse_time
+from blockweaver import _build, _corpus
+from blockweaver._contract import BlockweaverError, parse_time
 from blockweaver.cli import app
 
 DATASET_ID = "11111111-1111-4111-8111-111111111111"
@@ -65,6 +66,8 @@ def test_init_precedence_permissions_and_no_overwrite(tmp_path: Path) -> None:
     assert json.loads(result.stdout)["path"] == str(configured)
     assert configured.stat().st_mode & 0o777 == 0o600
     assert "url_env" in configured.read_text()
+    readme = (Path(__file__).parents[1] / "README.md").read_text()
+    assert f"```toml\n{configured.read_text()}```" in readme
 
     explicit_result = invoke(["init", "--config", str(explicit)], {"BLOCKWEAVER_CONFIG": str(configured)})
     assert json.loads(explicit_result.stdout)["path"] == str(explicit)
@@ -100,6 +103,34 @@ def test_strict_config_discovery_has_no_secrets(
 
     with config.open("a") as stream:
         stream.write("\nunknown = true\n")
+    assert error(invoke(["chains", "--config", str(config)]))["code"] == "CONFIG_INVALID"
+
+
+@pytest.mark.parametrize(
+    "replacement",
+    [
+        'url = "http://host:abc"',
+        'url = "http://host:70000"',
+        'url = "http://bad host"',
+        'url = "http://user:password@host"',
+        'url = "http://-bad.example"',
+        "timeout = nan",
+        "timeout = inf",
+        "timeout = 3601",
+    ],
+)
+def test_config_rejects_malformed_urls_and_unbounded_timeouts(
+    tmp_path: Path,
+    chains: tuple[ChainServer, ChainServer],
+    make_config: Any,
+    replacement: str,
+) -> None:
+    primary, verifier = chains
+    config = make_config(tmp_path / "config.toml", primary, verifier, output_root=tmp_path / "out")
+    text = config.read_text()
+    text = text.replace(f'url = "{primary.url}"', replacement, 1) if replacement.startswith("url") else text.replace("timeout = 2", replacement, 1)
+    config.write_text(text)
+
     assert error(invoke(["chains", "--config", str(config)]))["code"] == "CONFIG_INVALID"
 
 
@@ -235,6 +266,34 @@ def test_time_range_csv_and_reduced_precision(
     assert invoke(["verify", str(artifact)]).exit_code == 0
 
 
+def test_time_resolution_requires_independent_adjacent_boundary_proof(
+    tmp_path: Path,
+    chains: tuple[ChainServer, ChainServer],
+    make_config: Any,
+) -> None:
+    primary, verifier = chains
+    config = make_config(tmp_path / "config.toml", primary, verifier, output_root=tmp_path / "out")
+    primary.changes[10] = {"timestamp": hex(primary.timestamp_base + 9)}
+    start = datetime.fromtimestamp(primary.timestamp_base + 10, UTC).isoformat().replace("+00:00", "Z")
+    end = datetime.fromtimestamp(primary.timestamp_base + 14, UTC).isoformat().replace("+00:00", "Z")
+
+    failure = invoke(
+        [
+            "download",
+            "--config",
+            str(config),
+            "--id",
+            DATASET_ID,
+            "--from-time",
+            start,
+            "--to-time",
+            end,
+        ]
+    )
+    assert error(failure)["code"] == "RPC_MISMATCH"
+    assert not any(path.name.endswith(DATASET_ID) and not path.name.startswith(".") for path in (tmp_path / "out").glob("*"))
+
+
 @pytest.mark.parametrize(
     ("extra", "code"),
     [
@@ -288,6 +347,40 @@ def test_resume_reuses_only_complete_chunks_and_rejects_rebinding(
     assert primary.request_counts[11] == 1
 
 
+@pytest.mark.parametrize("corruption", ["digest", "duplicate"])
+def test_resume_integrity_binds_checkpoint_bytes_and_exported_proofs(
+    tmp_path: Path,
+    chains: tuple[ChainServer, ChainServer],
+    make_config: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    corruption: str,
+) -> None:
+    primary, verifier = chains
+    config = make_config(
+        tmp_path / "config.toml",
+        primary,
+        verifier,
+        output_root=tmp_path / "out",
+        features=("timestamp", "base_fee_per_gas"),
+    )
+    monkeypatch.setattr(_build, "_CHUNK_SIZE", 2)
+    primary.changes[12] = {"hash": "invalid"}
+    assert error(invoke(download_args(config)))["code"] == "RPC_INVALID"
+    primary.changes.clear()
+
+    chunks = tmp_path / "out" / f".blockweaver-{DATASET_ID}" / "chunks"
+    checkpoint = next(chunks.iterdir())
+    frame = pl.read_parquet(checkpoint)
+    column = "base_fee_per_gas" if corruption == "digest" else "timestamp"
+    frame.with_columns((pl.col(column) + 1).alias(column)).write_parquet(checkpoint)
+    if corruption == "duplicate":
+        first, last, _digest = checkpoint.stem.split("-")
+        digest = hashlib.sha256(checkpoint.read_bytes()).hexdigest()
+        checkpoint.rename(checkpoint.with_name(f"{first}-{last}-{digest}.parquet"))
+
+    assert error(invoke(download_args(config)))["code"] == "RESUME_INVALID"
+
+
 def test_verifier_disagreement_and_secret_redaction(
     tmp_path: Path,
     chains: tuple[ChainServer, ChainServer],
@@ -330,6 +423,57 @@ def test_publication_failure_recovers_ready_candidate(
     assert artifact.exists()
 
 
+@pytest.mark.parametrize("published", [False, True])
+def test_recovery_rejects_artifacts_outside_the_immutable_binding(
+    tmp_path: Path,
+    chains: tuple[ChainServer, ChainServer],
+    make_config: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    published: bool,
+) -> None:
+    primary, verifier = chains
+    config = make_config(tmp_path / "config.toml", primary, verifier, output_root=tmp_path / "out")
+    real_publish, real_discard = _build.publish, _build.discard_work
+
+    def interrupt(*_args: object) -> None:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(_build, "discard_work" if published else "publish", interrupt)
+    assert error(invoke(download_args(config)))["code"] == "INTERRUPTED"
+    monkeypatch.setattr(_build, "publish", real_publish)
+    monkeypatch.setattr(_build, "discard_work", real_discard)
+
+    hidden = tmp_path / "out" / f".blockweaver-{DATASET_ID}"
+    artifact = next(path for path in (tmp_path / "out").iterdir() if not path.name.startswith(".")) if published else hidden / "ready"
+    manifest_path = artifact / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["source"]["provider"] = "other"
+    manifest_path.write_text(json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n")
+    receipt_path = hidden / "receipt.json"
+    receipt = json.loads(receipt_path.read_text())
+    receipt["artifact_sha256"] = _corpus.pair_hashes(artifact)
+    receipt_path.write_text(json.dumps(receipt, sort_keys=True, separators=(",", ":")) + "\n")
+
+    assert error(invoke(download_args(config)))["code"] == "RESUME_MISMATCH"
+
+
+def test_publication_never_replaces_a_racing_destination(tmp_path: Path) -> None:
+    hidden = tmp_path / "hidden"
+    ready = hidden / "ready"
+    ready.mkdir(parents=True)
+    (ready / "manifest.json").write_text("{}\n")
+    (ready / "blocks.csv").write_text("block_number\n")
+    destination = tmp_path / "destination"
+    destination.mkdir()
+
+    with pytest.raises(BlockweaverError, match="already exists") as caught:
+        _corpus.publish(hidden, destination)
+
+    assert caught.value.code == "DESTINATION_EXISTS"
+    assert list(destination.iterdir()) == []
+    assert ready.exists()
+
+
 def test_verify_is_strict_locally_and_against_rpc(
     tmp_path: Path,
     chains: tuple[ChainServer, ChainServer],
@@ -346,6 +490,61 @@ def test_verify_is_strict_locally_and_against_rpc(
         artifact / "blocks.parquet"
     )
     assert error(invoke(["verify", str(artifact)]))["code"] == "ARTIFACT_INVALID"
+
+
+def test_manifest_requires_canonical_json_and_completion_follows_data_assembly(
+    tmp_path: Path,
+    chains: tuple[ChainServer, ChainServer],
+    make_config: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    primary, verifier = chains
+    output_root = tmp_path / "out"
+    config = make_config(tmp_path / "config.toml", primary, verifier, output_root=output_root)
+    observed = False
+
+    def completion_time() -> str:
+        nonlocal observed
+        observed = any(output_root.glob(".blockweaver-*/ready.tmp/blocks.parquet"))
+        return "2026-08-10T12:00:00Z"
+
+    monkeypatch.setattr(_corpus, "_completion_time", completion_time)
+    artifact = artifact_from(invoke(download_args(config)))
+    assert observed
+    manifest_path = artifact / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    assert manifest["completed_at"] == "2026-08-10T12:00:00Z"
+    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+    assert error(invoke(["verify", str(artifact)]))["code"] == "ARTIFACT_INVALID"
+
+
+def test_full_rpc_verification_is_chunked_and_checks_cross_chunk_ancestry(
+    tmp_path: Path,
+    chains: tuple[ChainServer, ChainServer],
+    make_config: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    primary, verifier = chains
+    config = make_config(
+        tmp_path / "config.toml",
+        primary,
+        verifier,
+        output_root=tmp_path / "out",
+        features=("effective_priority_fee_per_gas_p50",),
+    )
+    artifact = artifact_from(invoke(download_args(config, last=15)))
+    monkeypatch.setattr(_build, "_CHUNK_SIZE", 2)
+    verifier.requests.clear()
+
+    verified = invoke(["verify", str(artifact), "--config", str(config), "--provider", "verifier", "--full-rpc"])
+    assert verified.exit_code == 0, verified.output
+    fee_calls = [call for batch in verifier.requests for call in batch if call["method"] == "eth_feeHistory"]
+    assert len(fee_calls) == 3
+    assert all(int(call["params"][0], 16) <= 2 for call in fee_calls)
+
+    verifier.changes[12] = {"parentHash": block_hash(1)}
+    mismatch = invoke(["verify", str(artifact), "--config", str(config), "--provider", "verifier", "--full-rpc"])
+    assert error(mismatch)["code"] == "RPC_MISMATCH"
 
 
 def test_rpc_protocol_failure_is_bounded_and_machine_readable(
