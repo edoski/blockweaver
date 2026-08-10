@@ -1,3 +1,3 @@
-"""Acquire and verify immutable EVM block corpora."""
+"""Download and verify immutable EVM block datasets."""
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"

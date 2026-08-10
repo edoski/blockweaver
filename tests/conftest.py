@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import json
 import threading
-import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import suppress
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -16,26 +16,17 @@ def block_hash(number: int) -> str:
 
 
 class ChainServer:
-    def __init__(self, *, chain_id: int = 1, finalized: int = 30) -> None:
+    def __init__(self, *, chain_id: int = 1, finalized: int = 30, timestamp_base: int = 1_700_000_000) -> None:
         self.chain_id = chain_id
         self.finalized = finalized
+        self.timestamp_base = timestamp_base
         self.requests: list[list[dict[str, Any]]] = []
         self.request_counts: dict[int, int] = {}
         self.http_failures = 0
-        self.omit_once: set[int] = set()
         self.omit_counts: dict[int, int] = {}
-        self.omit: set[int] = set()
-        self.null_once: set[int] = set()
         self.changes: dict[int, dict[str, Any]] = {}
-        self.changes_after: dict[int, tuple[int, dict[str, Any]]] = {}
-        self.errors: dict[int, dict[str, Any]] = {}
-        self.delays: dict[int, float] = {}
-        self.delays_after: dict[int, tuple[int, float]] = {}
-        self.reject_batches_larger_than: int | None = None
-        self.wrong_id_once = False
-        self.priority_fees: dict[int, int] = {}
-        self.priority_fees_p90: dict[int, int] = {}
         self.fee_history_changes: dict[str, Any] = {}
+        self.wrong_id_once = False
         state = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -52,65 +43,28 @@ class ChainServer:
                     return
                 replies = []
                 for call in calls:
-                    params = call.get("params")
-                    if call.get("method") == "eth_feeHistory":
-                        count = int(params[0], 16)
-                        newest = int(params[1], 16)
+                    method, params = call.get("method"), call.get("params")
+                    if method == "eth_chainId":
+                        result: Any = hex(state.chain_id)
+                    elif method == "eth_feeHistory":
+                        count, newest = int(params[0], 16), int(params[1], 16)
                         oldest = newest - count + 1
+                        percentiles = params[2]
                         result = {
                             "oldestBlock": hex(oldest),
-                            "baseFeePerGas": [],
-                            "reward": [
-                                [
-                                    hex(state.priority_fees.get(number, number * 100)),
-                                    hex(state.priority_fees_p90.get(number, number * 200)),
-                                ]
-                                for number in range(oldest, newest + 1)
-                            ],
+                            "reward": [[hex(number * percentile) for percentile in percentiles] for number in range(oldest, newest + 1)],
                             **state.fee_history_changes,
                         }
-                        replies.append({"jsonrpc": "2.0", "id": call["id"], "result": result})
-                        continue
-                    selector = params[0] if isinstance(params, list) and params else None
-                    number = state.finalized if selector == "finalized" else int(selector, 16) if isinstance(selector, str) else -1
-                    state.request_counts[number] = state.request_counts.get(number, 0) + 1
-                    delay = state.delays.get(number, 0.0)
-                    after = state.delays_after.get(number)
-                    if after is not None and state.request_counts[number] > after[0]:
-                        delay = after[1]
-                    time.sleep(delay)
-                    if number in state.omit:
-                        continue
-                    if state.omit_counts.get(number, 0):
-                        state.omit_counts[number] -= 1
-                        continue
-                    if number in state.omit_once:
-                        state.omit_once.remove(number)
-                        continue
-                    if number in state.errors:
-                        replies.append({"jsonrpc": "2.0", "id": call["id"], "error": state.errors[number]})
-                        continue
-                    if self.server.state.reject_batches_larger_than is not None and len(calls) > self.server.state.reject_batches_larger_than:  # type: ignore[attr-defined]
-                        replies.append(
-                            {
-                                "jsonrpc": "2.0",
-                                "id": call["id"],
-                                "error": {"code": -32000, "message": "busy"},
-                            }
-                        )
-                        continue
-                    result: Any
-                    if call.get("method") == "eth_chainId":
-                        result = hex(state.chain_id)
-                    elif number in state.null_once:
-                        state.null_once.remove(number)
-                        result = None
                     else:
+                        selector = params[0]
+                        number = state.finalized if selector in {"finalized", "safe"} else int(selector, 16)
+                        state.request_counts[number] = state.request_counts.get(number, 0) + 1
+                        if state.omit_counts.get(number, 0):
+                            state.omit_counts[number] -= 1
+                            continue
                         result = state.block(number)
-                    item_id = call["id"]
-                    if state.wrong_id_once:
-                        state.wrong_id_once = False
-                        item_id += 10_000
+                    item_id = call["id"] + 10_000 if state.wrong_id_once else call["id"]
+                    state.wrong_id_once = False
                     replies.append({"jsonrpc": "2.0", "id": item_id, "result": result})
                 body = json.dumps(list(reversed(replies))).encode()
                 self.send_response(200)
@@ -124,7 +78,6 @@ class ChainServer:
                 del format, args
 
         self._server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-        self._server.state = self  # type: ignore[attr-defined]
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
 
     @property
@@ -132,20 +85,16 @@ class ChainServer:
         return f"http://127.0.0.1:{self._server.server_port}"
 
     def block(self, number: int) -> dict[str, Any]:
-        changes = self.changes.get(number, {})
-        delayed_changes = self.changes_after.get(number)
-        if delayed_changes is not None and self.request_counts.get(number, 0) > delayed_changes[0]:
-            changes = {**changes, **delayed_changes[1]}
         return {
             "number": hex(number),
             "hash": block_hash(number),
             "parentHash": block_hash(number - 1),
-            "timestamp": hex(1_700_000_000 + number),
+            "timestamp": hex(self.timestamp_base + number),
             "baseFeePerGas": hex(1_000_000_000 + number),
             "gasUsed": hex(15_000_000 + number),
             "gasLimit": hex(30_000_000),
             "transactions": [block_hash(number * 10 + offset) for offset in range(number % 3)],
-            **changes,
+            **self.changes.get(number, {}),
         }
 
     def __enter__(self) -> ChainServer:
@@ -162,3 +111,48 @@ class ChainServer:
 def chains() -> Iterator[tuple[ChainServer, ChainServer]]:
     with ChainServer() as primary, ChainServer() as verifier:
         yield primary, verifier
+
+
+@pytest.fixture
+def make_config() -> Callable[..., Path]:
+    def write(
+        path: Path,
+        primary: ChainServer,
+        verifier: ChainServer,
+        *,
+        output_root: Path,
+        features: tuple[str, ...] = ("timestamp", "block_hash"),
+        output_format: str = "parquet",
+    ) -> Path:
+        quoted_features = ", ".join(json.dumps(feature) for feature in features)
+        path.write_text(
+            f"""[defaults]
+chain = "test"
+source = "rpc"
+provider = "primary"
+verifier = "verifier"
+output_root = {json.dumps(str(output_root))}
+format = {json.dumps(output_format)}
+features = [{quoted_features}]
+
+[chains.test]
+chain_id = 1
+finality_tag = "finalized"
+
+[providers.primary]
+url = {json.dumps(primary.url)}
+batch_size = 3
+concurrency = 2
+timeout = 2
+
+[providers.verifier]
+url = {json.dumps(verifier.url)}
+batch_size = 3
+concurrency = 2
+timeout = 2
+""",
+            encoding="utf-8",
+        )
+        return path
+
+    return write

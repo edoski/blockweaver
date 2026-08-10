@@ -1,138 +1,114 @@
 # Blockweaver
 
-Acquire and verify immutable EVM block corpora.
-
-Blockweaver is a standalone CLI for producing the exact two-file Corpus format consumed by FABLE. It talks directly to EVM JSON-RPC endpoints with `aiohttp`; it does not import FABLE, Web3.py, provider SDKs, or a provider registry.
-
-## Install
+Blockweaver downloads and verifies immutable, feature-selected EVM block datasets. Chains and JSON-RPC providers are configuration, not code. Each successful request publishes one data file and one canonical manifest.
 
 Python 3.11 or newer is required.
 
 ```console
 uv tool install blockweaver
+blockweaver init
 ```
 
-For development from a checkout:
+`init` writes the platform user config path, or the path selected by `--config` or `BLOCKWEAVER_CONFIG`. It never overwrites a file. The generated TOML uses environment-backed URLs and a local example chain:
+
+```toml
+[defaults]
+chain = "ethereum"
+source = "rpc"
+provider = "primary"
+verifier = "verifier"
+output_root = "./downloads"
+format = "parquet"
+features = ["timestamp", "block_hash", "base_fee_per_gas", "gas_used", "gas_limit", "tx_count"]
+
+[chains.ethereum]
+chain_id = 1
+finality_tag = "finalized"
+
+[providers.primary]
+url_env = "ETHEREUM_PRIMARY_RPC_URL"
+batch_size = 20
+concurrency = 6
+timeout = 30
+
+[providers.verifier]
+url_env = "ETHEREUM_VERIFIER_RPC_URL"
+batch_size = 20
+concurrency = 6
+timeout = 30
+```
+
+Configuration is strict: unknown keys, unknown profiles, invalid URLs, and ambiguous `url`/`url_env` pairs fail before network access. Chain profiles may override `provider` and `verifier`. CLI values override the selected chain and provider profiles, which override global defaults.
+
+Inspect configuration and the closed feature catalog without exposing endpoints:
 
 ```console
-uv sync --locked --dev
-uv run blockweaver --help
+blockweaver chains
+blockweaver features --chain ethereum
 ```
 
-## Acquire
+## Download
 
-Use independent primary and verifier endpoints. Environment variables keep credentials out of the command line.
+Bounds are inclusive. Supply exactly one complete range form:
 
 ```console
-export BLOCKWEAVER_RPC_URL='https://primary.example.invalid'
-export BLOCKWEAVER_VERIFY_RPC_URL='https://verifier.example.invalid'
+blockweaver download --from-block 19000000 --to-block 19000999
 
-blockweaver acquire \
-  --storage-root ./data \
-  --corpus-id 11111111-1111-4111-8111-111111111111 \
-  --chain-id 1 \
-  --first-block 19000000 \
-  --last-block 19000999
+blockweaver download \
+  --from-time 2026-01-01T10:30+01:00 \
+  --to-time 2026-01-01T10:45:30+01:00 \
+  --feature timestamp \
+  --feature block_hash \
+  --feature effective_priority_fee_per_gas_p50 \
+  --format csv
 ```
 
-`--rpc-url` and `--verify-rpc-url` override the environment. `--batch-size` defaults to 20 and `--concurrency` to 6. The caller must supply a UUID4; Blockweaver never mints one.
+Dates mean the full UTC day. Datetimes accept timezone-aware hour, minute, or second precision; reduced-precision end bounds include the final second of that period. Blockweaver resolves time bounds against the finalized chain and rejects pre-genesis, empty, future, and partly unfinalized requests instead of clipping them.
 
-Block headers supply the existing block facts. Batched `eth_feeHistory(blockCount, newestBlock, [50, 90])` calls supply `effective_priority_fee_per_gas_p50` and `effective_priority_fee_per_gas_p90`. Blockweaver requires the requested `oldestBlock` and both reward values for every block. It does not use the response's `baseFeePerGas` length.
+`block_number` is always the first column. Other columns are selected explicitly or inherited from `defaults.features`. Header features share `eth_getBlockByNumber`; selected priority-fee percentiles share one `eth_feeHistory` request per acquisition chunk with only the requested percentiles.
 
-Acquisition checkpoints complete deterministic ranges under exactly:
+An omitted `--id` mints a UUID4 and emits it on stderr before acquisition. Reusing an explicit `--id` resumes only an exact binding of chain, requested and resolved range, features, format, source, and provider profile names. Batch size, concurrency, timeout, and endpoint credentials may change between attempts.
+
+The output is exactly:
 
 ```text
-ROOT/corpora/.<UUID>/
+ROOT/<chain>-<resolved-start-UTC>-<uuid4>/
+  manifest.json
+  blocks.parquet | blocks.csv
 ```
 
-Running the same command resumes those checkpoints. A request with different range, chain, operation, or extension source is rejected. Publication validates the complete candidate and atomically renames its ready directory to `ROOT/corpora/<UUID>/`. Existing destinations are never overwritten.
+Parquet is the typed default. CSV uses canonical decimal integers and UTF-8 strings; `manifest.json` is its type authority. The version-1 manifest records the request, resolved range, ordered schema and units, acquisition plan, chain identity, non-secret provider profile names, finality proof, verification samples, byte size, and SHA-256 digest. JSON is sorted, compact, UTF-8, and newline-terminated.
 
-The destination rename plus parent-directory sync is the commit boundary. A SIGINT during that short publication transition is deferred so a committed command can emit its receipt.
-
-Avalanche C-Chain history beyond Coreth's fee-history window can be acquired directly from Google's public Blockchain Analytics tables. The query reconstructs gas-used-weighted P50 and P90 from receipts and publishes the same canonical nine-column Corpus.
-
-```console
-blockweaver acquire-bigquery \
-  --storage-root ./data \
-  --corpus-id 22222222-2222-4222-8222-222222222222 \
-  --first-block 72240649 \
-  --last-block 90818814 \
-  --gcp-project fable-503220 \
-  --maximum-bytes-billed 200000000000 \
-  --rpc-url "$BLOCKWEAVER_RPC_URL"
-```
-
-The command uses Application Default Credentials and one partition-bounded query against `bigquery-public-data.goog_blockchain_avalanche_contract_chain_us`. It rejects incomplete receipt coverage and proves the target against the RPC finalized chain before publication. `--maximum-bytes-billed` is a hard query limit, not a promise that Google will charge nothing; run it only in a project whose billing and free-tier state you have verified.
-
-## Extend
-
-Extension fully validates the source, copies its rows into a new Corpus, and acquires only the suffix. It never mutates, renames, deletes, or hard-links the source.
-
-```console
-blockweaver extend ./data/corpora/11111111-1111-4111-8111-111111111111 \
-  --storage-root ./data \
-  --corpus-id 22222222-2222-4222-8222-222222222222 \
-  --last-block 19001999
-```
-
-Before publication, both endpoints must agree with the source boundary, the first suffix block must link to it, and the source pair hashes must remain unchanged.
+Work is checkpointed under a hidden directory. Complete chunks are validated before reuse. The fully assembled candidate is validated, synced, and atomically renamed; existing destinations are never overwritten.
 
 ## Verify
 
-Every verification performs full local validation, including exact filenames, JSON shape, Parquet schema, row count, order, domains, and timestamps.
-
-Existing Corpus directories that match the durable nine-column contract below can be verified directly. Verification reads the pair in place and needs no FABLE imports or acquisition code.
+Local verification is strict and needs no provider:
 
 ```console
-blockweaver verify ./data/corpora/11111111-1111-4111-8111-111111111111
-blockweaver verify ./data/corpora/11111111-1111-4111-8111-111111111111 --rpc-url "$BLOCKWEAVER_RPC_URL"
-blockweaver verify ./data/corpora/11111111-1111-4111-8111-111111111111 --rpc-url "$BLOCKWEAVER_RPC_URL" --full-rpc
+blockweaver verify ./downloads/ethereum-20260101T000000Z-11111111-1111-4111-8111-111111111111
 ```
 
-RPC verification checks deterministic samples and the finalized anchor. `--full-rpc` compares every row.
-
-## Durable contract
-
-A published Corpus contains exactly:
-
-```text
-corpus.json
-blocks.parquet
-```
-
-`corpus.json` has only the request and finalized anchor:
-
-```json
-{"finalized_anchor":{"block_hash":"0000000000000000000000000000000000000000000000000000000000000000","block_number":19001000},"request":{"corpus_id":"11111111-1111-4111-8111-111111111111","definition":{"chain_id":1,"first_block":19000000,"last_block":19000999}}}
-```
-
-`blocks.parquet` has exactly nine ordered, non-null `Int64` columns:
-
-| Column | Rule |
-| --- | --- |
-| `block_number` | Contiguous requested range |
-| `timestamp` | Nonnegative, nondecreasing seconds |
-| `chain_id` | Requested chain |
-| `base_fee_per_gas` | Positive wei/gas |
-| `gas_used` | Between zero and `gas_limit` |
-| `gas_limit` | Positive gas |
-| `tx_count` | Nonnegative transaction count |
-| `effective_priority_fee_per_gas_p50` | Nonnegative gas-used-weighted P50 among included transactions, in wei/gas |
-| `effective_priority_fee_per_gas_p90` | Nonnegative gas-used-weighted P90 among included transactions, in wei/gas |
-
-## Output and trust
-
-Progress is JSON Lines on stderr. One final receipt is JSON on stdout. The receipt records the operation, range, row counts, finalized anchor, SHA-256 hashes for the pair, deterministic sample facts, and verifier facts. It is not stored beside the Corpus.
+RPC verification uses a configured profile or a direct URL. It checks deterministic samples and refreshes the stored finality proof. `--full-rpc` checks every row.
 
 ```console
-blockweaver verify ./data/corpora/11111111-1111-4111-8111-111111111111 \
-  >receipt.json 2>progress.jsonl
+blockweaver verify DATASET --provider verifier
+blockweaver verify DATASET --rpc-url http://127.0.0.1:8545 --full-rpc
 ```
 
-Store the receipt in your own audit system. Blockweaver excludes RPC URLs and credentials from durable files and intentional output.
+Progress and errors are JSON Lines on stderr. Errors include stable `code` and `message` fields. Success is one JSON receipt on stdout. URLs and environment values are excluded from manifests, receipts, and intentional logs.
 
-Providers must support archival reads for every requested historical block and the `finalized` tag. Blockweaver proves numbered ancestry from the target to a freshly read finalized block, then rereads the tagged anchor by number. This detects endpoint disagreement and many provider faults; it does not make a provider trustless. Use independently operated endpoints when possible.
+Providers must implement EVM JSON-RPC batch requests, historical `eth_getBlockByNumber`, the configured `finalized` or `safe` tag, and `eth_feeHistory` when priority-fee features are selected. Independent verification consumes quota. Blockweaver checks provider agreement, numbered ancestry to the tagged anchor, a numbered anchor reread, and deterministic row samples; this is strong operational verification, not a trustless consensus client.
 
-Historical reads, finality ancestry, retries, and `--full-rpc` can consume substantial provider quota or incur charges. Estimate the range and provider pricing first. Tune batching and concurrency to provider limits.
+For development:
+
+```console
+uv sync --locked --dev
+uv run pytest
+uv run ruff check src tests
+uv run ruff format --check src tests
+uv run pyright
+uv run vulture src tests --min-confidence 80
+```
 
 Licensed under the [MIT License](LICENSE).

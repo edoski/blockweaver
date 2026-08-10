@@ -1,7 +1,8 @@
-"""Canonical two-file Corpus storage and resumable checkpoints."""
+"""Canonical two-file dataset storage and resumable work state."""
 
 from __future__ import annotations
 
+import csv
 import fcntl
 import hashlib
 import json
@@ -11,167 +12,198 @@ import shutil
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from uuid import UUID
 
 import polars as pl
 
-from ._contract import Anchor, Block, Request, validate_links
+from ._contract import Anchor, BlockweaverError, Header, Plan, ResolvedRange, Value, format_utc, plan_features, validate_links
 
-BASE_COLUMNS = [
-    "block_number",
-    "timestamp",
-    "chain_id",
-    "base_fee_per_gas",
-    "gas_used",
-    "gas_limit",
-    "tx_count",
-]
-FINAL_COLUMNS = [
-    *BASE_COLUMNS,
-    "effective_priority_fee_per_gas_p50",
-    "effective_priority_fee_per_gas_p90",
-]
-FINAL_SCHEMA = {name: pl.Int64 for name in FINAL_COLUMNS}
-CHECKPOINT_SCHEMA = {
-    **FINAL_SCHEMA,
-    "block_hash": pl.String,
-    "parent_hash": pl.String,
-}
 _CHUNK = re.compile(r"(\d{20})-(\d{20})\.parquet\Z")
+_HASH = re.compile(r"0x[0-9a-f]{64}\Z")
+_DECIMAL = re.compile(r"0|[1-9][0-9]*\Z")
+_NAME = re.compile(r"[a-z0-9][a-z0-9_-]*\Z")
+_SHA256 = re.compile(r"[0-9a-f]{64}\Z")
+_MANIFEST_KEYS = {
+    "manifest_version",
+    "dataset_version",
+    "tool_version",
+    "dataset_id",
+    "completed_at",
+    "chain",
+    "source",
+    "requested_range",
+    "resolved_range",
+    "schema",
+    "acquisition_plan",
+    "row_count",
+    "output",
+    "target_hash",
+    "finalized_anchor",
+    "verification",
+}
 
 
 @dataclass(frozen=True, slots=True)
-class LoadedCorpus:
+class LoadedDataset:
     path: Path
-    request: Request
-    anchor: Anchor
+    manifest: dict[str, Any]
+    plan: Plan
     rows: int
+    data_path: Path
 
     @property
-    def blocks_path(self) -> Path:
-        return self.path / "blocks.parquet"
+    def chain_id(self) -> int:
+        return int(self.manifest["chain"]["chain_id"])
 
-    def fact(self, number: int) -> dict[str, object]:
-        return self.facts([number])[number]
+    @property
+    def first_block(self) -> int:
+        return int(self.manifest["resolved_range"]["from_block"])
 
-    def facts(self, numbers: list[int]) -> dict[int, dict[str, object]]:
-        frame = pl.scan_parquet(self.blocks_path).filter(pl.col("block_number").is_in(numbers)).collect(engine="streaming")
-        if frame["block_number"].to_list() != numbers:
-            raise ValueError("Requested Corpus rows are missing")
-        return {int(row["block_number"]): {name: int(value) for name, value in row.items()} for row in frame.iter_rows(named=True)}
+    @property
+    def last_block(self) -> int:
+        return int(self.manifest["resolved_range"]["to_block"])
+
+    @property
+    def anchor(self) -> Anchor:
+        value = self.manifest["finalized_anchor"]
+        return Anchor(value["block_number"], value["block_hash"], value["tag"])
+
+    def facts(self, numbers: list[int]) -> dict[int, dict[str, Value]]:
+        frame = _scan_data(self.data_path, self.plan, self.manifest["output"]["format"])
+        selected = frame.filter(pl.col("block_number").is_in(numbers)).collect(engine="streaming")
+        if selected["block_number"].to_list() != numbers:
+            raise BlockweaverError("ARTIFACT_INVALID", "Requested dataset rows are missing")
+        return {int(row["block_number"]): {name: value for name, value in row.items()} for row in selected.iter_rows(named=True)}
 
 
 @dataclass(frozen=True, slots=True)
 class WorkState:
     chunks: Path
     candidate: Path | None = None
-    receipt: dict[str, object] | None = None
+    receipt: dict[str, Any] | None = None
     published: bool = False
 
 
-def corpus_path(root: Path, corpus_id: UUID) -> Path:
-    return root / "corpora" / str(corpus_id)
+def dataset_path(root: Path, chain: str, resolved: ResolvedRange, dataset_id: UUID) -> Path:
+    return root / f"{chain}-{format_utc(resolved.first_timestamp, filename=True)}-{dataset_id}"
 
 
 @contextmanager
-def locked_work(root: Path, corpus_id: UUID) -> Iterator[Path]:
-    destination = corpus_path(root, corpus_id)
-    parent = destination.parent
-    hidden = parent / f".{corpus_id}"
-    if destination.exists() and not hidden.exists():
-        raise FileExistsError(f"Destination already exists: {destination}")
-    parent.mkdir(parents=True, exist_ok=True)
+def locked_work(root: Path, dataset_id: UUID, destination: Path) -> Iterator[Path]:
+    root.mkdir(parents=True, exist_ok=True)
+    hidden = root / f".blockweaver-{dataset_id}"
+    existed = hidden.exists()
+    if destination.exists() and not existed:
+        raise BlockweaverError("DESTINATION_EXISTS", f"Destination already exists: {destination}")
     hidden.mkdir(exist_ok=True)
     descriptor = os.open(hidden, os.O_RDONLY)
     try:
         fcntl.flock(descriptor, fcntl.LOCK_EX)
-        if destination.exists() and not hidden.exists():
-            raise FileExistsError(f"Destination already exists: {destination}")
         yield hidden
     finally:
         fcntl.flock(descriptor, fcntl.LOCK_UN)
         os.close(descriptor)
 
 
-def prepare_work(hidden: Path, destination: Path, request: Request, binding: dict[str, object]) -> WorkState:
-    manifest = hidden / "binding.json"
+def prepare_work(hidden: Path, destination: Path, binding: dict[str, object]) -> WorkState:
+    binding_path = hidden / "binding.json"
     chunks = hidden / "chunks"
     ready = hidden / "ready"
     receipt_path = hidden / "receipt.json"
-    if destination.exists():
-        candidate = load_corpus(destination)
-        if candidate.request != request:
-            raise ValueError("Published recovery does not match the command")
-        if manifest.is_file():
-            _validate_binding(manifest, binding)
-        receipt = _read_json(receipt_path) if receipt_path.is_file() else None
-        if receipt is not None:
-            _validate_receipt(receipt, destination, destination, request, binding)
-        return WorkState(chunks, destination, receipt, True)
     for path in hidden.rglob("*.tmp"):
         shutil.rmtree(path) if path.is_dir() else path.unlink()
-    if manifest.is_file() and chunks.is_dir():
-        _validate_binding(manifest, binding)
+    if binding_path.is_file() and chunks.is_dir():
+        if _read_json(binding_path) != binding:
+            raise BlockweaverError("RESUME_MISMATCH", "Incomplete work belongs to a different immutable request")
+        if destination.exists():
+            dataset = load_dataset(destination)
+            receipt = _read_json(receipt_path) if receipt_path.is_file() else None
+            if receipt is not None and receipt.get("artifact_sha256") != pair_hashes(destination):
+                raise BlockweaverError("RESUME_INVALID", "Published recovery receipt does not match the dataset")
+            return WorkState(chunks, dataset.path, receipt, True)
         if ready.exists():
             try:
-                candidate = load_corpus(ready)
-                if candidate.request != request:
-                    raise ValueError("Ready candidate does not match the command")
+                dataset = load_dataset(ready, work=True)
                 receipt = _read_json(receipt_path) if receipt_path.is_file() else None
-                if receipt is not None:
-                    _validate_receipt(receipt, ready, destination, request, binding)
-            except (OSError, ValueError):
+                if receipt is not None and receipt.get("artifact_sha256") != pair_hashes(ready):
+                    raise ValueError
+            except (BlockweaverError, OSError, ValueError):
                 shutil.rmtree(ready) if ready.is_dir() else ready.unlink()
                 receipt_path.unlink(missing_ok=True)
             else:
-                return WorkState(chunks, ready, receipt)
+                return WorkState(chunks, dataset.path, receipt)
         receipt_path.unlink(missing_ok=True)
         return WorkState(chunks)
+    if destination.exists():
+        raise BlockweaverError("DESTINATION_EXISTS", f"Destination already exists: {destination}")
     for path in hidden.iterdir():
         shutil.rmtree(path) if path.is_dir() else path.unlink()
-    chunks.mkdir(parents=True)
-    _write_json(manifest, binding)
+    chunks.mkdir()
+    _write_json(binding_path, binding)
     _fsync_directory(hidden)
     return WorkState(chunks)
 
 
-def checkpoint_paths(chunks: Path, request: Request, size: int) -> tuple[list[Path], int, Block | None]:
+def checkpoint_paths(
+    chunks: Path,
+    *,
+    first_block: int,
+    last_block: int,
+    size: int,
+    plan: Plan,
+) -> tuple[list[Path], int, Header | None]:
     parsed: list[tuple[int, int, Path]] = []
     for path in chunks.iterdir():
         match = _CHUNK.fullmatch(path.name)
         if match is None:
-            raise ValueError(f"Unexpected checkpoint file: {path.name}")
+            raise BlockweaverError("RESUME_INVALID", f"Unexpected checkpoint file: {path.name}")
         parsed.append((int(match.group(1)), int(match.group(2)), path))
     parsed.sort()
-    expected = request.first_block
-    previous: Block | None = None
+    expected = first_block
+    previous: Header | None = None
     valid: list[Path] = []
     for first, last, path in parsed:
-        expected_last = min(expected + size - 1, request.last_block)
+        expected_last = min(expected + size - 1, last_block)
         if (first, last) != (expected, expected_last):
-            raise ValueError("Checkpoints are not a deterministic complete prefix")
-        blocks = read_checkpoint(path, request.chain_id)
-        if [item.block_number for item in blocks] != list(range(first, last + 1)):
-            raise ValueError("Checkpoint range does not match its filename")
-        validate_links(blocks, previous)
-        previous = blocks[-1]
+            raise BlockweaverError("RESUME_INVALID", "Checkpoints are not a deterministic complete prefix")
+        headers = read_checkpoint(path, plan)
+        if [header.block_number for header in headers] != list(range(first, last + 1)):
+            raise BlockweaverError("RESUME_INVALID", "Checkpoint range does not match its filename")
+        try:
+            validate_links(headers, previous)
+        except ValueError as error:
+            raise BlockweaverError("RESUME_INVALID", str(error)) from None
+        previous = headers[-1]
         valid.append(path)
         expected = last + 1
     return valid, expected, previous
 
 
-def write_checkpoint(
-    path: Path,
-    blocks: list[Block],
-    priority_fees: list[tuple[int, int]],
-) -> None:
+def checkpoint_schema(plan: Plan):
+    return {
+        **_polars_schema(plan),
+        "_proof_hash": pl.String,
+        "_proof_parent_hash": pl.String,
+        "_proof_timestamp": pl.Int64,
+    }
+
+
+def write_checkpoint(path: Path, plan: Plan, headers: list[Header], rows: list[dict[str, Value]]) -> None:
     temporary = path.with_suffix(".parquet.tmp")
     try:
-        rows = [block.checkpoint_row(*priority_fee) for block, priority_fee in zip(blocks, priority_fees, strict=True)]
-        frame = pl.DataFrame(rows, schema=CHECKPOINT_SCHEMA)
-        frame.write_parquet(temporary, compression="zstd", row_group_size=4096)
+        values = [
+            {
+                **row,
+                "_proof_hash": header.block_hash,
+                "_proof_parent_hash": header.parent_hash,
+                "_proof_timestamp": header.timestamp,
+            }
+            for header, row in zip(headers, rows, strict=True)
+        ]
+        pl.DataFrame(values, schema=checkpoint_schema(plan)).write_parquet(temporary, compression="zstd", row_group_size=4096)
         _fsync_file(temporary)
         os.replace(temporary, path)
         _fsync_directory(path.parent)
@@ -179,121 +211,285 @@ def write_checkpoint(
         temporary.unlink(missing_ok=True)
 
 
-def read_checkpoint(path: Path, chain_id: int) -> list[Block]:
+def read_checkpoint(path: Path, plan: Plan) -> list[Header]:
     try:
         frame = pl.read_parquet(path)
+        if frame.schema != checkpoint_schema(plan) or frame.is_empty() or frame.null_count().row(0) != (0,) * len(frame.columns):
+            raise ValueError
+        _validate_eager_frame(frame.select(plan.columns), plan, None)
+        headers = [
+            Header(row["block_number"], row["_proof_hash"], row["_proof_parent_hash"], row["_proof_timestamp"], {}) for row in frame.iter_rows(named=True)
+        ]
+        if any(_HASH.fullmatch(value) is None for header in headers for value in (header.block_hash, header.parent_hash)):
+            raise ValueError
+        return headers
     except Exception as error:
-        raise ValueError(f"Unreadable checkpoint: {path.name}") from error
-    if frame.schema != CHECKPOINT_SCHEMA or frame.null_count().row(0) != (0,) * len(CHECKPOINT_SCHEMA):
-        raise ValueError("Invalid checkpoint schema")
-    block_columns = [*BASE_COLUMNS, "block_hash", "parent_hash"]
-    blocks = [Block(**{name: row[name] for name in block_columns}) for row in frame.iter_rows(named=True)]
-    if any(re.fullmatch(r"[0-9a-f]{64}", value) is None for item in blocks for value in (item.block_hash, item.parent_hash)):
-        raise ValueError("Invalid checkpoint hash")
-    if any(item.chain_id != chain_id for item in blocks) or not blocks:
-        raise ValueError("Invalid checkpoint chain")
-    return blocks
+        raise BlockweaverError("RESUME_INVALID", f"Invalid checkpoint: {path.name}") from error
+
+
+def checkpoint_facts(paths: list[Path], plan: Plan, numbers: list[int]) -> dict[int, dict[str, Value]]:
+    frame = pl.concat([pl.scan_parquet(path).select(plan.columns) for path in paths], how="vertical")
+    selected = frame.filter(pl.col("block_number").is_in(numbers)).collect(engine="streaming")
+    if selected["block_number"].to_list() != numbers:
+        raise BlockweaverError("RESUME_INVALID", "Requested checkpoint rows are missing")
+    return {int(row["block_number"]): {name: value for name, value in row.items()} for row in selected.iter_rows(named=True)}
 
 
 def write_candidate(
     candidate: Path,
-    request: Request,
-    anchor: Anchor,
+    *,
+    plan: Plan,
+    output_format: str,
     sources: list[Path],
-) -> None:
-    scans = [pl.scan_parquet(path).select(FINAL_COLUMNS) for path in sources]
-    _write_candidate(candidate, request, anchor, pl.concat(scans, how="vertical"))
-
-
-def _write_candidate(candidate: Path, request: Request, anchor: Anchor, frame: pl.LazyFrame) -> None:
+    manifest: dict[str, object],
+) -> LoadedDataset:
     candidate.mkdir()
-    blocks_path = candidate / "blocks.parquet"
-    temporary = candidate / "blocks.parquet.tmp"
-    frame.sink_parquet(temporary, compression="zstd", row_group_size=4096, maintain_order=True)
+    filename = f"blocks.{output_format}"
+    data_path = candidate / filename
+    temporary = candidate / f"{filename}.tmp"
+    scans = [pl.scan_parquet(path).select(plan.columns) for path in sources]
+    combined = pl.concat(scans, how="vertical")
+    if output_format == "parquet":
+        combined.sink_parquet(temporary, compression="zstd", row_group_size=4096, maintain_order=True)
+    else:
+        combined.sink_csv(temporary, maintain_order=True)
     _fsync_file(temporary)
-    os.replace(temporary, blocks_path)
-    _write_json(candidate / "corpus.json", {"request": request.document(), "finalized_anchor": anchor.document()})
+    os.replace(temporary, data_path)
+    output = {
+        "filename": filename,
+        "format": output_format,
+        "bytes": data_path.stat().st_size,
+        "sha256": file_hash(data_path),
+    }
+    _write_json(candidate / "manifest.json", {**manifest, "output": output})
     _fsync_directory(candidate)
+    return load_dataset(candidate, work=True)
 
 
-def load_corpus(path: Path) -> LoadedCorpus:
-    path, request, anchor = _load_corpus_pair(path)
-    rows = validate_blocks(path / "blocks.parquet", request)
-    return LoadedCorpus(path, request, anchor, rows)
+def load_dataset(path: Path, *, work: bool = False) -> LoadedDataset:
+    try:
+        return _load_dataset(path, work=work)
+    except BlockweaverError as error:
+        raise BlockweaverError("ARTIFACT_INVALID", str(error)) from None
+    except Exception as error:
+        raise BlockweaverError("ARTIFACT_INVALID", str(error) or "Invalid dataset") from None
 
 
-def _load_corpus_pair(path: Path) -> tuple[Path, Request, Anchor]:
+def _load_dataset(path: Path, *, work: bool) -> LoadedDataset:
     path = path.resolve()
     if not path.is_dir():
-        raise ValueError(f"Corpus directory does not exist: {path}")
-    if {item.name for item in path.iterdir()} != {"corpus.json", "blocks.parquet"}:
-        raise ValueError("Corpus directory must contain exactly corpus.json and blocks.parquet")
-    try:
-        document = json.loads((path / "corpus.json").read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as error:
-        raise ValueError("Invalid corpus.json") from error
-    request, anchor = _parse_document(document)
-    if anchor.block_number < request.last_block:
-        raise ValueError("Finalized anchor precedes the Corpus")
-    return path, request, anchor
+        raise ValueError(f"Dataset directory does not exist: {path}")
+    manifest_path = path / "manifest.json"
+    if not manifest_path.is_file():
+        raise ValueError("Dataset must contain manifest.json")
+    manifest = _read_json(manifest_path)
+    if set(manifest) != _MANIFEST_KEYS:
+        raise ValueError("manifest.json has a noncanonical shape")
+    if manifest["manifest_version"] != 1 or manifest["dataset_version"] != 1 or not isinstance(manifest["tool_version"], str) or not manifest["tool_version"]:
+        raise ValueError("Unsupported manifest version")
+    dataset_id = _canonical_uuid(manifest["dataset_id"])
+    chain = _exact_table(manifest["chain"], {"name", "chain_id"}, "chain")
+    if not isinstance(chain["name"], str) or _NAME.fullmatch(chain["name"]) is None or type(chain["chain_id"]) is not int or chain["chain_id"] <= 0:
+        raise ValueError("Invalid manifest chain")
+    source = _exact_table(manifest["source"], {"type", "provider", "verifier"}, "source")
+    if source["type"] != "rpc" or any(not isinstance(source[key], str) or _NAME.fullmatch(source[key]) is None for key in ("provider", "verifier")):
+        raise ValueError("Invalid manifest source")
+    requested = manifest["requested_range"]
+    if not isinstance(requested, dict) or requested.get("kind") not in {"block", "time"}:
+        raise ValueError("Invalid requested range")
+    expected_requested = {"kind", "from", "to"} if requested["kind"] == "block" else {"kind", "from", "to", "normalized_from_utc", "normalized_to_utc"}
+    if set(requested) != expected_requested:
+        raise ValueError("Invalid requested range shape")
+    resolved = _exact_table(
+        manifest["resolved_range"],
+        {"from_block", "to_block", "from_timestamp", "to_timestamp"},
+        "resolved range",
+    )
+    if any(type(resolved[key]) is not int or resolved[key] < 0 for key in resolved):
+        raise ValueError("Invalid resolved range values")
+    if resolved["from_block"] > resolved["to_block"] or resolved["from_timestamp"] > resolved["to_timestamp"]:
+        raise ValueError("Invalid resolved range order")
+    if requested["kind"] == "block":
+        if any(type(requested[key]) is not int or requested[key] < 0 for key in ("from", "to")):
+            raise ValueError("Invalid requested block range")
+        if (requested["from"], requested["to"]) != (resolved["from_block"], resolved["to_block"]):
+            raise ValueError("Requested and resolved block ranges disagree")
+    else:
+        if any(not isinstance(requested[key], str) for key in expected_requested - {"kind"}):
+            raise ValueError("Invalid requested time range")
+        normalized_from = _utc_timestamp(requested["normalized_from_utc"])
+        normalized_to = _utc_timestamp(requested["normalized_to_utc"])
+        if normalized_from > normalized_to or resolved["from_timestamp"] < normalized_from or resolved["to_timestamp"] > normalized_to:
+            raise ValueError("Requested and resolved time ranges disagree")
+    schema = manifest["schema"]
+    if not isinstance(schema, list) or not schema:
+        raise ValueError("Invalid schema")
+    names: list[str] = []
+    for column in schema:
+        parsed = _exact_table(column, {"name", "type", "unit"}, "schema column")
+        if any(not isinstance(parsed[key], str) for key in parsed):
+            raise ValueError("Invalid schema column")
+        names.append(parsed["name"])
+    if names[0] != "block_number":
+        raise ValueError("block_number must be the first schema column")
+    plan = plan_features(names[1:])
+    if schema != plan.schema_document() or manifest["acquisition_plan"] != plan.document():
+        raise ValueError("Schema or acquisition plan is not canonical")
+    output = _exact_table(manifest["output"], {"filename", "format", "bytes", "sha256"}, "output")
+    if output["format"] not in {"parquet", "csv"} or output["filename"] != f"blocks.{output['format']}":
+        raise ValueError("Invalid output descriptor")
+    data_path = path / output["filename"]
+    if {item.name for item in path.iterdir()} != {"manifest.json", output["filename"]}:
+        raise ValueError("Dataset directory must contain exactly manifest.json and its declared data file")
+    if (
+        type(output["bytes"]) is not int
+        or output["bytes"] < 0
+        or output["bytes"] != data_path.stat().st_size
+        or not isinstance(output["sha256"], str)
+        or _SHA256.fullmatch(output["sha256"]) is None
+        or output["sha256"] != file_hash(data_path)
+    ):
+        raise ValueError("Data file size or digest does not match manifest")
+    if not isinstance(manifest["completed_at"], str) or not manifest["completed_at"].endswith("Z"):
+        raise ValueError("Invalid completion time")
+    completed = datetime.fromisoformat(manifest["completed_at"].replace("Z", "+00:00"))
+    if completed.utcoffset() != UTC.utcoffset(completed):
+        raise ValueError("Completion time is not UTC")
+    anchor = _exact_table(manifest["finalized_anchor"], {"block_number", "block_hash", "tag"}, "finalized anchor")
+    if type(anchor["block_number"]) is not int or anchor["block_number"] < resolved["to_block"]:
+        raise ValueError("Finalized anchor does not cover the dataset")
+    if _HASH.fullmatch(anchor["block_hash"]) is None or anchor["tag"] not in {"finalized", "safe"}:
+        raise ValueError("Invalid finalized anchor")
+    if not isinstance(manifest["target_hash"], str) or _HASH.fullmatch(manifest["target_hash"]) is None:
+        raise ValueError("Invalid target hash")
+    verification = _exact_table(
+        manifest["verification"],
+        {"primary_chain_id", "verifier_chain_id", "target_agreement", "sampled_blocks"},
+        "verification",
+    )
+    if (
+        verification["primary_chain_id"] != chain["chain_id"]
+        or verification["verifier_chain_id"] != chain["chain_id"]
+        or verification["target_agreement"] is not True
+    ):
+        raise ValueError("Invalid verification facts")
+    samples = verification["sampled_blocks"]
+    if (
+        not isinstance(samples, list)
+        or any(type(number) is not int for number in samples)
+        or samples != sorted(set(samples))
+        or any(number < resolved["from_block"] or number > resolved["to_block"] for number in samples)
+        or resolved["from_block"] not in samples
+        or resolved["to_block"] not in samples
+    ):
+        raise ValueError("Invalid verification samples")
+    expected_name = f"{chain['name']}-{format_utc(resolved['from_timestamp'], filename=True)}-{dataset_id}"
+    allowed_names = {expected_name, "ready", "ready.tmp"} if work else {expected_name}
+    if path.name not in allowed_names:
+        raise ValueError("Dataset directory name does not match its manifest")
+    rows = _validate_data(data_path, plan, output["format"], resolved, manifest["target_hash"])
+    if type(manifest["row_count"]) is not int or manifest["row_count"] != rows:
+        raise ValueError("Manifest row count does not match data")
+    return LoadedDataset(path, manifest, plan, rows, data_path)
 
 
-def validate_blocks(path: Path, request: Request) -> int:
-    try:
-        schema = pl.read_parquet_schema(path)
-    except Exception as error:
-        raise ValueError("Invalid blocks.parquet") from error
-    if schema != FINAL_SCHEMA:
-        raise ValueError("blocks.parquet has a noncanonical schema")
-    try:
-        scan = pl.scan_parquet(path)
-        invalid = (
-            (pl.col("chain_id") != request.chain_id)
-            | (pl.col("timestamp") < 0)
-            | (pl.col("base_fee_per_gas") <= 0)
-            | (pl.col("gas_used") < 0)
-            | (pl.col("gas_limit") <= 0)
-            | (pl.col("gas_used") > pl.col("gas_limit"))
-            | (pl.col("tx_count") < 0)
-            | (pl.col("effective_priority_fee_per_gas_p50") < 0)
-            | (pl.col("effective_priority_fee_per_gas_p90") < 0)
-        )
-        summary = (
-            scan.select(
-                pl.len().alias("rows"),
-                pl.col("block_number").first().alias("first"),
-                pl.col("block_number").last().alias("last"),
-                (pl.col("block_number").diff() != 1).fill_null(False).any().alias("gaps"),
+def _validate_data(path: Path, plan: Plan, output_format: str, resolved: dict[str, int], target_hash: str) -> int:
+    if output_format == "parquet":
+        if pl.read_parquet_schema(path) != _polars_schema(plan):
+            raise ValueError("Parquet schema is not canonical")
+    else:
+        _validate_csv_tokens(path, plan)
+    frame = _scan_data(path, plan, output_format)
+    invalid = pl.lit(False)
+    for feature in plan.features:
+        if feature.dtype == "Int64":
+            rule = pl.col(feature.name) < 0
+            if feature.name in {"base_fee_per_gas", "gas_limit"}:
+                rule = pl.col(feature.name) <= 0
+            invalid |= rule
+        elif feature.name in {"block_hash", "parent_hash"}:
+            invalid |= ~pl.col(feature.name).str.contains(r"^0x[0-9a-f]{64}$")
+    if {"gas_used", "gas_limit"} <= set(plan.columns):
+        invalid |= pl.col("gas_used") > pl.col("gas_limit")
+    expressions = [
+        pl.len().alias("rows"),
+        pl.col("block_number").first().alias("first"),
+        pl.col("block_number").last().alias("last"),
+        (pl.col("block_number").diff() != 1).fill_null(False).any().alias("gaps"),
+        invalid.any().alias("invalid"),
+        pl.sum_horizontal(*(pl.col(name).null_count() for name in plan.columns)).alias("nulls"),
+    ]
+    if "timestamp" in plan.columns:
+        expressions.extend(
+            [
                 (pl.col("timestamp").diff() < 0).fill_null(False).any().alias("time_decreases"),
-                invalid.any().alias("invalid"),
-                pl.sum_horizontal(*(pl.col(name).null_count() for name in FINAL_SCHEMA)).alias("nulls"),
-            )
-            .collect(engine="streaming")
-            .row(0, named=True)
+                pl.col("timestamp").first().alias("first_timestamp"),
+                pl.col("timestamp").last().alias("last_timestamp"),
+            ]
         )
-    except Exception as error:
-        raise ValueError("Invalid blocks.parquet") from error
-    if summary["nulls"]:
-        raise ValueError("blocks.parquet contains nulls")
-    expected_rows = request.last_block - request.first_block + 1
-    if summary["rows"] != expected_rows:
-        raise ValueError("blocks.parquet row count does not match request")
-    if summary["first"] != request.first_block or summary["last"] != request.last_block or summary["gaps"]:
-        raise ValueError("Block numbers are not the requested contiguous range")
-    if summary["invalid"] or summary["time_decreases"]:
-        raise ValueError("blocks.parquet contains invalid block values")
+    if "block_hash" in plan.columns:
+        expressions.append(pl.col("block_hash").last().alias("target_hash"))
+    summary = frame.select(*expressions).collect(engine="streaming").row(0, named=True)
+    expected_rows = resolved["to_block"] - resolved["from_block"] + 1
+    if summary["rows"] != expected_rows or summary["first"] != resolved["from_block"] or summary["last"] != resolved["to_block"] or summary["gaps"]:
+        raise ValueError("Data rows are not the resolved contiguous range")
+    if summary["invalid"] or summary["nulls"]:
+        raise ValueError("Data contains invalid or null values")
+    if "timestamp" in plan.columns and (
+        summary["time_decreases"] or summary["first_timestamp"] != resolved["from_timestamp"] or summary["last_timestamp"] != resolved["to_timestamp"]
+    ):
+        raise ValueError("Data timestamps do not match the resolved range")
+    if "block_hash" in plan.columns and summary["target_hash"] != target_hash:
+        raise ValueError("Data target hash does not match the manifest")
     return expected_rows
 
 
-def pair_hashes(path: Path) -> dict[str, str]:
-    hashes: dict[str, str] = {}
-    for name in ("corpus.json", "blocks.parquet"):
-        digest = hashlib.sha256()
-        with (path / name).open("rb") as stream:
-            while chunk := stream.read(1024 * 1024):
-                digest.update(chunk)
-        hashes[name] = digest.hexdigest()
-    return hashes
+def _validate_eager_frame(frame: pl.DataFrame, plan: Plan, resolved: dict[str, int] | None) -> None:
+    if frame.schema != _polars_schema(plan) or frame.null_count().row(0) != (0,) * len(frame.columns):
+        raise ValueError("Invalid checkpoint values")
+    if frame["block_number"].to_list() != list(range(int(frame[0, "block_number"]), int(frame[-1, "block_number"]) + 1)):
+        raise ValueError("Checkpoint block numbers are not contiguous")
+    previous_timestamp: int | None = None
+    for row in frame.iter_rows(named=True):
+        for feature in plan.features:
+            value = row[feature.name]
+            if feature.dtype == "Int64" and (value < 0 or (feature.name in {"base_fee_per_gas", "gas_limit"} and value == 0)):
+                raise ValueError("Checkpoint contains an invalid feature value")
+            if feature.name in {"block_hash", "parent_hash"} and _HASH.fullmatch(value) is None:
+                raise ValueError("Checkpoint contains an invalid hash")
+        if {"gas_used", "gas_limit"} <= set(plan.columns) and row["gas_used"] > row["gas_limit"]:
+            raise ValueError("Checkpoint contains invalid gas values")
+        if "timestamp" in plan.columns:
+            timestamp = row["timestamp"]
+            if previous_timestamp is not None and timestamp < previous_timestamp:
+                raise ValueError("Checkpoint timestamps decrease")
+            previous_timestamp = timestamp
+    del resolved
+
+
+def _validate_csv_tokens(path: Path, plan: Plan) -> None:
+    with path.open(newline="", encoding="utf-8") as stream:
+        reader = csv.reader(stream)
+        try:
+            header = next(reader)
+        except StopIteration:
+            raise ValueError("CSV is empty") from None
+        if header != list(plan.columns):
+            raise ValueError("CSV header is not canonical")
+        integer_indexes = [index for index, dtype in enumerate(plan.schema.values()) if dtype == "Int64"]
+        for row in reader:
+            if len(row) != len(header) or any(_DECIMAL.fullmatch(row[index]) is None for index in integer_indexes):
+                raise ValueError("CSV contains a noncanonical value")
+
+
+def _scan_data(path: Path, plan: Plan, output_format: str) -> pl.LazyFrame:
+    if output_format == "parquet":
+        return pl.scan_parquet(path)
+    return pl.scan_csv(path, schema=_polars_schema(plan))
+
+
+def _polars_schema(plan: Plan):
+    return {name: pl.Int64 if dtype == "Int64" else pl.String for name, dtype in plan.schema.items()}
 
 
 def save_ready(hidden: Path, candidate: Path, receipt: dict[str, object]) -> None:
@@ -306,10 +502,10 @@ def save_ready(hidden: Path, candidate: Path, receipt: dict[str, object]) -> Non
 
 def publish(hidden: Path, destination: Path) -> None:
     ready = hidden / "ready"
-    for name in ("corpus.json", "blocks.parquet"):
-        _fsync_file(ready / name)
-    if {item.name for item in ready.iterdir()} != {"corpus.json", "blocks.parquet"}:
-        raise ValueError("Candidate contains unexpected files")
+    for path in ready.iterdir():
+        _fsync_file(path)
+    if len(list(ready.iterdir())) != 2 or not (ready / "manifest.json").is_file():
+        raise BlockweaverError("PUBLICATION_FAILED", "Candidate does not contain exactly the canonical artifact pair")
     _fsync_directory(ready)
     os.rename(ready, destination)
     _fsync_directory(destination.parent)
@@ -319,72 +515,54 @@ def discard_work(hidden: Path) -> None:
     shutil.rmtree(hidden)
 
 
-def _validate_binding(path: Path, binding: dict[str, object]) -> None:
-    if _read_json(path) != binding:
-        raise ValueError("Incomplete work belongs to a different command")
+def pair_hashes(path: Path) -> dict[str, str]:
+    return {item.name: file_hash(item) for item in sorted(path.iterdir()) if item.is_file()}
 
 
-def _validate_receipt(
-    receipt: dict[str, object],
-    candidate: Path,
-    destination: Path,
-    request: Request,
-    binding: dict[str, object],
-) -> None:
-    expected = {
-        "operation": binding["operation"],
-        "corpus_id": str(request.corpus_id),
-        "path": str(destination),
-        "chain_id": request.chain_id,
-        "first_block": request.first_block,
-        "last_block": request.last_block,
-        "rows": request.last_block - request.first_block + 1,
-    }
-    if any(receipt.get(name) != value for name, value in expected.items()):
-        raise ValueError("Recovery receipt does not match the command")
-    if receipt.get("pair_sha256") != pair_hashes(candidate):
-        raise ValueError("Recovery receipt does not match the Corpus")
+def file_hash(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        while chunk := stream.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
-def _read_json(path: Path) -> dict[str, object]:
-    try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as error:
-        raise ValueError(f"Invalid work state: {path.name}") from error
-    if not isinstance(value, dict):
-        raise ValueError(f"Invalid work state: {path.name}")
+def _canonical_uuid(value: object) -> UUID:
+    if not isinstance(value, str):
+        raise ValueError("Dataset ID must be a string")
+    parsed = UUID(value)
+    if parsed.version != 4 or str(parsed) != value:
+        raise ValueError("Dataset ID must be a canonical UUID4")
+    return parsed
+
+
+def _utc_timestamp(value: str) -> int:
+    if not value.endswith("Z"):
+        raise ValueError("Normalized time must be UTC")
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.utcoffset() != UTC.utcoffset(parsed):
+        raise ValueError("Normalized time must be UTC")
+    return int(parsed.timestamp())
+
+
+def _exact_table(value: object, keys: set[str], label: str) -> dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != keys:
+        raise ValueError(f"Invalid {label}")
     return value
 
 
-def _parse_document(value: Any) -> tuple[Request, Anchor]:
-    if not isinstance(value, dict) or set(value) != {"request", "finalized_anchor"}:
-        raise ValueError("corpus.json has a noncanonical shape")
-    request = value["request"]
-    anchor = value["finalized_anchor"]
-    if not isinstance(request, dict) or set(request) != {"corpus_id", "definition"}:
-        raise ValueError("Invalid Corpus request")
-    definition = request["definition"]
-    if not isinstance(definition, dict) or set(definition) != {"chain_id", "first_block", "last_block"}:
-        raise ValueError("Invalid Corpus definition")
-    if any(type(definition[key]) is not int for key in definition):
-        raise ValueError("Corpus definition values must be integers")
-    if not isinstance(request["corpus_id"], str):
-        raise ValueError("Corpus ID must be a string")
+def _read_json(path: Path) -> dict[str, Any]:
     try:
-        parsed_request = Request(UUID(request["corpus_id"]), **definition)
-    except (TypeError, ValueError) as error:
-        raise ValueError("Invalid Corpus request") from error
-    if not isinstance(anchor, dict) or set(anchor) != {"block_number", "block_hash"}:
-        raise ValueError("Invalid finalized anchor")
-    if type(anchor["block_number"]) is not int or not isinstance(anchor["block_hash"], str):
-        raise ValueError("Invalid finalized anchor")
-    if anchor["block_number"] < 0 or re.fullmatch(r"[0-9a-f]{64}", anchor["block_hash"]) is None:
-        raise ValueError("Invalid finalized anchor")
-    return parsed_request, Anchor(**anchor)
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError(f"Invalid JSON file: {path.name}") from error
+    if not isinstance(value, dict):
+        raise ValueError(f"Invalid JSON object: {path.name}")
+    return value
 
 
 def _write_json(path: Path, value: object) -> None:
-    data = json.dumps(value, ensure_ascii=True, allow_nan=False, sort_keys=True, separators=(",", ":"))
+    data = json.dumps(value, ensure_ascii=True, allow_nan=False, sort_keys=True, separators=(",", ":")) + "\n"
     temporary = path.with_suffix(path.suffix + ".tmp")
     try:
         temporary.write_text(data, encoding="utf-8")

@@ -1,32 +1,42 @@
-"""Acquire, extend, verify, and publish Corpus objects."""
+"""Download, verify, and atomically publish configured datasets."""
 
 from __future__ import annotations
 
 import hashlib
-import shutil
-from collections.abc import Callable, Iterable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from itertools import islice
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Literal, cast
+from typing import Literal
 from uuid import UUID
 
-import polars as pl
-from google.cloud import bigquery
-
-from ._contract import Anchor, Block, Request, validate_links
+from . import __version__
+from ._contract import (
+    Anchor,
+    BlockweaverError,
+    Chain,
+    Header,
+    OutputFormat,
+    Plan,
+    Provider,
+    RequestedRange,
+    ResolvedRange,
+    Value,
+    plan_features,
+    validate_links,
+    validate_uuid,
+)
 from ._corpus import (
-    FINAL_SCHEMA,
-    LoadedCorpus,
+    LoadedDataset,
+    checkpoint_facts,
     checkpoint_paths,
-    corpus_path,
+    dataset_path,
     discard_work,
-    load_corpus,
+    load_dataset,
     locked_work,
     pair_hashes,
     prepare_work,
     publish,
-    read_checkpoint,
     save_ready,
     write_candidate,
     write_checkpoint,
@@ -35,586 +45,389 @@ from ._rpc import Rpc
 
 Progress = Callable[[dict[str, object]], None]
 Publication = Callable[[Literal["publishing", "committed"]], None]
-_CHECKPOINT_SIZE = 1024
-_AVALANCHE_CHAIN_ID = 43_114
-_AVALANCHE_DATASET = "bigquery-public-data.goog_blockchain_avalanche_contract_chain_us"
-_AVALANCHE_QUERY = f"""
-WITH requested_blocks AS (
-  SELECT block_number, block_timestamp, block_hash, parent_hash, base_fee_per_gas, gas_used, gas_limit
-  FROM `{_AVALANCHE_DATASET}.blocks`
-  WHERE block_timestamp >= TIMESTAMP_SECONDS(@first_timestamp)
-    AND block_timestamp < TIMESTAMP_SECONDS(@after_timestamp)
-    AND block_number BETWEEN @first_block AND @last_block
-),
-requested_receipts AS (
-  SELECT block_hash, transaction_index, gas_used, effective_gas_price
-  FROM `{_AVALANCHE_DATASET}.receipts`
-  WHERE block_timestamp >= TIMESTAMP_SECONDS(@first_timestamp)
-    AND block_timestamp < TIMESTAMP_SECONDS(@after_timestamp)
-),
-weighted AS (
-  SELECT
-    b.block_number,
-    r.transaction_index,
-    r.gas_used,
-    r.effective_gas_price - b.base_fee_per_gas AS priority_fee,
-    b.gas_used AS block_gas_used,
-    COUNT(*) OVER (PARTITION BY b.block_number) AS tx_count,
-    SUM(r.gas_used) OVER (PARTITION BY b.block_number) AS receipt_gas_used,
-    SUM(r.gas_used) OVER (
-      PARTITION BY b.block_number
-      ORDER BY r.effective_gas_price - b.base_fee_per_gas, r.transaction_index
-      ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
-    ) AS cumulative_gas_used
-  FROM requested_blocks AS b
-  JOIN requested_receipts AS r USING (block_hash)
-),
-fees AS (
-  SELECT
-    block_number,
-    ANY_VALUE(tx_count) AS tx_count,
-    ANY_VALUE(receipt_gas_used) AS receipt_gas_used,
-    ARRAY_AGG(
-      IF(cumulative_gas_used >= DIV(block_gas_used, 2), priority_fee, NULL)
-      IGNORE NULLS
-      ORDER BY priority_fee, transaction_index
-      LIMIT 1
-    )[OFFSET(0)] AS priority_fee_p50,
-    ARRAY_AGG(
-      IF(cumulative_gas_used >= DIV(block_gas_used * 9, 10), priority_fee, NULL)
-      IGNORE NULLS
-      ORDER BY priority_fee, transaction_index
-      LIMIT 1
-    )[OFFSET(0)] AS priority_fee_p90
-  FROM weighted
-  GROUP BY block_number
-)
-SELECT
-  b.block_number,
-  UNIX_SECONDS(b.block_timestamp) AS timestamp,
-  {_AVALANCHE_CHAIN_ID} AS chain_id,
-  b.base_fee_per_gas,
-  b.gas_used,
-  b.gas_limit,
-  COALESCE(f.tx_count, 0) AS tx_count,
-  COALESCE(f.receipt_gas_used, 0) AS receipt_gas_used,
-  COALESCE(f.priority_fee_p50, 0) AS effective_priority_fee_per_gas_p50,
-  COALESCE(f.priority_fee_p90, 0) AS effective_priority_fee_per_gas_p90,
-  b.block_hash,
-  b.parent_hash
-FROM requested_blocks AS b
-LEFT JOIN fees AS f USING (block_number)
-ORDER BY block_number
-"""
+_CHUNK_SIZE = 1024
+_INTEGRITY_PLAN = plan_features([])
 
 
 @dataclass(frozen=True, slots=True)
-class ExtensionSource:
-    corpus: LoadedCorpus
-    hashes: dict[str, str]
-
-    def ensure_unchanged(self) -> None:
-        if pair_hashes(self.corpus.path) != self.hashes:
-            raise ValueError("Source Corpus changed during extension")
-
-
-async def extend_corpus(
-    source_path: Path,
-    *,
-    storage_root: Path,
-    corpus_id: UUID,
-    last_block: int,
-    rpc_url: str,
-    verify_rpc_url: str,
-    batch_size: int,
-    concurrency: int,
-    progress: Progress,
-    publication: Publication,
-) -> dict[str, object]:
-    source_path = source_path.resolve()
-    source_hashes = pair_hashes(source_path)
-    corpus = load_corpus(source_path)
-    if pair_hashes(source_path) != source_hashes:
-        raise ValueError("Source Corpus changed during validation")
-    if corpus_id == corpus.request.corpus_id:
-        raise ValueError("Extension requires a new corpus_id")
-    if last_block <= corpus.request.last_block:
-        raise ValueError("Extension last_block must exceed the source endpoint")
-    request = Request(
-        corpus_id,
-        corpus.request.chain_id,
-        corpus.request.first_block,
-        last_block,
-    )
-    return await acquire_corpus(
-        request,
-        storage_root=storage_root,
-        rpc_url=rpc_url,
-        verify_rpc_url=verify_rpc_url,
-        batch_size=batch_size,
-        concurrency=concurrency,
-        progress=progress,
-        extension=ExtensionSource(corpus, source_hashes),
-        publication=publication,
-    )
+class DownloadSpec:
+    dataset_id: UUID
+    chain: Chain
+    requested_range: RequestedRange
+    plan: Plan
+    output_root: Path
+    output_format: OutputFormat
+    primary: Provider
+    verifier: Provider
 
 
-async def acquire_avalanche_bigquery(
-    request: Request,
-    *,
-    storage_root: Path,
-    gcp_project: str,
-    maximum_bytes_billed: int,
-    rpc_url: str,
-    progress: Progress,
-    publication: Publication,
-) -> dict[str, object]:
-    if request.chain_id != _AVALANCHE_CHAIN_ID:
-        raise ValueError("BigQuery acquisition requires Avalanche C-Chain")
-    destination = corpus_path(storage_root.resolve(), request.corpus_id)
-    with locked_work(storage_root.resolve(), request.corpus_id) as hidden:
-        try:
-            for path in hidden.iterdir():
-                shutil.rmtree(path) if path.is_dir() else path.unlink()
-            async with Rpc(rpc_url, batch_size=20, concurrency=6) as rpc:
-                if await rpc.chain_id() != _AVALANCHE_CHAIN_ID:
-                    raise ValueError("RPC chain ID does not match Avalanche C-Chain")
-                first, target = await rpc.blocks(
-                    [request.first_block, request.last_block],
-                    chain_id=_AVALANCHE_CHAIN_ID,
-                )
-                config = bigquery.QueryJobConfig(
-                    maximum_bytes_billed=maximum_bytes_billed,
-                    query_parameters=[
-                        bigquery.ScalarQueryParameter(
-                            "first_block",
-                            "INT64",
-                            request.first_block,
-                        ),
-                        bigquery.ScalarQueryParameter(
-                            "last_block",
-                            "INT64",
-                            request.last_block,
-                        ),
-                        bigquery.ScalarQueryParameter(
-                            "first_timestamp",
-                            "INT64",
-                            first.timestamp,
-                        ),
-                        bigquery.ScalarQueryParameter(
-                            "after_timestamp",
-                            "INT64",
-                            target.timestamp + 1,
-                        ),
-                    ],
-                )
-                rows = iter(
-                    bigquery.Client(project=gcp_project)
-                    .query(
-                        _AVALANCHE_QUERY,
-                        job_config=config,
-                        location="US",
-                    )
-                    .result(page_size=10_000)
-                )
-                part_paths: list[Path] = []
-                query_target: Block | None = None
-                expected = request.first_block
-                while page := list(islice(rows, 100_000)):
-                    frame_rows: list[dict[str, object]] = []
-                    page_first = expected
-                    for row in page:
-                        values = dict(row.items())
-                        if expected > request.last_block or values["block_number"] != expected:
-                            raise ValueError("BigQuery did not return the requested contiguous range")
-                        block_hash = str(values.pop("block_hash")).removeprefix("0x")
-                        parent_hash = str(values.pop("parent_hash")).removeprefix("0x")
-                        receipt_gas_used = values.pop("receipt_gas_used")
-                        if receipt_gas_used != values["gas_used"]:
-                            raise ValueError(f"BigQuery receipts are incomplete for block {expected}")
-                        frame_rows.append(values)
-                        if expected == request.last_block:
-                            query_target = Block(
-                                block_number=expected,
-                                block_hash=block_hash,
-                                parent_hash=parent_hash,
-                                timestamp=cast(int, values["timestamp"]),
-                                chain_id=_AVALANCHE_CHAIN_ID,
-                                base_fee_per_gas=cast(
-                                    int,
-                                    values["base_fee_per_gas"],
-                                ),
-                                gas_used=cast(int, values["gas_used"]),
-                                gas_limit=cast(int, values["gas_limit"]),
-                                tx_count=cast(int, values["tx_count"]),
-                            )
-                        expected += 1
-                    part_path = hidden / f"{page_first:020d}-{expected - 1:020d}.parquet"
-                    pl.DataFrame(frame_rows, schema=FINAL_SCHEMA).write_parquet(
-                        part_path,
-                        compression="zstd",
-                        row_group_size=4096,
-                    )
-                    part_paths.append(part_path)
-                if expected != request.last_block + 1:
-                    raise ValueError("BigQuery did not return the requested contiguous range")
-                if query_target is None:
-                    raise ValueError("BigQuery returned no target block")
-                anchor, proof = await _prove_finality(query_target, rpc, request)
-            progress(
-                {
-                    "event": "bigquery_complete",
-                    "first_block": request.first_block,
-                    "last_block": request.last_block,
-                }
+async def download(spec: DownloadSpec, *, progress: Progress, publication: Publication) -> dict[str, object]:
+    validate_uuid(spec.dataset_id)
+    if spec.primary.name == spec.verifier.name:
+        raise BlockweaverError("PROVIDER_INVALID", "Primary and verifier must be distinct provider profiles")
+    if spec.primary.url == spec.verifier.url:
+        raise BlockweaverError("PROVIDER_INVALID", "Primary and verifier RPC endpoints must be independent")
+    progress({"event": "request", "dataset_id": str(spec.dataset_id)})
+    try:
+        async with _rpc(spec.primary) as primary, _rpc(spec.verifier) as verifier:
+            primary_chain_id, verifier_chain_id = await primary.chain_id(), await verifier.chain_id()
+            if primary_chain_id != spec.chain.chain_id or verifier_chain_id != spec.chain.chain_id:
+                raise BlockweaverError("RPC_CHAIN_MISMATCH", "RPC chain ID does not match the configured chain")
+            primary_tag, verifier_tag = (
+                await primary.tagged_header(spec.chain.finality_tag, _INTEGRITY_PLAN),
+                await verifier.tagged_header(spec.chain.finality_tag, _INTEGRITY_PLAN),
             )
-            candidate_path = hidden / "ready"
-            write_candidate(
-                candidate_path,
-                request,
-                anchor,
-                part_paths,
-            )
-            candidate = load_corpus(candidate_path)
-            receipt = _receipt(
-                operation="acquire-bigquery",
-                request=request,
-                path=destination,
-                source_id=None,
-                source_rows=0,
-                reused=0,
-                acquired=candidate.rows,
-                anchor=anchor,
-                hashes=pair_hashes(candidate_path),
-                samples=[candidate.fact(number) for number in _sample_numbers(request, None)],
-                verifier={
-                    **proof,
-                    "mode": "bigquery_rpc",
-                    "project": gcp_project,
-                    "dataset": _AVALANCHE_DATASET,
-                },
-            )
-            publication("publishing")
-            publish(hidden, destination)
-            publication("committed")
-            progress(
-                {
-                    "event": "published",
-                    "corpus_id": str(request.corpus_id),
-                }
-            )
-            return receipt
-        finally:
-            discard_work(hidden)
-
-
-async def acquire_corpus(
-    request: Request,
-    *,
-    storage_root: Path,
-    rpc_url: str,
-    verify_rpc_url: str,
-    batch_size: int,
-    concurrency: int,
-    progress: Progress,
-    publication: Publication,
-    extension: ExtensionSource | None = None,
-) -> dict[str, object]:
-    if rpc_url == verify_rpc_url:
-        raise ValueError("Primary and verifier RPC endpoints must be independent")
-    destination = corpus_path(storage_root.resolve(), request.corpus_id)
-    if extension is None:
-        operation, source_id, source_rows, source_last, source_paths = "acquire", None, 0, None, []
-    else:
-        source = extension.corpus
-        operation, source_id, source_rows = "extend", source.request.corpus_id, source.rows
-        source_last, source_paths = source.request.last_block, [source.blocks_path]
-    suffix_first = request.first_block if source_last is None else source_last + 1
-    suffix_request = Request(request.corpus_id, request.chain_id, suffix_first, request.last_block)
-    binding: dict[str, object] = {
-        "version": "0.1.0",
-        "operation": operation,
-        "request": request.document(),
-    }
-    if extension is not None:
-        binding["source"] = {
-            "path": str(extension.corpus.path),
-            "pair_sha256": extension.hashes,
-        }
-    with locked_work(storage_root.resolve(), request.corpus_id) as hidden:
-        work = prepare_work(hidden, destination, request, binding)
-        candidate_path, receipt = work.candidate, work.receipt
-        recovered = candidate_path is not None
-        if recovered and receipt is not None:
-            receipt = {**receipt, "reused_rows": request.last_block - request.first_block + 1, "acquired_rows": 0}
-        paths, next_block, previous, reused_suffix = [], suffix_first, None, 0
-        if candidate_path is None:
-            paths, next_block, previous = checkpoint_paths(work.chunks, suffix_request, _CHECKPOINT_SIZE)
-            reused_suffix = next_block - suffix_first
-            progress({"event": "resume", "reused_rows": source_rows + reused_suffix})
-        if receipt is None:
-            async with (
-                Rpc(rpc_url, batch_size=batch_size, concurrency=concurrency) as primary,
-                Rpc(verify_rpc_url, batch_size=batch_size, concurrency=concurrency) as verifier,
-            ):
-                if await primary.chain_id() != request.chain_id or await verifier.chain_id() != request.chain_id:
-                    raise ValueError("RPC chain ID does not match the Corpus request")
-                boundary = None if extension is None else await _validate_source_boundary(extension.corpus, primary, verifier)
+            resolved = await _resolve_range(spec.requested_range, primary, min(primary_tag.block_number, verifier_tag.block_number))
+            destination = dataset_path(spec.output_root.resolve(), spec.chain.name, resolved, spec.dataset_id)
+            binding = _binding(spec, resolved)
+            with locked_work(spec.output_root.resolve(), spec.dataset_id, destination) as hidden:
+                work = prepare_work(hidden, destination, binding)
+                candidate_path, receipt = work.candidate, work.receipt
+                recovered = candidate_path is not None
+                paths: list[Path] = []
+                next_block = resolved.first_block
+                previous: Header | None = None
+                reused = 0
                 if candidate_path is None:
-                    if previous is not None and boundary is not None:
-                        validate_links([read_checkpoint(paths[0], request.chain_id)[0]], boundary)
-                    while next_block <= request.last_block:
-                        last = min(next_block + _CHECKPOINT_SIZE - 1, request.last_block)
-                        blocks = await primary.blocks(range(next_block, last + 1), chain_id=request.chain_id)
-                        priority_fees = await primary.priority_fees(next_block, last)
-                        validate_links(blocks, previous or boundary)
-                        path = work.chunks / f"{next_block:020d}-{last:020d}.parquet"
-                        write_checkpoint(path, blocks, priority_fees)
-                        paths.append(path)
-                        previous, next_block = blocks[-1], last + 1
-                        progress({"event": "checkpoint", "first_block": blocks[0].block_number, "last_block": last})
-                    assert previous is not None
-                    anchor, verifier_fact = await _prove_finality(previous, verifier, request)
-                    candidate_path = hidden / "ready.tmp"
-                    write_candidate(candidate_path, request, anchor, source_paths + paths)
-                    candidate = load_corpus(candidate_path)
-                    reused, acquired = source_rows + reused_suffix, request.last_block - suffix_first + 1 - reused_suffix
+                    paths, next_block, previous = checkpoint_paths(
+                        work.chunks,
+                        first_block=resolved.first_block,
+                        last_block=resolved.last_block,
+                        size=_CHUNK_SIZE,
+                        plan=spec.plan,
+                    )
+                    reused = next_block - resolved.first_block
+                    progress({"event": "resume", "reused_rows": reused})
+                if receipt is None:
+                    if candidate_path is None:
+                        while next_block <= resolved.last_block:
+                            last = min(next_block + _CHUNK_SIZE - 1, resolved.last_block)
+                            headers, rows = await primary.rows(next_block, last, spec.plan)
+                            validate_links(headers, previous)
+                            chunk_path = work.chunks / f"{next_block:020d}-{last:020d}.parquet"
+                            write_checkpoint(chunk_path, spec.plan, headers, rows)
+                            paths.append(chunk_path)
+                            previous, next_block = headers[-1], last + 1
+                            progress({"event": "checkpoint", "from_block": headers[0].block_number, "to_block": last})
+                        assert previous is not None
+                        anchor, verifier_target = await _prove_finality(previous, verifier, spec.chain)
+                        sample_numbers = _sample_numbers(spec.dataset_id, resolved.first_block, resolved.last_block)
+                        local_samples = checkpoint_facts(paths, spec.plan, sample_numbers)
+                        await _check_rows(local_samples, sample_numbers, spec.plan, verifier)
+                        verification = {
+                            "primary_chain_id": primary_chain_id,
+                            "verifier_chain_id": verifier_chain_id,
+                            "target_agreement": previous == verifier_target,
+                            "sampled_blocks": sample_numbers,
+                        }
+                        manifest = _manifest(spec, resolved, previous.block_hash, anchor, verification)
+                        candidate_path = hidden / "ready.tmp"
+                        candidate = write_candidate(
+                            candidate_path,
+                            plan=spec.plan,
+                            output_format=spec.output_format,
+                            sources=paths,
+                            manifest=manifest,
+                        )
+                        acquired = candidate.rows - reused
+                    else:
+                        candidate = load_dataset(candidate_path, work=candidate_path.name in {"ready", "ready.tmp"})
+                        await _validate_candidate(candidate, primary, verifier, spec.chain)
+                        anchor = candidate.anchor
+                        acquired, reused = 0, candidate.rows
+                    receipt = _receipt("download", candidate, destination, reused, acquired, anchor)
+                assert candidate_path is not None and receipt is not None
+                if work.published:
+                    publication("committed")
                 else:
-                    candidate = load_corpus(candidate_path)
-                    anchor = candidate.anchor
-                    verifier_fact = await _validate_candidate_finality(candidate, primary, verifier)
-                    reused, acquired = candidate.rows, 0
-                samples = await _check_samples(candidate, primary, _sample_numbers(request, source_last))
-            receipt = _receipt(
-                operation=operation,
-                request=request,
-                path=destination,
-                source_id=source_id,
-                source_rows=source_rows,
-                reused=reused,
-                acquired=acquired,
-                anchor=anchor,
-                hashes=pair_hashes(candidate_path),
-                samples=samples,
-                verifier=verifier_fact,
-            )
-        if extension is not None:
-            extension.ensure_unchanged()
-        assert candidate_path is not None and receipt is not None
-        if work.published:
-            publication("committed")
-        else:
-            save_ready(hidden, candidate_path, receipt)
-            publication("publishing")
-            publish(hidden, destination)
-            publication("committed")
-        discard_work(hidden)
-        event: dict[str, object] = {"event": "published", "corpus_id": str(request.corpus_id)}
-        if recovered:
-            event["recovered"] = True
-        progress(event)
-        return receipt
+                    save_ready(hidden, candidate_path, receipt)
+                    publication("publishing")
+                    publish(hidden, destination)
+                    publication("committed")
+                discard_work(hidden)
+                event: dict[str, object] = {"event": "published", "dataset_id": str(spec.dataset_id), "path": str(destination)}
+                if recovered:
+                    event["recovered"] = True
+                progress(event)
+                return receipt
+    except BlockweaverError:
+        raise
+    except ValueError as error:
+        raise BlockweaverError("RPC_INVALID", str(error)) from None
+    except RuntimeError as error:
+        raise BlockweaverError("RPC_FAILED", str(error)) from None
+    except OSError as error:
+        raise BlockweaverError("IO_FAILED", str(error)) from None
 
 
-async def verify_corpus(
+async def verify_dataset(
     path: Path,
     *,
-    rpc_url: str | None,
+    provider: Provider | None,
     full_rpc: bool,
-    batch_size: int,
-    concurrency: int,
     progress: Progress,
 ) -> dict[str, object]:
-    corpus = load_corpus(path)
-    progress({"event": "local_valid", "rows": corpus.rows})
-    sample_numbers = _sample_numbers(corpus.request, None)
-    numbers: Iterable[int] = range(corpus.request.first_block, corpus.request.last_block + 1) if full_rpc else sample_numbers
-    samples: list[dict[str, object]]
-    verifier_fact: dict[str, object] = {"mode": "local"}
-    if rpc_url is None:
+    dataset = load_dataset(path)
+    progress({"event": "local_valid", "rows": dataset.rows})
+    anchor = dataset.anchor
+    verification: dict[str, object] = {"mode": "local"}
+    if provider is None:
         if full_rpc:
-            raise ValueError("--full-rpc requires --rpc-url or BLOCKWEAVER_RPC_URL")
-        samples = [corpus.fact(number) for number in sample_numbers]
+            raise BlockweaverError("VERIFY_INVALID", "--full-rpc requires a configured provider or --rpc-url")
     else:
-        async with Rpc(rpc_url, batch_size=batch_size, concurrency=concurrency) as rpc:
-            chain_id = await rpc.chain_id()
-            if chain_id != corpus.request.chain_id:
-                raise ValueError("RPC chain ID does not match the Corpus")
-            samples = await _check_samples(corpus, rpc, numbers, set(sample_numbers), contiguous=full_rpc)
-            target = (await rpc.blocks([corpus.request.last_block], chain_id=chain_id))[0]
-            fresh = await _refresh_finality(target, corpus.anchor, rpc, chain_id)
-            verifier_fact = {
-                "mode": "full_rpc" if full_rpc else "sample_rpc",
-                "chain_id": chain_id,
-                "finalized_block_number": fresh.block_number,
-                "finalized_block_hash": fresh.block_hash,
-            }
-    return _receipt(
-        operation="verify",
-        request=corpus.request,
-        path=corpus.path,
-        source_id=None,
-        source_rows=0,
-        reused=corpus.rows,
-        acquired=0,
-        anchor=corpus.anchor,
-        hashes=pair_hashes(corpus.path),
-        samples=samples,
-        verifier=verifier_fact,
-    )
-
-
-async def _validate_source_boundary(source: LoadedCorpus, primary: Rpc, verifier: Rpc) -> Block:
-    number = source.request.last_block
-    primary_block, verifier_block = (
-        await primary.blocks([number], chain_id=source.request.chain_id),
-        await verifier.blocks([number], chain_id=source.request.chain_id),
-    )
-    if primary_block[0] != verifier_block[0]:
-        raise ValueError("RPC endpoints disagree on the source boundary")
-    source_fact = source.fact(number)
-    source_headers = {name: source_fact[name] for name in primary_block[0].durable_row()}
-    if primary_block[0].durable_row() != source_headers:
-        raise ValueError("Source boundary does not match RPC")
-    return primary_block[0]
-
-
-async def _prove_finality(target: Block, verifier: Rpc, request: Request) -> tuple[Anchor, dict[str, object]]:
-    verifier_target = (await verifier.blocks([target.block_number], chain_id=request.chain_id))[0]
-    if target != verifier_target:
-        raise ValueError("RPC endpoints disagree on the target block")
-    tagged = await verifier.finalized_block(chain_id=request.chain_id)
-    if tagged.block_number < target.block_number:
-        raise ValueError("Verifier finalized head does not cover the target")
-    await _connect_ancestry(verifier_target, tagged, verifier, request.chain_id)
-    return Anchor(tagged.block_number, tagged.block_hash), {
-        "chain_id": request.chain_id,
-        "target_block_hash": target.block_hash,
-        "finalized_block_number": tagged.block_number,
-        "finalized_block_hash": tagged.block_hash,
-    }
-
-
-async def _validate_candidate_finality(corpus: LoadedCorpus, primary: Rpc, verifier: Rpc) -> dict[str, object]:
-    chain_id = corpus.request.chain_id
-    target = (await primary.blocks([corpus.request.last_block], chain_id=chain_id))[0]
-    verifier_target = (await verifier.blocks([target.block_number], chain_id=chain_id))[0]
-    if target != verifier_target:
-        raise ValueError("RPC endpoints disagree on the target block")
-    fresh = await _refresh_finality(verifier_target, corpus.anchor, verifier, chain_id)
+        try:
+            async with _rpc(provider) as rpc:
+                chain_id = await rpc.chain_id()
+                if chain_id != dataset.chain_id:
+                    raise BlockweaverError("RPC_CHAIN_MISMATCH", "RPC chain ID does not match the dataset")
+                target = await rpc.header(dataset.last_block, dataset.plan)
+                if target.block_hash != dataset.manifest["target_hash"]:
+                    raise BlockweaverError("RPC_MISMATCH", "Dataset target hash does not match RPC")
+                fresh = await _refresh_finality(target, anchor, rpc, dataset.chain_id)
+                numbers = (
+                    list(range(dataset.first_block, dataset.last_block + 1))
+                    if full_rpc
+                    else _sample_numbers(UUID(dataset.manifest["dataset_id"]), dataset.first_block, dataset.last_block)
+                )
+                await _check_rows(dataset.facts(numbers), numbers, dataset.plan, rpc, contiguous=full_rpc)
+                verification = {
+                    "mode": "full_rpc" if full_rpc else "sample_rpc",
+                    "provider": provider.name,
+                    "chain_id": chain_id,
+                    "sampled_blocks": numbers
+                    if not full_rpc
+                    else _sample_numbers(UUID(dataset.manifest["dataset_id"]), dataset.first_block, dataset.last_block),
+                    "finalized_anchor": fresh.document(),
+                }
+        except BlockweaverError:
+            raise
+        except ValueError as error:
+            raise BlockweaverError("RPC_INVALID", str(error)) from None
+        except RuntimeError as error:
+            raise BlockweaverError("RPC_FAILED", str(error)) from None
     return {
-        "chain_id": chain_id,
-        "target_block_hash": target.block_hash,
-        "finalized_block_number": fresh.block_number,
-        "finalized_block_hash": fresh.block_hash,
-        "recovered": True,
+        "version": 1,
+        "operation": "verify",
+        "dataset_id": dataset.manifest["dataset_id"],
+        "path": str(dataset.path),
+        "rows": dataset.rows,
+        "artifact_sha256": pair_hashes(dataset.path),
+        "verification": verification,
     }
 
 
-async def _refresh_finality(target: Block, anchor: Anchor, rpc: Rpc, chain_id: int) -> Block:
-    stored = (await rpc.blocks([anchor.block_number], chain_id=chain_id))[0]
+def _rpc(provider: Provider) -> Rpc:
+    return Rpc(provider.url, batch_size=provider.batch_size, concurrency=provider.concurrency, timeout=provider.timeout)
+
+
+async def _resolve_range(request: RequestedRange, rpc: Rpc, finalized: int) -> ResolvedRange:
+    if request.kind == "block":
+        if request.end > finalized:
+            raise BlockweaverError("RANGE_UNFINALIZED", "Requested block range is not fully finalized")
+        first, last = await rpc.headers([request.start, request.end], _INTEGRITY_PLAN)
+        return ResolvedRange(request.start, request.end, first.timestamp, last.timestamp)
+    cache: dict[int, Header] = {}
+
+    async def header(number: int) -> Header:
+        if number not in cache:
+            cache[number] = await rpc.header(number, _INTEGRITY_PLAN)
+        return cache[number]
+
+    genesis, latest = await header(0), await header(finalized)
+    if request.start < genesis.timestamp:
+        raise BlockweaverError("RANGE_PRE_GENESIS", "Requested time range begins before chain genesis")
+    if request.end > latest.timestamp:
+        raise BlockweaverError("RANGE_UNFINALIZED", "Requested time range extends beyond the finalized chain")
+    first = await _lower_bound_timestamp(request.start, finalized, header)
+    after = await _lower_bound_timestamp(request.end + 1, finalized, header)
+    last = finalized if after == finalized and (await header(finalized)).timestamp <= request.end else after - 1
+    first_header, last_header = await header(first), await header(last)
+    if first > last or first_header.timestamp > request.end:
+        raise BlockweaverError("RANGE_EMPTY", "Requested time range contains no blocks")
+    return ResolvedRange(first, last, first_header.timestamp, last_header.timestamp)
+
+
+async def _lower_bound_timestamp(target: int, high: int, header: Callable[[int], Awaitable[Header]]) -> int:
+    low = 0
+    while low < high:
+        middle = (low + high) // 2
+        value = await header(middle)
+        if value.timestamp < target:
+            low = middle + 1
+        else:
+            high = middle
+    return low
+
+
+async def _prove_finality(target: Header, verifier: Rpc, chain: Chain) -> tuple[Anchor, Header]:
+    verifier_target = await verifier.header(target.block_number, plan_features_for_header(target))
+    if not _same_header(target, verifier_target):
+        raise BlockweaverError("RPC_MISMATCH", "RPC endpoints disagree on the target block")
+    tagged = await verifier.tagged_header(chain.finality_tag, _INTEGRITY_PLAN)
+    if tagged.block_number < target.block_number:
+        raise BlockweaverError("RANGE_UNFINALIZED", "Verifier finality head does not cover the target")
+    await _connect_ancestry(verifier_target, tagged, verifier)
+    return Anchor(tagged.block_number, tagged.block_hash, chain.finality_tag), verifier_target
+
+
+def plan_features_for_header(header: Header) -> Plan:
+    return plan_features(list(header.values))
+
+
+def _same_header(left: Header, right: Header) -> bool:
+    return (
+        left.block_number,
+        left.block_hash,
+        left.parent_hash,
+        left.timestamp,
+        left.values,
+    ) == (
+        right.block_number,
+        right.block_hash,
+        right.parent_hash,
+        right.timestamp,
+        right.values,
+    )
+
+
+async def _refresh_finality(target: Header, anchor: Anchor, rpc: Rpc, chain_id: int) -> Anchor:
+    del chain_id
+    stored = await rpc.header(anchor.block_number, _INTEGRITY_PLAN)
     if stored.block_hash != anchor.block_hash:
-        raise ValueError("Stored finalized anchor no longer matches RPC")
-    await _connect_ancestry(target, stored, rpc, chain_id)
-    fresh = await rpc.finalized_block(chain_id=chain_id)
+        raise BlockweaverError("RPC_MISMATCH", "Stored finalized anchor no longer matches RPC")
+    await _connect_ancestry(target, stored, rpc)
+    fresh = await rpc.tagged_header(anchor.tag, _INTEGRITY_PLAN)
     if fresh.block_number < stored.block_number:
-        raise ValueError("RPC finalized head does not cover the stored finalized anchor")
-    await _connect_ancestry(stored, fresh, rpc, chain_id)
-    return fresh
+        raise BlockweaverError("RPC_MISMATCH", "RPC finality head regressed behind the stored anchor")
+    await _connect_ancestry(stored, fresh, rpc)
+    return Anchor(fresh.block_number, fresh.block_hash, anchor.tag)
 
 
-async def _connect_ancestry(previous: Block, tagged: Block, rpc: Rpc, chain_id: int) -> None:
+async def _connect_ancestry(previous: Header, tagged: Header, rpc: Rpc) -> None:
     cursor = previous.block_number + 1
     while cursor <= tagged.block_number:
-        last = min(cursor + _CHECKPOINT_SIZE - 1, tagged.block_number)
-        segment = await rpc.blocks(range(cursor, last + 1), chain_id=chain_id)
+        last = min(cursor + _CHUNK_SIZE - 1, tagged.block_number)
+        segment = await rpc.headers(range(cursor, last + 1), _INTEGRITY_PLAN)
         validate_links(segment, previous)
         previous = segment[-1]
         cursor = last + 1
-    reread = (await rpc.blocks([tagged.block_number], chain_id=chain_id))[0]
-    if tagged != reread or previous != tagged:
-        raise ValueError("Finalized tag did not survive numbered reread")
+    reread = await rpc.header(tagged.block_number, _INTEGRITY_PLAN)
+    if not _same_header(tagged, reread) or not _same_core(previous, tagged):
+        raise BlockweaverError("RPC_MISMATCH", "Finality tag did not survive numbered reread")
 
 
-async def _check_samples(
-    corpus: LoadedCorpus,
+def _same_core(left: Header, right: Header) -> bool:
+    return (left.block_number, left.block_hash, left.parent_hash, left.timestamp) == (
+        right.block_number,
+        right.block_hash,
+        right.parent_hash,
+        right.timestamp,
+    )
+
+
+async def _check_rows(
+    local: dict[int, dict[str, Value]],
+    numbers: list[int],
+    plan: Plan,
     rpc: Rpc,
-    numbers: Iterable[int],
-    receipt_numbers: set[int] | None = None,
     *,
     contiguous: bool = False,
-) -> list[dict[str, object]]:
-    facts: list[dict[str, object]] = []
-    previous: Block | None = None
-    iterator = iter(numbers)
-    while batch := list(islice(iterator, _CHECKPOINT_SIZE)):
-        remote = await rpc.blocks(batch, chain_id=corpus.request.chain_id)
-        if contiguous:
-            values = await rpc.priority_fees(batch[0], batch[-1])
-            priority_fees = dict(zip(batch, values, strict=True))
-        else:
-            priority_fees = {number: (await rpc.priority_fees(number, number))[0] for number in batch}
-        local = corpus.facts(batch)
-        if contiguous:
-            validate_links(remote, previous)
-            previous = remote[-1]
-        for block in remote:
-            durable = block.corpus_row(*priority_fees[block.block_number])
-            if durable != local[block.block_number]:
-                raise ValueError(f"Corpus row {block.block_number} does not match RPC")
-            if receipt_numbers is None or block.block_number in receipt_numbers:
-                facts.append({**durable, "block_hash": block.block_hash})
-    return facts
+) -> None:
+    if contiguous:
+        headers, rows = await rpc.rows(numbers[0], numbers[-1], plan)
+        validate_links(headers)
+    else:
+        headers = await rpc.headers(numbers, plan)
+        rows = []
+        for header in headers:
+            fees = (await rpc.fee_history(header.block_number, header.block_number, plan.percentiles))[0]
+            rows.append(header.row(plan, fees))
+    for number, row in zip(numbers, rows, strict=True):
+        if local[number] != row:
+            raise BlockweaverError("RPC_MISMATCH", f"Dataset row {number} does not match verifier RPC")
 
 
-def _sample_numbers(request: Request, source_last: int | None) -> list[int]:
-    selected = {request.first_block, request.last_block}
-    if source_last is not None:
-        selected.update({source_last, source_last + 1})
-    blocked = sorted(number for number in selected if request.first_block < number < request.last_block)
-    available = request.last_block - request.first_block - 1 - len(blocked)
+async def _validate_candidate(dataset: LoadedDataset, primary: Rpc, verifier: Rpc, chain: Chain) -> None:
+    if dataset.chain_id != chain.chain_id:
+        raise BlockweaverError("RESUME_MISMATCH", "Ready candidate chain does not match the request")
+    target = await primary.header(dataset.last_block, dataset.plan)
+    if target.block_hash != dataset.manifest["target_hash"]:
+        raise BlockweaverError("RPC_MISMATCH", "Ready candidate target hash does not match primary RPC")
+    verifier_target = await verifier.header(dataset.last_block, dataset.plan)
+    if not _same_header(target, verifier_target):
+        raise BlockweaverError("RPC_MISMATCH", "RPC endpoints disagree on the ready candidate target")
+    await _refresh_finality(verifier_target, dataset.anchor, verifier, chain.chain_id)
+    numbers = _sample_numbers(UUID(dataset.manifest["dataset_id"]), dataset.first_block, dataset.last_block)
+    await _check_rows(dataset.facts(numbers), numbers, dataset.plan, verifier)
+
+
+def _binding(spec: DownloadSpec, resolved: ResolvedRange) -> dict[str, object]:
+    return {
+        "version": 1,
+        "dataset_id": str(spec.dataset_id),
+        "chain": {"name": spec.chain.name, "chain_id": spec.chain.chain_id, "finality_tag": spec.chain.finality_tag},
+        "source": {"type": "rpc", "provider": spec.primary.name, "verifier": spec.verifier.name},
+        "requested_range": spec.requested_range.document(),
+        "resolved_range": resolved.document(),
+        "features": list(spec.plan.columns[1:]),
+        "format": spec.output_format,
+    }
+
+
+def _manifest(
+    spec: DownloadSpec,
+    resolved: ResolvedRange,
+    target_hash: str,
+    anchor: Anchor,
+    verification: dict[str, object],
+) -> dict[str, object]:
+    return {
+        "manifest_version": 1,
+        "dataset_version": 1,
+        "tool_version": __version__,
+        "dataset_id": str(spec.dataset_id),
+        "completed_at": datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z"),
+        "chain": {"name": spec.chain.name, "chain_id": spec.chain.chain_id},
+        "source": {"type": "rpc", "provider": spec.primary.name, "verifier": spec.verifier.name},
+        "requested_range": spec.requested_range.document(),
+        "resolved_range": resolved.document(),
+        "schema": spec.plan.schema_document(),
+        "acquisition_plan": spec.plan.document(),
+        "row_count": resolved.last_block - resolved.first_block + 1,
+        "target_hash": target_hash,
+        "finalized_anchor": anchor.document(),
+        "verification": verification,
+    }
+
+
+def _sample_numbers(dataset_id: UUID, first_block: int, last_block: int) -> list[int]:
+    selected = {first_block, last_block}
+    available = last_block - first_block - 1
     if available > 0:
-        seed = int.from_bytes(hashlib.sha256(request.corpus_id.bytes).digest()[:8], "big")
+        seed = int.from_bytes(hashlib.sha256(dataset_id.bytes).digest()[:8], "big")
         for offset in range(min(3, available)):
-            candidate = request.first_block + 1 + (seed + offset) % available
-            for boundary in blocked:
-                if candidate >= boundary:
-                    candidate += 1
-            selected.add(candidate)
+            selected.add(first_block + 1 + (seed + offset) % available)
     return sorted(selected)
 
 
 def _receipt(
-    *,
     operation: str,
-    request: Request,
-    path: Path,
-    source_id: UUID | None,
-    source_rows: int,
+    dataset: LoadedDataset,
+    destination: Path,
     reused: int,
     acquired: int,
     anchor: Anchor,
-    hashes: dict[str, str],
-    samples: list[dict[str, object]],
-    verifier: dict[str, object],
 ) -> dict[str, object]:
-    receipt: dict[str, object] = {
+    return {
         "version": 1,
         "operation": operation,
-        "corpus_id": str(request.corpus_id),
-        "path": str(path),
-        "chain_id": request.chain_id,
-        "first_block": request.first_block,
-        "last_block": request.last_block,
-        "rows": request.last_block - request.first_block + 1,
-        "source_rows": source_rows,
+        "dataset_id": dataset.manifest["dataset_id"],
+        "path": str(destination),
+        "chain": dataset.manifest["chain"],
+        "resolved_range": dataset.manifest["resolved_range"],
+        "rows": dataset.rows,
         "reused_rows": reused,
         "acquired_rows": acquired,
         "finalized_anchor": anchor.document(),
-        "pair_sha256": hashes,
-        "samples": samples,
-        "verifier": verifier,
+        "artifact_sha256": pair_hashes(dataset.path),
     }
-    if source_id is not None:
-        receipt["source_corpus_id"] = str(source_id)
-    return receipt
