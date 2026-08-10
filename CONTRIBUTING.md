@@ -17,4 +17,4 @@ Open an issue before broadening the CLI, durable format, dependency set, or prov
 
 ## Release
 
-Update the project version and lockfile on a green `main`, then publish a GitHub Release tagged `v<version>`. The publish workflow repeats every quality gate, requires the tag to match the project version, builds the wheel and source archive, and uploads them through PyPI Trusted Publishing. It stores no release credential or build artifact.
+Update the project version and lockfile on a green `main`, then publish a GitHub Release tagged `v<version>`. The workflow requires the tagged commit to belong to `main`, repeats every quality gate, checks the tag against the project version, and builds the wheel and source archive without publishing permission. A separate job downloads that one-day artifact and uploads it through PyPI Trusted Publishing, with no long-lived release credential.
