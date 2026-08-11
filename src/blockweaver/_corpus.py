@@ -30,8 +30,9 @@ from ._contract import (
     Plan,
     Value,
     plan_features,
-    source_definition,
     validate_links,
+    validate_manifest_source,
+    validate_verification,
 )
 
 _CHUNK = re.compile(r"(\d{20})-(\d{20})-([0-9a-f]{64})\.parquet\Z")
@@ -418,8 +419,7 @@ def _read_dataset(path: Path, *, work: bool) -> Dataset:
     source_value = manifest["source"]
     if not isinstance(source_value, dict):
         raise ValueError("Invalid manifest source")
-    source = source_definition(source_value.get("type"))
-    source.validate_manifest(source_value)
+    source = validate_manifest_source(source_value)
     requested = manifest["requested_range"]
     if not isinstance(requested, dict) or requested.get("kind") not in {"block", "time"}:
         raise ValueError("Invalid requested range")
@@ -459,7 +459,7 @@ def _read_dataset(path: Path, *, work: bool) -> Dataset:
     if names[0] != "block_number":
         raise ValueError("block_number must be the first schema column")
     plan = plan_features(names[1:])
-    if schema != plan.schema_document() or manifest["acquisition_plan"] != plan.document(source.name):
+    if schema != plan.schema_document() or manifest["acquisition_plan"] != plan.document(source):
         raise ValueError("Schema or acquisition plan is not canonical")
     output = _exact_table(manifest["output"], {"filename", "format", "bytes", "sha256"}, "output")
     if output["format"] not in {"parquet", "csv"} or output["filename"] != f"blocks.{output['format']}":
@@ -488,7 +488,7 @@ def _read_dataset(path: Path, *, work: bool) -> Dataset:
         raise ValueError("Invalid finalized anchor")
     if not isinstance(manifest["target_hash"], str) or _HASH.fullmatch(manifest["target_hash"]) is None:
         raise ValueError("Invalid target hash")
-    verification = source.validate_verification(manifest["verification"], chain["chain_id"])
+    verification = validate_verification(manifest["verification"], chain["chain_id"], source)
     samples = verification["sampled_blocks"]
     if (
         not isinstance(samples, list)

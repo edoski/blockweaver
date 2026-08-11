@@ -6,7 +6,6 @@ import os
 import re
 import sys
 import tomllib
-from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from ipaddress import ip_address
@@ -54,15 +53,14 @@ class Feature:
     domain: str = ""
 
     def document(self, *, available_sources: tuple[Source, ...] = ("rpc",)) -> dict[str, object]:
-        definitions = source_definitions()
         return {
             "name": self.name,
             "type": self.dtype,
             "unit": self.unit,
-            "source_support": [source.name for source in definitions],
-            "acquisition_families": {source.name: getattr(self, source.feature_family_field) for source in definitions},
+            "source_support": ["rpc", "bigquery"],
+            "acquisition_families": {"rpc": self.family, "bigquery": self.bigquery_family},
             "domain_rule": self.domain,
-            "hidden_dependencies": {source.name: list(getattr(self, source.feature_dependencies_field)) for source in definitions},
+            "hidden_dependencies": {"rpc": list(self.dependencies), "bigquery": list(self.bigquery_dependencies)},
             "configured_sources": list(available_sources),
         }
 
@@ -138,7 +136,7 @@ class Plan:
         ]
 
     def document(self, source: Source = "rpc") -> dict[str, object]:
-        return source_definition(source).plan_documenter(self)
+        return _rpc_plan_document(self) if source == "rpc" else _bigquery_plan_document(self)
 
 
 def _rpc_plan_document(plan: Plan) -> dict[str, object]:
@@ -169,121 +167,59 @@ def _bigquery_plan_document(plan: Plan) -> dict[str, object]:
     return {"families": families}
 
 
-@dataclass(frozen=True, slots=True, kw_only=True)
-class SourceDefinition:
-    name: Source
-    runner: str
-    feature_family_field: str
-    feature_dependencies_field: str
-    chain_requirements: tuple[str, ...]
-    config_requirements: tuple[str, ...]
-    runtime_requirements: tuple[str, ...]
-    accepts_primary_options: bool
-    chain_document_fields: tuple[str, ...]
-    manifest_fields: tuple[tuple[str, str, Literal["name", "dataset"]], ...]
-    verification_chain_fields: tuple[str, ...]
-    verification_nonnegative_fields: tuple[str, ...]
-    plan_documenter: Callable[[Plan], dict[str, object]]
-
-    def configured(self, config: Config, chain: Chain) -> bool:
-        return all(getattr(chain, field) is not None for field in self.chain_requirements) and all(
-            getattr(config, field) is not None for field in self.config_requirements
-        )
-
-    def validate_runtime(self, chain: Chain, *, primary: Provider | None, bigquery: BigQuerySettings | None) -> None:
-        runtime = {"primary": primary, "bigquery": bigquery}
-        if {name for name, value in runtime.items() if value is not None} != set(self.runtime_requirements) or any(
-            getattr(chain, field) is None for field in self.chain_requirements
-        ):
-            raise BlockweaverError("SOURCE_UNAVAILABLE", f"{self.name} source is not fully configured")
-
-    def chain_document(self, chain: Chain) -> dict[str, object]:
-        return {field: value for field in self.chain_document_fields if (value := getattr(chain, field)) is not None}
-
-    def manifest_document(self, chain: Chain, primary: Provider | None, verifier: Provider) -> dict[str, object]:
-        roots: dict[str, object | None] = {"chain": chain, "primary": primary, "verifier": verifier}
-        document: dict[str, object] = {"type": self.name}
-        for field, path, _validator in self.manifest_fields:
-            root, *attributes = path.split(".")
-            value = roots[root]
-            for attribute in attributes:
-                value = getattr(value, attribute) if value is not None else None
-            if value is None:
-                raise BlockweaverError("SOURCE_UNAVAILABLE", f"{self.name} source is not fully configured")
-            document[field] = value
-        return document
-
-    def validate_manifest(self, value: object) -> dict[str, object]:
-        fields = {field for field, _context, _validator in self.manifest_fields}
-        if not isinstance(value, dict) or set(value) != {"type", *fields} or value.get("type") != self.name:
-            raise ValueError("Invalid manifest source")
-        for field, _context, validator in self.manifest_fields:
-            item = value[field]
-            if not isinstance(item, str) or (validator == "name" and _NAME.fullmatch(item) is None):
-                raise ValueError("Invalid manifest source")
-            if validator == "dataset":
-                validate_dataset_identifier(item)
-        return value
-
-    def validate_verification(self, value: object, chain_id: int) -> dict[str, object]:
-        fields = {"target_agreement", "sampled_blocks", *self.verification_chain_fields, *self.verification_nonnegative_fields}
-        if not isinstance(value, dict) or set(value) != fields:
-            raise ValueError("Invalid verification facts")
-        if value["target_agreement"] is not True or any(value[field] != chain_id for field in self.verification_chain_fields):
-            raise ValueError("Invalid verification facts")
-        if any(type(value[field]) is not int or value[field] < 0 for field in self.verification_nonnegative_fields):
-            raise ValueError("Invalid verification facts")
-        return value
-
-
-_SOURCES = (
-    SourceDefinition(
-        name="rpc",
-        runner="rpc",
-        feature_family_field="family",
-        feature_dependencies_field="dependencies",
-        chain_requirements=(),
-        config_requirements=(),
-        runtime_requirements=("primary",),
-        accepts_primary_options=True,
-        chain_document_fields=(),
-        manifest_fields=(("provider", "primary.name", "name"), ("verifier", "verifier.name", "name")),
-        verification_chain_fields=("primary_chain_id", "verifier_chain_id"),
-        verification_nonnegative_fields=(),
-        plan_documenter=_rpc_plan_document,
-    ),
-    SourceDefinition(
-        name="bigquery",
-        runner="bigquery",
-        feature_family_field="bigquery_family",
-        feature_dependencies_field="bigquery_dependencies",
-        chain_requirements=("bigquery_dataset",),
-        config_requirements=("bigquery",),
-        runtime_requirements=("bigquery",),
-        accepts_primary_options=False,
-        chain_document_fields=("bigquery_dataset",),
-        manifest_fields=(("dataset", "chain.bigquery_dataset", "dataset"), ("verifier", "verifier.name", "name")),
-        verification_chain_fields=("verifier_chain_id",),
-        verification_nonnegative_fields=("dry_run_bytes",),
-        plan_documenter=_bigquery_plan_document,
-    ),
-)
-_SOURCE_BY_NAME = {source.name: source for source in _SOURCES}
-
-
-def source_definitions() -> tuple[SourceDefinition, ...]:
-    return _SOURCES
-
-
-def source_definition(value: object) -> SourceDefinition:
-    try:
-        return _SOURCE_BY_NAME[value]  # type: ignore[index]
-    except (KeyError, TypeError):
-        raise BlockweaverError("SOURCE_UNAVAILABLE", f"Unknown source: {value}") from None
+def parse_source(value: object) -> Source:
+    if value == "rpc":
+        return "rpc"
+    if value == "bigquery":
+        return "bigquery"
+    raise BlockweaverError("SOURCE_UNAVAILABLE", f"Unknown source: {value}")
 
 
 def configured_sources(config: Config, chain: Chain) -> tuple[Source, ...]:
-    return tuple(source.name for source in _SOURCES if source.configured(config, chain))
+    verifier = chain.verifier or config.defaults.verifier
+    sources: list[Source] = []
+    primary = chain.provider or config.defaults.provider
+    if primary is not None and primary in config.providers and verifier in config.providers:
+        sources.append("rpc")
+    if chain.bigquery_dataset is not None and config.bigquery is not None and verifier in config.providers:
+        sources.append("bigquery")
+    return tuple(sources)
+
+
+def validate_manifest_source(value: object) -> Source:
+    if not isinstance(value, dict):
+        raise ValueError("Invalid manifest source")
+    source = value.get("type")
+    if source == "rpc":
+        if set(value) != {"type", "provider", "verifier"} or any(
+            not isinstance(value[field], str) or _NAME.fullmatch(value[field]) is None for field in ("provider", "verifier")
+        ):
+            raise ValueError("Invalid manifest source")
+        return "rpc"
+    if source == "bigquery":
+        if (
+            set(value) != {"type", "dataset", "verifier"}
+            or not isinstance(value["dataset"], str)
+            or not isinstance(value["verifier"], str)
+            or _NAME.fullmatch(value["verifier"]) is None
+        ):
+            raise ValueError("Invalid manifest source")
+        validate_dataset_identifier(value["dataset"])
+        return "bigquery"
+    raise ValueError("Invalid manifest source")
+
+
+def validate_verification(value: object, chain_id: int, source: Source) -> dict[str, object]:
+    chain_fields = {"primary_chain_id", "verifier_chain_id"} if source == "rpc" else {"verifier_chain_id"}
+    nonnegative_fields = set() if source == "rpc" else {"dry_run_bytes"}
+    fields = {"target_agreement", "sampled_blocks", *chain_fields, *nonnegative_fields}
+    if not isinstance(value, dict) or set(value) != fields:
+        raise ValueError("Invalid verification facts")
+    if value["target_agreement"] is not True or any(value[field] != chain_id for field in chain_fields):
+        raise ValueError("Invalid verification facts")
+    if any(type(value[field]) is not int or value[field] < 0 for field in nonnegative_fields):
+        raise ValueError("Invalid verification facts")
+    return value
 
 
 def plan_features(names: list[str] | tuple[str, ...]) -> Plan:
@@ -350,7 +286,7 @@ class Chain:
 class Defaults:
     chain: str
     source: Source
-    provider: str
+    provider: str | None
     verifier: str
     output_root: Path
     output_format: OutputFormat
@@ -463,9 +399,9 @@ def load_config(path: Path) -> Config:
             defaults_raw,
             {"chain", "source", "provider", "verifier", "output_root", "format", "features"},
             "defaults",
-            required={"chain", "source", "provider", "verifier", "output_root", "format", "features"},
+            required={"chain", "source", "verifier", "output_root", "format", "features"},
         )
-        source = source_definition(_string(defaults_raw["source"], "defaults.source")).name
+        source = parse_source(_string(defaults_raw["source"], "defaults.source"))
         output_format = _string(defaults_raw["format"], "defaults.format")
         if output_format not in {"parquet", "csv"}:
             raise ValueError("defaults.format must be parquet or csv")
@@ -476,7 +412,7 @@ def load_config(path: Path) -> Config:
         defaults = Defaults(
             _name(defaults_raw["chain"], "defaults.chain"),
             source,  # type: ignore[arg-type]
-            _name(defaults_raw["provider"], "defaults.provider"),
+            _name(defaults_raw["provider"], "defaults.provider") if "provider" in defaults_raw else None,
             _name(defaults_raw["verifier"], "defaults.verifier"),
             Path(_string(defaults_raw["output_root"], "defaults.output_root")).expanduser(),
             output_format,  # type: ignore[arg-type]
@@ -488,13 +424,15 @@ def load_config(path: Path) -> Config:
         if defaults.chain not in chains:
             raise ValueError("defaults.chain does not name a configured chain")
         for chain in chains.values():
-            for provider_name in (chain.provider or defaults.provider, chain.verifier or defaults.verifier):
-                if provider_name not in providers:
+            for provider_name in (chain.provider, chain.verifier):
+                if provider_name is not None and provider_name not in providers:
                     raise ValueError(f"chain {chain.name} names an unknown provider: {provider_name}")
-        if defaults.provider not in providers or defaults.verifier not in providers:
-            raise ValueError("defaults provider profiles must be configured")
+        if defaults.provider is not None and defaults.provider not in providers:
+            raise ValueError("defaults.provider must name a configured provider")
+        if defaults.verifier not in providers:
+            raise ValueError("defaults.verifier must name a configured provider")
         config = Config(path, defaults, chains, providers, bigquery)
-        if not source_definition(defaults.source).configured(config, chains[defaults.chain]):
+        if defaults.source not in configured_sources(config, chains[defaults.chain]):
             raise ValueError(f"default {defaults.source} source is not fully configured")
         return config
     except BlockweaverError:
@@ -643,6 +581,132 @@ def requested_range(
     return RequestedRange("time", start, end, from_time, to_time)
 
 
+@dataclass(frozen=True, slots=True, kw_only=True)
+class RpcDownloadRequest:
+    dataset_id: UUID
+    chain: Chain
+    requested_range: RequestedRange
+    plan: Plan
+    output_root: Path
+    output_format: OutputFormat
+    primary: Provider
+    verifier: Provider
+
+    def __post_init__(self) -> None:
+        validate_uuid(self.dataset_id)
+        if self.primary.name == self.verifier.name:
+            raise BlockweaverError("PROVIDER_INVALID", "Primary and verifier must be distinct provider profiles")
+        if self.primary.url == self.verifier.url:
+            raise BlockweaverError("PROVIDER_INVALID", "Primary and verifier RPC endpoints must be independent")
+
+    @property
+    def source(self) -> Literal["rpc"]:
+        return "rpc"
+
+    def source_document(self) -> dict[str, object]:
+        return {"type": "rpc", "provider": self.primary.name, "verifier": self.verifier.name}
+
+    def secrets(self) -> list[str]:
+        return [self.primary.url, self.verifier.url]
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class BigQueryDownloadRequest:
+    dataset_id: UUID
+    chain: Chain
+    requested_range: RequestedRange
+    plan: Plan
+    output_root: Path
+    output_format: OutputFormat
+    dataset: str
+    bigquery: BigQuerySettings
+    verifier: Provider
+
+    def __post_init__(self) -> None:
+        validate_uuid(self.dataset_id)
+
+    @property
+    def source(self) -> Literal["bigquery"]:
+        return "bigquery"
+
+    def source_document(self) -> dict[str, object]:
+        return {"type": "bigquery", "dataset": self.dataset, "verifier": self.verifier.name}
+
+    def secrets(self) -> list[str]:
+        return [self.bigquery.project, self.verifier.url]
+
+
+DownloadRequest = RpcDownloadRequest | BigQueryDownloadRequest
+
+
+def resolve_download_request(
+    config: Config,
+    *,
+    dataset_id: UUID,
+    chain: str | None,
+    source: Source | None,
+    provider: str | None,
+    verifier: str | None,
+    rpc_url: str | None,
+    verify_rpc_url: str | None,
+    output_root: Path | None,
+    output_format: OutputFormat | None,
+    features: list[str] | None,
+    from_block: int | None,
+    to_block: int | None,
+    from_time: str | None,
+    to_time: str | None,
+    batch_size: int | None,
+    concurrency: int | None,
+    timeout: float | None,
+) -> DownloadRequest:
+    selected_chain = config.chain(chain)
+    selected_source = parse_source(source or config.defaults.source)
+    if selected_source not in configured_sources(config, selected_chain):
+        raise BlockweaverError("SOURCE_UNAVAILABLE", f"Chain {selected_chain.name} does not configure source={selected_source}")
+    plan = plan_features(features if features is not None else config.defaults.features)
+    bounds = requested_range(from_block, to_block, from_time, to_time)
+    root = (output_root or config.defaults.output_root).expanduser()
+    selected_format = output_format or config.defaults.output_format
+    verifier_name = verifier or selected_chain.verifier or config.defaults.verifier
+    if selected_source == "bigquery":
+        if provider is not None or rpc_url is not None:
+            raise BlockweaverError("SOURCE_OPTION_INVALID", "--provider and --rpc-url do not apply to source=bigquery")
+        verifying = config.provider(
+            verifier_name,
+            url=verify_rpc_url,
+            batch_size=batch_size,
+            concurrency=concurrency,
+            timeout=timeout,
+        )
+        if selected_chain.bigquery_dataset is None:
+            raise BlockweaverError("SOURCE_UNAVAILABLE", "bigquery source is not fully configured")
+        return BigQueryDownloadRequest(
+            dataset_id=dataset_id,
+            chain=selected_chain,
+            requested_range=bounds,
+            plan=plan,
+            output_root=root,
+            output_format=selected_format,
+            dataset=selected_chain.bigquery_dataset,
+            bigquery=config.bigquery_settings(),
+            verifier=verifying,
+        )
+    primary_name = provider or selected_chain.provider or config.defaults.provider
+    if primary_name is None:
+        raise BlockweaverError("SOURCE_UNAVAILABLE", "rpc source requires a primary provider")
+    return RpcDownloadRequest(
+        dataset_id=dataset_id,
+        chain=selected_chain,
+        requested_range=bounds,
+        plan=plan,
+        output_root=root,
+        output_format=selected_format,
+        primary=config.provider(primary_name, url=rpc_url, batch_size=batch_size, concurrency=concurrency, timeout=timeout),
+        verifier=config.provider(verifier_name, url=verify_rpc_url, batch_size=batch_size, concurrency=concurrency, timeout=timeout),
+    )
+
+
 def parse_time(value: str, *, end: bool) -> int:
     try:
         if _DATE.fullmatch(value):
@@ -686,9 +750,9 @@ class Header:
 
     def row(self, plan: Plan, fees: dict[int, int] | None = None) -> dict[str, Value]:
         result: dict[str, Value] = {"block_number": self.block_number}
-        fees = fees or {}
         for feature in plan.features:
             if feature.percentile is not None:
+                assert fees is not None
                 result[feature.name] = fees[feature.percentile]
             elif feature.name == "block_hash":
                 result[feature.name] = self.block_hash
@@ -754,7 +818,7 @@ def parse_header(value: Any, *, expected: int | None, plan: Plan) -> Header:
             values["gas_limit"] = gas_limit
     if "transactions" in plan.header_fields:
         transactions = value["transactions"]
-        if not isinstance(transactions, list) or any(not isinstance(item, str) or _HASH.fullmatch(item) is None for item in transactions):
+        if not isinstance(transactions, list):
             raise ValueError("Invalid transactions field")
         values["tx_count"] = len(transactions)
     return Header(number, block_hash(value["hash"], "block hash"), block_hash(value["parentHash"], "parent hash"), timestamp, values)

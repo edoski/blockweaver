@@ -23,11 +23,15 @@ class ChainServer:
         self.requests: list[list[dict[str, Any]]] = []
         self.request_counts: dict[int, int] = {}
         self.http_failures = 0
+        self.retry_after = "0"
         self.omit_counts: dict[int, int] = {}
         self.changes: dict[int, dict[str, Any]] = {}
         self.tag_changes: dict[str, Any] = {}
         self.fee_history_changes: dict[str, Any] = {}
         self.wrong_id_once = False
+        self.rpc_errors: list[int] = []
+        self.item_errors: dict[int, list[int]] = {}
+        self.limit_batches = False
         state = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -39,12 +43,22 @@ class ChainServer:
                 if state.http_failures:
                     state.http_failures -= 1
                     self.send_response(429)
-                    self.send_header("Retry-After", "0")
+                    self.send_header("Retry-After", state.retry_after)
                     self.end_headers()
                     return
                 replies = []
                 for call in calls:
                     method, params = call.get("method"), call.get("params")
+                    error_code = state._error_code(calls, method, params)
+                    if error_code is not None:
+                        replies.append(
+                            {
+                                "jsonrpc": "2.0",
+                                "id": call["id"],
+                                "error": {"code": error_code, "message": "provider detail must stay private"},
+                            }
+                        )
+                        continue
                     if method == "eth_chainId":
                         result: Any = hex(state.chain_id)
                     elif method == "eth_feeHistory":
@@ -99,6 +113,17 @@ class ChainServer:
             "transactions": [block_hash(number * 10 + offset) for offset in range(number % 3)],
             **self.changes.get(number, {}),
         }
+
+    def _error_code(self, calls: list[dict[str, Any]], method: str, params: list[Any]) -> int | None:
+        if self.rpc_errors:
+            return self.rpc_errors.pop(0)
+        if self.limit_batches and len(calls) > 1:
+            return -32005
+        if method == "eth_getBlockByNumber" and params[0] not in {"finalized", "safe"}:
+            errors = self.item_errors.get(int(params[0], 16), [])
+            if errors:
+                return errors.pop(0)
+        return None
 
     def __enter__(self) -> ChainServer:
         self._thread.start()
@@ -195,15 +220,20 @@ def make_config() -> Callable[..., Path]:
         output_format: str = "parquet",
         source: str = "rpc",
         dataset: str | None = None,
+        include_primary: bool = True,
     ) -> Path:
         quoted_features = ", ".join(json.dumps(feature) for feature in features)
         chain_dataset = f"bigquery_dataset = {json.dumps(dataset)}" if dataset else ""
         bigquery_config = '\n[bigquery]\nproject = "billing-project"\nmaximum_bytes_billed = 1000\n' if dataset else ""
+        default_provider = 'provider = "primary"' if include_primary else ""
+        primary_provider = (
+            f"""[providers.primary]\nurl = {json.dumps(primary.url)}\nbatch_size = 3\nconcurrency = 2\ntimeout = 2\n""" if include_primary else ""
+        )
         path.write_text(
             f"""[defaults]
 chain = "test"
 source = {json.dumps(source)}
-provider = "primary"
+{default_provider}
 verifier = "verifier"
 output_root = {json.dumps(str(output_root))}
 format = {json.dumps(output_format)}
@@ -214,12 +244,7 @@ chain_id = 1
 finality_tag = "finalized"
 {chain_dataset}
 
-[providers.primary]
-url = {json.dumps(primary.url)}
-batch_size = 3
-concurrency = 2
-timeout = 2
-
+{primary_provider}
 [providers.verifier]
 url = {json.dumps(verifier.url)}
 batch_size = 3
