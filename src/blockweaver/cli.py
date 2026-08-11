@@ -21,7 +21,7 @@ from ._contract import (
     FEATURES,
     BlockweaverError,
     Provider,
-    configured_sources,
+    available_sources,
     load_config,
     resolve_download_request,
     selected_config_path,
@@ -95,7 +95,7 @@ def init(config: ConfigPath = None) -> None:
             path.unlink(missing_ok=True)
             raise
         _sync_directory(path.parent)
-        _output({"version": 1, "operation": "init", "path": str(path)})
+        _output({"operation": "init", "path": str(path)})
     except FileExistsError:
         _abort(BlockweaverError("CONFIG_EXISTS", f"Configuration already exists: {path}"))
     except OSError as error:
@@ -115,13 +115,13 @@ def chains(config: ConfigPath = None) -> None:
                 "finality_tag": chain.finality_tag,
                 "provider": chain.provider or settings.defaults.provider,
                 "verifier": chain.verifier or settings.defaults.verifier,
-                "source_support": list(configured_sources(settings, chain)),
+                "available_sources": list(available_sources(settings, chain)),
                 "default": chain.name == settings.defaults.chain,
             }
             if chain.bigquery_dataset is not None:
                 value["bigquery_dataset"] = chain.bigquery_dataset
             values.append(value)
-        _output({"version": 1, "chains": values})
+        _output({"chains": values})
     except BlockweaverError as error:
         _abort(error)
 
@@ -135,13 +135,13 @@ def features(
     try:
         settings = load_config(selected_config_path(config))
         selected_chain = settings.chain(chain)
-        sources = configured_sources(settings, selected_chain)
+        sources = available_sources(settings, selected_chain)
         _output(
             {
-                "version": 1,
                 "chain": selected_chain.name,
+                "available_sources": list(sources),
                 "mandatory": {"name": "block_number", "type": "Int64", "unit": "block"},
-                "features": [feature.document(available_sources=sources) for feature in FEATURES],
+                "features": [feature.document() for feature in FEATURES],
             }
         )
     except BlockweaverError as error:
@@ -216,13 +216,18 @@ def verify(
     selected_provider: Provider | None = None
     secrets = [rpc_url] if rpc_url else []
     try:
+        if config is not None and provider is None:
+            raise BlockweaverError("VERIFY_INVALID", "--config requires --provider for RPC verification")
+        if provider is None and rpc_url is None and (full_rpc or batch_size is not None or concurrency is not None or timeout is not None):
+            raise BlockweaverError(
+                "VERIFY_INVALID",
+                "--full-rpc, --batch-size, --concurrency, and --timeout require --provider or --rpc-url",
+            )
         if provider is not None:
             settings = load_config(selected_config_path(config))
             selected_provider = settings.provider(provider, url=rpc_url, batch_size=batch_size, concurrency=concurrency, timeout=timeout)
         elif rpc_url is not None:
             selected_provider = Provider("cli", rpc_url, batch_size or 20, concurrency or 6, timeout or 30)
-        elif config is not None:
-            raise BlockweaverError("VERIFY_INVALID", "--config requires --provider for RPC verification")
         if selected_provider is not None:
             secrets.append(selected_provider.url)
     except BlockweaverError as error:

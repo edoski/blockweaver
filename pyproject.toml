@@ -10,6 +10,10 @@ readme = "README.md"
 license = "MIT"
 requires-python = ">=3.11"
 authors = [{ name = "Edoardo S." }]
+classifiers = [
+  "Operating System :: MacOS",
+  "Operating System :: POSIX :: Linux",
+]
 dependencies = [
   "aiohttp>=3.12,<4",
   "polars>=1.31,<2",

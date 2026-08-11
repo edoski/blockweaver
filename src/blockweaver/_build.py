@@ -34,17 +34,15 @@ async def verify_dataset(
     full_rpc: bool,
     progress: Progress,
 ) -> dict[str, object]:
+    if provider is None and full_rpc:
+        raise BlockweaverError("VERIFY_INVALID", "--full-rpc requires a configured provider or --rpc-url")
     dataset = open_dataset(path)
     progress({"event": "local_valid", "rows": dataset.row_count})
     verification: dict[str, object] = {"mode": "local"}
-    if provider is None:
-        if full_rpc:
-            raise BlockweaverError("VERIFY_INVALID", "--full-rpc requires a configured provider or --rpc-url")
-    else:
+    if provider is not None:
         verification = await _sources.verify_rpc(dataset, provider, full_rpc)
         dataset._assert_unchanged()
     return {
-        "version": 1,
         "operation": "verify",
         "dataset_id": str(dataset.dataset_id),
         "path": str(dataset.path),

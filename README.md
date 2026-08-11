@@ -2,50 +2,28 @@
 
 Blockweaver downloads and verifies immutable, feature-selected EVM block datasets. Chains and JSON-RPC providers are configuration, not code. Each successful request publishes one data file and one canonical manifest.
 
-Python 3.11 or newer is required.
+Python 3.11 or newer is required. Dataset writing is supported on Linux and macOS.
 
 ```console
 uv tool install blockweaver
 blockweaver init
 ```
 
-`init` writes the platform user config path, or the path selected by `--config` or `BLOCKWEAVER_CONFIG`. It never overwrites a file. The generated TOML uses environment-backed URLs and a local example chain:
+`init` writes a complete executable example with environment-backed RPC URLs and a local chain. Configuration selection is explicit `--config`, then `BLOCKWEAVER_CONFIG`, then the platform user config path. The command never overwrites a file.
+
+Edit that generated file for user-specific profiles. For example:
 
 ```toml
-[defaults]
-chain = "local"
-source = "rpc"
+[chains.ethereum]
+chain_id = 1
+finality_tag = "finalized"
 provider = "primary"
 verifier = "verifier"
-output_root = "./downloads"
-format = "parquet"
-features = ["timestamp", "block_hash", "base_fee_per_gas", "gas_used", "gas_limit", "tx_count"]
-
-[chains.local]
-chain_id = 31337
-finality_tag = "finalized"
-# bigquery_dataset = "project.dataset"
-
-[providers.primary]
-url_env = "BLOCKWEAVER_PRIMARY_RPC_URL"
-batch_size = 20
-concurrency = 6
-timeout = 30
-
-[providers.verifier]
-url_env = "BLOCKWEAVER_VERIFIER_RPC_URL"
-batch_size = 20
-concurrency = 6
-timeout = 30
-
-# [bigquery]
-# project_env = "GOOGLE_CLOUD_PROJECT"
-# maximum_bytes_billed = 1000000000
 ```
 
 Configuration is strict: unknown keys, unknown profiles, invalid URLs, ambiguous `url`/`url_env` pairs, and non-finite or greater-than-one-hour timeouts fail before network access. Chain profiles may override `provider` and `verifier`. CLI values override the selected chain and provider profiles, which override global defaults.
 
-Inspect configuration and the closed feature catalog without exposing endpoints. `chains` reports `bigquery` only for chains with a dataset and billing configuration; `features` reports each source supported by the tool and configured for the selected chain.
+Inspect configuration and the closed feature catalog without exposing endpoints. `chains` reports `available_sources`; `features` reports top-level `available_sources` and per-feature `supported_sources`.
 
 ```console
 blockweaver chains
@@ -110,6 +88,8 @@ blockweaver verify DATASET --provider verifier
 blockweaver verify DATASET --rpc-url http://127.0.0.1:8545 --full-rpc
 ```
 
+RPC-only tuning requires `--provider` or `--rpc-url`. An explicit `--config` requires `--provider`; `--rpc-url` can override that named profile's endpoint.
+
 Progress and errors are JSON Lines on stderr. Errors include stable `code` and `message` fields. Success is one JSON receipt on stdout. URLs and environment values are excluded from manifests, receipts, and intentional logs.
 
 Providers must implement EVM JSON-RPC batch requests, historical `eth_getBlockByNumber`, the configured `finalized` or `safe` tag, and `eth_feeHistory` when priority-fee features are selected. Independent verification consumes quota. Blockweaver checks provider agreement, numbered ancestry to the tagged anchor, a numbered anchor reread, and deterministic row samples; this is strong operational verification, not a trustless consensus client.
@@ -124,17 +104,7 @@ uv tool install 'blockweaver[bigquery]'
 
 Configure a strictly validated `project.dataset` identifier on the chain and one billing project or environment reference. The byte cap is mandatory.
 When BigQuery is the default source, configuration may omit `defaults.provider` and the unused primary profile; the verifier profile remains mandatory.
-
-```toml
-[chains.my_chain]
-chain_id = 12345
-finality_tag = "finalized"
-bigquery_dataset = "project.dataset"
-
-[bigquery]
-project_env = "GOOGLE_CLOUD_PROJECT"
-maximum_bytes_billed = 1000000000
-```
+Set `chains.<name>.bigquery_dataset`, then configure `[bigquery]` with exactly one billing `project` or `project_env` and `maximum_bytes_billed`.
 
 Select it globally with `defaults.source = "bigquery"` or per request:
 
