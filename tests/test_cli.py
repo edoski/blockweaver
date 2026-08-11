@@ -89,17 +89,19 @@ def test_strict_config_discovery_has_no_secrets(tmp_path: Path, chains: tuple[Ch
     config = make_config(tmp_path / "config.toml", primary, verifier, output_root=tmp_path / "out")
     chain_result = invoke(["chains", "--config", str(config)])
     feature_result = invoke(["features", "--config", str(config)])
-    assert json.loads(chain_result.stdout)["chains"] == [
-        {
-            "chain_id": 1,
-            "default": True,
-            "finality_tag": "finalized",
-            "name": "test",
-            "provider": "primary",
-            "available_sources": ["rpc"],
-            "verifier": "verifier",
-        }
-    ]
+    assert json.loads(chain_result.stdout) == {
+        "chains": [
+            {
+                "chain_id": 1,
+                "default": True,
+                "finality_tag": "finalized",
+                "name": "test",
+                "provider": "primary",
+                "available_sources": ["rpc"],
+                "verifier": "verifier",
+            }
+        ]
+    }
     catalog = json.loads(feature_result.stdout)
     assert set(catalog) == {"chain", "available_sources", "mandatory", "features"}
     assert catalog["available_sources"] == ["rpc"]
