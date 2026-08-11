@@ -14,7 +14,7 @@ import shutil
 import sys
 from collections.abc import Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -27,9 +27,7 @@ from ._contract import (
     BlockweaverError,
     Header,
     Plan,
-    ResolvedRange,
     Value,
-    format_utc,
     plan_features,
     source_definition,
     validate_links,
@@ -41,8 +39,6 @@ _DECIMAL = re.compile(r"0|[1-9][0-9]*\Z")
 _NAME = re.compile(r"[a-z0-9][a-z0-9_-]*\Z")
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _MANIFEST_KEYS = {
-    "manifest_version",
-    "dataset_version",
     "tool_version",
     "dataset_id",
     "completed_at",
@@ -74,39 +70,48 @@ _RECEIPT_KEYS = {
 
 
 @dataclass(frozen=True, slots=True)
-class LoadedDataset:
+class Dataset:
+    """A strictly validated immutable local dataset."""
+
     path: Path
-    manifest: dict[str, Any]
-    plan: Plan
-    rows: int
+    dataset_id: UUID
+    chain_name: str
+    chain_id: int
+    first_block: int
+    last_block: int
+    first_timestamp: int
+    last_timestamp: int
+    schema: tuple[str, ...]
+    output_format: str
+    row_count: int
     data_path: Path
+    _manifest_json: bytes = field(repr=False, compare=False)
 
     @property
-    def chain_id(self) -> int:
-        return int(self.manifest["chain"]["chain_id"])
+    def _plan(self) -> Plan:
+        return plan_features(self.schema[1:])
+
+    def _document(self) -> dict[str, Any]:
+        return json.loads(self._manifest_json)
 
     @property
-    def first_block(self) -> int:
-        return int(self.manifest["resolved_range"]["from_block"])
-
-    @property
-    def last_block(self) -> int:
-        return int(self.manifest["resolved_range"]["to_block"])
-
-    @property
-    def anchor(self) -> Anchor:
-        value = self.manifest["finalized_anchor"]
+    def _anchor(self) -> Anchor:
+        value = self._document()["finalized_anchor"]
         return Anchor(value["block_number"], value["block_hash"], value["tag"])
 
-    def facts(self, numbers: list[int]) -> dict[int, dict[str, Value]]:
-        frame = _scan_data(self.data_path, self.plan, self.manifest["output"]["format"])
+    @property
+    def _target_hash(self) -> str:
+        return str(self._document()["target_hash"])
+
+    def _facts(self, numbers: list[int]) -> dict[int, dict[str, Value]]:
+        frame = _scan_data(self.data_path, self._plan, self.output_format)
         selected = frame.filter(pl.col("block_number").is_in(numbers)).collect(engine="streaming")
         if selected["block_number"].to_list() != numbers:
             raise BlockweaverError("ARTIFACT_INVALID", "Requested dataset rows are missing")
         return {int(row["block_number"]): {name: value for name, value in row.items()} for row in selected.iter_rows(named=True)}
 
-    def fact_chunks(self, size: int) -> Iterator[dict[int, dict[str, Value]]]:
-        batches = _scan_data(self.data_path, self.plan, self.manifest["output"]["format"]).collect_batches(
+    def _fact_chunks(self, size: int) -> Iterator[dict[int, dict[str, Value]]]:
+        batches = _scan_data(self.data_path, self._plan, self.output_format).collect_batches(
             chunk_size=size,
             maintain_order=True,
             engine="streaming",
@@ -124,8 +129,8 @@ class WorkState:
     published: bool = False
 
 
-def dataset_path(root: Path, chain: str, resolved: ResolvedRange, dataset_id: UUID) -> Path:
-    return root / f"{chain}-{format_utc(resolved.first_timestamp, filename=True)}-{dataset_id}"
+def dataset_path(root: Path, dataset_id: UUID) -> Path:
+    return root / str(dataset_id)
 
 
 @contextmanager
@@ -156,7 +161,7 @@ def prepare_work(hidden: Path, destination: Path, binding: dict[str, object]) ->
         if _read_json(binding_path) != binding:
             raise BlockweaverError("RESUME_MISMATCH", "Incomplete work belongs to a different immutable request")
         if destination.exists():
-            dataset = load_dataset(destination)
+            dataset = open_dataset(destination)
             _validate_dataset_binding(dataset, binding)
             receipt = _read_receipt(receipt_path) if receipt_path.is_file() else None
             if receipt is not None:
@@ -164,7 +169,7 @@ def prepare_work(hidden: Path, destination: Path, binding: dict[str, object]) ->
             return WorkState(chunks, dataset.path, receipt, True)
         if ready.exists():
             try:
-                dataset = load_dataset(ready, work=True)
+                dataset = _open_dataset(ready, work=True)
             except (BlockweaverError, OSError, ValueError):
                 shutil.rmtree(ready) if ready.is_dir() else ready.unlink()
                 receipt_path.unlink(missing_ok=True)
@@ -186,42 +191,44 @@ def prepare_work(hidden: Path, destination: Path, binding: dict[str, object]) ->
     return WorkState(chunks)
 
 
-def _validate_dataset_binding(dataset: LoadedDataset, binding: dict[str, object]) -> None:
+def _validate_dataset_binding(dataset: Dataset, binding: dict[str, object]) -> None:
     chain = binding["chain"]
     source = binding["source"]
     if not isinstance(chain, dict) or not isinstance(source, dict):
         raise BlockweaverError("RESUME_MISMATCH", "Stored work binding is invalid")
+    manifest = dataset._document()
     matches = (
-        dataset.manifest["dataset_id"] == binding["dataset_id"]
-        and dataset.manifest["chain"] == {"name": chain.get("name"), "chain_id": chain.get("chain_id")}
-        and dataset.manifest["finalized_anchor"]["tag"] == chain.get("finality_tag")
-        and dataset.manifest["source"] == source
-        and dataset.manifest["requested_range"] == binding["requested_range"]
-        and dataset.manifest["resolved_range"] == binding["resolved_range"]
-        and list(dataset.plan.columns[1:]) == binding["features"]
-        and dataset.manifest["output"]["format"] == binding["format"]
+        str(dataset.dataset_id) == binding["dataset_id"]
+        and manifest["chain"] == {"name": chain.get("name"), "chain_id": chain.get("chain_id")}
+        and manifest["finalized_anchor"]["tag"] == chain.get("finality_tag")
+        and manifest["source"] == source
+        and manifest["requested_range"] == binding["requested_range"]
+        and manifest["resolved_range"] == binding["resolved_range"]
+        and list(dataset._plan.columns[1:]) == binding["features"]
+        and dataset.output_format == binding["format"]
     )
     if not matches:
         raise BlockweaverError("RESUME_MISMATCH", "Recovered dataset does not match the immutable work binding")
 
 
-def _validate_recovery_receipt(receipt: dict[str, Any], dataset: LoadedDataset, destination: Path) -> None:
+def _validate_recovery_receipt(receipt: dict[str, Any], dataset: Dataset, destination: Path) -> None:
+    manifest = dataset._document()
     if (
         set(receipt) != _RECEIPT_KEYS
         or receipt.get("version") != 1
         or receipt.get("operation") != "download"
-        or receipt.get("dataset_id") != dataset.manifest["dataset_id"]
+        or receipt.get("dataset_id") != str(dataset.dataset_id)
         or receipt.get("path") != str(destination)
-        or receipt.get("chain") != dataset.manifest["chain"]
-        or receipt.get("resolved_range") != dataset.manifest["resolved_range"]
-        or receipt.get("rows") != dataset.rows
-        or receipt.get("finalized_anchor") != dataset.manifest["finalized_anchor"]
+        or receipt.get("chain") != manifest["chain"]
+        or receipt.get("resolved_range") != manifest["resolved_range"]
+        or receipt.get("rows") != dataset.row_count
+        or receipt.get("finalized_anchor") != manifest["finalized_anchor"]
         or receipt.get("artifact_sha256") != pair_hashes(dataset.path)
         or type(receipt.get("reused_rows")) is not int
         or type(receipt.get("acquired_rows")) is not int
         or receipt["reused_rows"] < 0
         or receipt["acquired_rows"] < 0
-        or receipt["reused_rows"] + receipt["acquired_rows"] != dataset.rows
+        or receipt["reused_rows"] + receipt["acquired_rows"] != dataset.row_count
     ):
         raise BlockweaverError("RESUME_INVALID", "Recovery receipt does not match the immutable dataset")
 
@@ -344,7 +351,7 @@ def write_candidate(
     output_format: str,
     sources: list[Path],
     manifest: dict[str, object],
-) -> LoadedDataset:
+) -> Dataset:
     candidate.mkdir()
     filename = f"blocks.{output_format}"
     data_path = candidate / filename
@@ -367,19 +374,25 @@ def write_candidate(
     }
     _write_json(candidate / "manifest.json", {**manifest, "completed_at": _completion_time(), "output": output})
     _fsync_directory(candidate)
-    return load_dataset(candidate, work=True)
+    return _open_dataset(candidate, work=True)
 
 
-def load_dataset(path: Path, *, work: bool = False) -> LoadedDataset:
+def open_dataset(path: str | Path) -> Dataset:
+    """Open and strictly validate a published Blockweaver dataset."""
+
+    return _open_dataset(Path(path), work=False)
+
+
+def _open_dataset(path: Path, *, work: bool) -> Dataset:
     try:
-        return _load_dataset(path, work=work)
+        return _read_dataset(path, work=work)
     except BlockweaverError as error:
         raise BlockweaverError("ARTIFACT_INVALID", str(error)) from None
     except Exception as error:
         raise BlockweaverError("ARTIFACT_INVALID", str(error) or "Invalid dataset") from None
 
 
-def _load_dataset(path: Path, *, work: bool) -> LoadedDataset:
+def _read_dataset(path: Path, *, work: bool) -> Dataset:
     path = path.resolve()
     if not path.is_dir():
         raise ValueError(f"Dataset directory does not exist: {path}")
@@ -395,8 +408,8 @@ def _load_dataset(path: Path, *, work: bool) -> LoadedDataset:
         raise ValueError("manifest.json is not canonical JSON")
     if set(manifest) != _MANIFEST_KEYS:
         raise ValueError("manifest.json has a noncanonical shape")
-    if manifest["manifest_version"] != 1 or manifest["dataset_version"] != 1 or not isinstance(manifest["tool_version"], str) or not manifest["tool_version"]:
-        raise ValueError("Unsupported manifest version")
+    if not isinstance(manifest["tool_version"], str) or not manifest["tool_version"]:
+        raise ValueError("Invalid tool version")
     dataset_id = _canonical_uuid(manifest["dataset_id"])
     chain = _exact_table(manifest["chain"], {"name", "chain_id"}, "chain")
     if not isinstance(chain["name"], str) or _NAME.fullmatch(chain["name"]) is None or type(chain["chain_id"]) is not int or chain["chain_id"] <= 0:
@@ -485,14 +498,28 @@ def _load_dataset(path: Path, *, work: bool) -> LoadedDataset:
         or resolved["to_block"] not in samples
     ):
         raise ValueError("Invalid verification samples")
-    expected_name = f"{chain['name']}-{format_utc(resolved['from_timestamp'], filename=True)}-{dataset_id}"
+    expected_name = str(dataset_id)
     allowed_names = {expected_name, "ready", "ready.tmp"} if work else {expected_name}
     if path.name not in allowed_names:
         raise ValueError("Dataset directory name does not match its manifest")
     rows = _validate_data(data_path, plan, output["format"], resolved, manifest["target_hash"])
     if type(manifest["row_count"]) is not int or manifest["row_count"] != rows:
         raise ValueError("Manifest row count does not match data")
-    return LoadedDataset(path, manifest, plan, rows, data_path)
+    return Dataset(
+        path=path,
+        dataset_id=dataset_id,
+        chain_name=chain["name"],
+        chain_id=chain["chain_id"],
+        first_block=resolved["from_block"],
+        last_block=resolved["to_block"],
+        first_timestamp=resolved["from_timestamp"],
+        last_timestamp=resolved["to_timestamp"],
+        schema=tuple(names),
+        output_format=output["format"],
+        row_count=rows,
+        data_path=data_path,
+        _manifest_json=manifest_bytes,
+    )
 
 
 def _validate_data(path: Path, plan: Plan, output_format: str, resolved: dict[str, int], target_hash: str) -> int:

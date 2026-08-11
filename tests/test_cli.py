@@ -12,7 +12,7 @@ import pytest
 from conftest import ChainServer, FakeBigQuery, block_hash
 from typer.testing import CliRunner
 
-from blockweaver import _build, _corpus, _sources
+from blockweaver import BlockweaverError, Dataset, _build, _corpus, _sources, open_dataset
 from blockweaver import cli as cli_module
 from blockweaver._contract import parse_time
 from blockweaver.cli import app
@@ -59,7 +59,6 @@ def test_cli_commands_and_machine_usage_errors() -> None:
     help_result = invoke(["--help"])
     assert help_result.exit_code == 0
     assert all(command in help_result.stdout for command in ("init", "chains", "features", "download", "verify"))
-
     failure = error(invoke(["download"]))
     assert failure["event"] == "error"
     assert failure["code"] == "CONFIG_NOT_FOUND"
@@ -68,12 +67,10 @@ def test_cli_commands_and_machine_usage_errors() -> None:
 def test_init_precedence_permissions_and_no_overwrite(tmp_path: Path) -> None:
     configured = tmp_path / "configured.toml"
     explicit = tmp_path / "explicit.toml"
-
     result = invoke(["init"], {"BLOCKWEAVER_CONFIG": str(configured)})
     assert json.loads(result.stdout)["path"] == str(configured)
     assert configured.stat().st_mode & 0o777 == 0o600
     assert "url_env" in configured.read_text()
-
     explicit_result = invoke(["init", "--config", str(explicit)], {"BLOCKWEAVER_CONFIG": str(configured)})
     assert json.loads(explicit_result.stdout)["path"] == str(explicit)
     assert error(invoke(["init", "--config", str(explicit)]))["code"] == "CONFIG_EXISTS"
@@ -82,7 +79,6 @@ def test_init_precedence_permissions_and_no_overwrite(tmp_path: Path) -> None:
 def test_strict_config_discovery_has_no_secrets(tmp_path: Path, chains: tuple[ChainServer, ChainServer], make_config: Any) -> None:
     primary, verifier = chains
     config = make_config(tmp_path / "config.toml", primary, verifier, output_root=tmp_path / "out")
-
     chain_result = invoke(["chains", "--config", str(config)])
     feature_result = invoke(["features", "--config", str(config)])
     assert json.loads(chain_result.stdout)["chains"] == [
@@ -101,7 +97,6 @@ def test_strict_config_discovery_has_no_secrets(tmp_path: Path, chains: tuple[Ch
     assert {item["name"] for item in catalog["features"]} >= {"timestamp", "block_hash", "effective_priority_fee_per_gas_p90"}
     assert primary.url not in chain_result.output + feature_result.output
     assert verifier.url not in chain_result.output + feature_result.output
-
     with config.open("a") as stream:
         stream.write("\nunknown = true\n")
     assert error(invoke(["chains", "--config", str(config)]))["code"] == "CONFIG_INVALID"
@@ -131,7 +126,6 @@ def test_config_rejects_malformed_urls_and_unbounded_timeouts(
     text = config.read_text()
     text = text.replace(f'url = "{primary.url}"', replacement, 1) if replacement.startswith("url") else text.replace("timeout = 2", replacement, 1)
     config.write_text(text)
-
     assert error(invoke(["chains", "--config", str(config)]))["code"] == "CONFIG_INVALID"
 
 
@@ -142,7 +136,6 @@ def test_download_cli_values_override_defaults_and_profiles(tmp_path: Path, chai
     config = make_config(tmp_path / "config.toml", primary, verifier, output_root=configured_root, features=("timestamp",))
     with config.open("a") as stream:
         stream.write(f'''\n[providers.override]\nurl = "{primary.url}"\nbatch_size = 1\nconcurrency = 1\ntimeout = 1\n''')
-
     artifact = artifact_from(
         invoke(
             [
@@ -178,7 +171,6 @@ def test_basic_auth_rpc_urls_are_accepted_and_fully_redacted(
     config = make_config(tmp_path / "config.toml", primary, verifier, output_root=tmp_path / "out")
     basic_url = primary.url.replace("http://", "http://user:secret@")
     config.write_text(config.read_text().replace(primary.url, basic_url))
-
     successful = invoke(download_args(config))
     assert successful.exit_code == 0, successful.output
     assert basic_url not in successful.output
@@ -215,7 +207,11 @@ def test_parquet_download_selects_and_coalesces_features(tmp_path: Path, chains:
         ]
     )
     artifact = artifact_from(result)
-    assert artifact.name == f"test-20231114T221330Z-{DATASET_ID}"
+    dataset = open_dataset(str(artifact))
+    assert isinstance(dataset, Dataset) and artifact == tmp_path / "out" / DATASET_ID == dataset.path
+    assert (str(dataset.dataset_id), dataset.chain_name, dataset.chain_id, dataset.first_block, dataset.last_block) == (DATASET_ID, "test", 1, 10, 14)
+    assert dataset.schema == ("block_number", "timestamp", "block_hash", "gas_used", "effective_priority_fee_per_gas_p50")
+    assert dataset.output_format == "parquet" and dataset.row_count == 5
     assert {path.name for path in artifact.iterdir()} == {"manifest.json", "blocks.parquet"}
     frame = pl.read_parquet(artifact / "blocks.parquet")
     assert frame.schema == {
@@ -227,7 +223,6 @@ def test_parquet_download_selects_and_coalesces_features(tmp_path: Path, chains:
     }
     assert frame["block_number"].to_list() == [10, 11, 12, 13, 14]
     assert frame["effective_priority_fee_per_gas_p50"].to_list() == [500, 550, 600, 650, 700]
-
     fee_calls = [call for batch in primary.requests for call in batch if call["method"] == "eth_feeHistory"]
     assert [call["params"] for call in fee_calls] == [["0x5", "0xe", [50]]]
     block_calls = [call for batch in primary.requests for call in batch if call["method"] == "eth_getBlockByNumber"]
@@ -237,6 +232,7 @@ def test_parquet_download_selects_and_coalesces_features(tmp_path: Path, chains:
     manifest_text = (artifact / "manifest.json").read_text()
     manifest = json.loads(manifest_text)
     assert manifest_text.endswith("\n")
+    assert set(manifest) == _corpus._MANIFEST_KEYS
     assert manifest["schema"] == [
         {"name": "block_number", "type": "Int64", "unit": "block"},
         {"name": "timestamp", "type": "Int64", "unit": "unix_second"},
@@ -255,7 +251,6 @@ def test_time_range_csv_and_reduced_precision(tmp_path: Path, chains: tuple[Chai
     config = make_config(tmp_path / "config.toml", primary, verifier, output_root=tmp_path / "out", output_format="csv")
     start = datetime.fromtimestamp(primary.timestamp_base + 10, UTC).isoformat().replace("+00:00", "Z")
     end = datetime.fromtimestamp(primary.timestamp_base + 14, UTC).isoformat().replace("+00:00", "Z")
-
     result = invoke(
         [
             "download",
@@ -496,7 +491,11 @@ def test_verify_is_strict_locally_and_against_rpc(tmp_path: Path, chains: tuple[
     artifact = artifact_from(invoke(download_args(config)))
     full = invoke(["verify", str(artifact), "--config", str(config), "--provider", "verifier", "--full-rpc"])
     assert json.loads(full.stdout)["verification"]["mode"] == "full_rpc"
-
+    moved = artifact.with_name("22222222-2222-4222-8222-222222222222")
+    artifact.rename(moved)
+    with pytest.raises(BlockweaverError, match="directory name"):
+        open_dataset(moved)
+    moved.rename(artifact)
     frame = pl.read_parquet(artifact / "blocks.parquet")
     frame.with_columns(pl.when(pl.col("block_number") == 12).then(999).otherwise(pl.col("timestamp")).alias("timestamp")).write_parquet(
         artifact / "blocks.parquet"

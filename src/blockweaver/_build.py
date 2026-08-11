@@ -29,13 +29,14 @@ from ._contract import (
     validate_uuid,
 )
 from ._corpus import (
-    LoadedDataset,
+    Dataset,
+    _open_dataset,
     checkpoint_facts,
     checkpoint_paths,
     dataset_path,
     discard_work,
-    load_dataset,
     locked_work,
+    open_dataset,
     pair_hashes,
     prepare_work,
     publish,
@@ -188,7 +189,7 @@ async def _materialize(
     publication: Publication,
 ) -> dict[str, object]:
     root = spec.output_root.resolve()
-    destination = dataset_path(root, spec.chain.name, resolved, spec.dataset_id)
+    destination = dataset_path(root, spec.dataset_id)
     with locked_work(root, spec.dataset_id, destination) as hidden:
         work = prepare_work(hidden, destination, _binding(spec, resolved))
         candidate_path, receipt = work.candidate, work.receipt
@@ -233,12 +234,12 @@ async def _materialize(
                     sources=paths,
                     manifest=_manifest(spec, resolved, previous.block_hash, anchor, verification),
                 )
-                acquired = candidate.rows - reused
+                acquired = candidate.row_count - reused
             else:
-                candidate = load_dataset(candidate_path, work=candidate_path.name in {"ready", "ready.tmp"})
+                candidate = _open_dataset(candidate_path, work=candidate_path.name in {"ready", "ready.tmp"})
                 await _validate_candidate(candidate, primary, verifier, spec.chain)
-                anchor = candidate.anchor
-                acquired, reused = 0, candidate.rows
+                anchor = candidate._anchor
+                acquired, reused = 0, candidate.row_count
             receipt = _receipt("download", candidate, destination, reused, acquired, anchor)
         assert candidate_path is not None and receipt is not None
         if work.published:
@@ -348,9 +349,9 @@ async def verify_dataset(
     full_rpc: bool,
     progress: Progress,
 ) -> dict[str, object]:
-    dataset = load_dataset(path)
-    progress({"event": "local_valid", "rows": dataset.rows})
-    anchor = dataset.anchor
+    dataset = open_dataset(path)
+    progress({"event": "local_valid", "rows": dataset.row_count})
+    anchor = dataset._anchor
     verification: dict[str, object] = {"mode": "local"}
     if provider is None:
         if full_rpc:
@@ -361,15 +362,15 @@ async def verify_dataset(
                 chain_id = await rpc.chain_id()
                 if chain_id != dataset.chain_id:
                     raise BlockweaverError("RPC_CHAIN_MISMATCH", "RPC chain ID does not match the dataset")
-                target = await rpc.header(dataset.last_block, dataset.plan)
-                if target.block_hash != dataset.manifest["target_hash"]:
+                target = await rpc.header(dataset.last_block, dataset._plan)
+                if target.block_hash != dataset._target_hash:
                     raise BlockweaverError("RPC_MISMATCH", "Dataset target hash does not match RPC")
                 fresh = await _refresh_finality(target, anchor, rpc)
-                sample_numbers = _sample_numbers(UUID(dataset.manifest["dataset_id"]), dataset.first_block, dataset.last_block)
+                sample_numbers = _sample_numbers(dataset.dataset_id, dataset.first_block, dataset.last_block)
                 if full_rpc:
                     await _check_full_dataset(dataset, rpc)
                 else:
-                    await _check_rows(dataset.facts(sample_numbers), sample_numbers, dataset.plan, rpc)
+                    await _check_rows(dataset._facts(sample_numbers), sample_numbers, dataset._plan, rpc)
                 verification = {
                     "mode": "full_rpc" if full_rpc else "sample_rpc",
                     "provider": provider.name,
@@ -386,9 +387,9 @@ async def verify_dataset(
     return {
         "version": 1,
         "operation": "verify",
-        "dataset_id": dataset.manifest["dataset_id"],
+        "dataset_id": str(dataset.dataset_id),
         "path": str(dataset.path),
-        "rows": dataset.rows,
+        "rows": dataset.row_count,
         "artifact_sha256": pair_hashes(dataset.path),
         "verification": verification,
     }
@@ -564,32 +565,32 @@ async def _check_rows(
     return headers[-1] if contiguous else None
 
 
-async def _check_full_dataset(dataset: LoadedDataset, rpc: Rpc) -> None:
+async def _check_full_dataset(dataset: Dataset, rpc: Rpc) -> None:
     previous: Header | None = None
     expected = dataset.first_block
-    for local in dataset.fact_chunks(_CHUNK_SIZE):
+    for local in dataset._fact_chunks(_CHUNK_SIZE):
         numbers = list(local)
         if not numbers or numbers[0] != expected:
             raise BlockweaverError("ARTIFACT_INVALID", "Dataset streaming order changed during verification")
-        previous = await _check_rows(local, numbers, dataset.plan, rpc, previous=previous)
+        previous = await _check_rows(local, numbers, dataset._plan, rpc, previous=previous)
         expected = numbers[-1] + 1
     if expected != dataset.last_block + 1:
         raise BlockweaverError("ARTIFACT_INVALID", "Dataset streaming coverage changed during verification")
 
 
-async def _validate_candidate(dataset: LoadedDataset, primary: Rpc | None, verifier: Rpc, chain: Chain) -> None:
+async def _validate_candidate(dataset: Dataset, primary: Rpc | None, verifier: Rpc, chain: Chain) -> None:
     if dataset.chain_id != chain.chain_id:
         raise BlockweaverError("RESUME_MISMATCH", "Ready candidate chain does not match the request")
-    verifier_target = await verifier.header(dataset.last_block, dataset.plan)
-    if verifier_target.block_hash != dataset.manifest["target_hash"]:
+    verifier_target = await verifier.header(dataset.last_block, dataset._plan)
+    if verifier_target.block_hash != dataset._target_hash:
         raise BlockweaverError("RPC_MISMATCH", "Ready candidate target hash does not match verifier RPC")
     if primary is not None:
-        target = await primary.header(dataset.last_block, dataset.plan)
+        target = await primary.header(dataset.last_block, dataset._plan)
         if not _same_header(target, verifier_target):
             raise BlockweaverError("RPC_MISMATCH", "RPC endpoints disagree on the ready candidate target")
-    await _refresh_finality(verifier_target, dataset.anchor, verifier)
-    numbers = _sample_numbers(UUID(dataset.manifest["dataset_id"]), dataset.first_block, dataset.last_block)
-    await _check_rows(dataset.facts(numbers), numbers, dataset.plan, verifier)
+    await _refresh_finality(verifier_target, dataset._anchor, verifier)
+    numbers = _sample_numbers(dataset.dataset_id, dataset.first_block, dataset.last_block)
+    await _check_rows(dataset._facts(numbers), numbers, dataset._plan, verifier)
 
 
 def _binding(spec: DownloadSpec, resolved: ResolvedRange) -> dict[str, object]:
@@ -613,8 +614,6 @@ def _manifest(
     verification: dict[str, object],
 ) -> dict[str, object]:
     return {
-        "manifest_version": 1,
-        "dataset_version": 1,
         "tool_version": __version__,
         "dataset_id": str(spec.dataset_id),
         "chain": {"name": spec.chain.name, "chain_id": spec.chain.chain_id},
@@ -642,20 +641,21 @@ def _sample_numbers(dataset_id: UUID, first_block: int, last_block: int) -> list
 
 def _receipt(
     operation: str,
-    dataset: LoadedDataset,
+    dataset: Dataset,
     destination: Path,
     reused: int,
     acquired: int,
     anchor: Anchor,
 ) -> dict[str, object]:
+    manifest = dataset._document()
     return {
         "version": 1,
         "operation": operation,
-        "dataset_id": dataset.manifest["dataset_id"],
+        "dataset_id": str(dataset.dataset_id),
         "path": str(destination),
-        "chain": dataset.manifest["chain"],
-        "resolved_range": dataset.manifest["resolved_range"],
-        "rows": dataset.rows,
+        "chain": manifest["chain"],
+        "resolved_range": manifest["resolved_range"],
+        "rows": dataset.row_count,
         "reused_rows": reused,
         "acquired_rows": acquired,
         "finalized_anchor": anchor.document(),

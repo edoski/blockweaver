@@ -77,21 +77,30 @@ An omitted `--id` mints a UUID4 and emits it on stderr before acquisition. Reusi
 The output is exactly:
 
 ```text
-ROOT/<chain>-<resolved-start-UTC>-<uuid4>/
+ROOT/<uuid4>/
   manifest.json
   blocks.parquet | blocks.csv
 ```
 
-Parquet is the typed default. CSV uses canonical decimal integers and UTF-8 strings; `manifest.json` is its type authority. The version-1 manifest records the request, resolved range, ordered schema and units, acquisition plan, chain identity, non-secret provider profile names, finality proof, verification samples, byte size, and SHA-256 digest. JSON is sorted, compact, UTF-8, and newline-terminated.
+The directory UUID must equal the manifest's dataset UUID. Parquet is the typed default. CSV uses canonical decimal integers and UTF-8 strings; `manifest.json` is its type authority. The unversioned manifest records the tool version, request, resolved range, ordered schema and units, acquisition plan, chain identity, non-secret provider profile names, finality proof, verification samples, byte size, and SHA-256 digest. JSON is sorted, compact, UTF-8, and newline-terminated.
 
 Work is checkpointed under a hidden directory. Complete chunks are digest-bound and validated before reuse. The fully assembled candidate is validated, synced, and atomically renamed without replacement; existing destinations are never overwritten.
+
+Python consumers use the same strict local validator as `verify`:
+
+```python
+from blockweaver import open_dataset
+
+dataset = open_dataset("downloads/11111111-1111-4111-8111-111111111111")
+print(dataset.chain_id, dataset.first_block, dataset.last_block, dataset.schema, dataset.data_path)
+```
 
 ## Verify
 
 Local verification is strict and needs no provider:
 
 ```console
-blockweaver verify ./downloads/ethereum-20260101T000000Z-11111111-1111-4111-8111-111111111111
+blockweaver verify ./downloads/11111111-1111-4111-8111-111111111111
 ```
 
 RPC verification uses a configured profile or a direct URL. It checks deterministic samples and refreshes the stored finality proof. `--full-rpc` checks every row in bounded chunks, including ancestry across chunk boundaries.

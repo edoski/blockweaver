@@ -24,7 +24,7 @@
 - Use a plain TOML configuration file for settings that persist across downloads. One-off CLI values override configuration.
 - Resolve requests from either inclusive block numbers or human-readable UTC date/time bounds.
 - Let selected features determine the JSON-RPC methods and parameters used. Make the available feature catalog discoverable.
-- Publish one UUID-identified directory named from the chain and resolved start time. Store one data file plus one stable adjacent JSON manifest.
+- Publish one UUID-identified directory named only by the dataset UUID. Store one data file plus one stable adjacent JSON manifest.
 - Support Parquet and CSV. Avoid speculative format plugins.
 
 ## Design status
@@ -105,14 +105,14 @@ Keep BigQuery behind the optional `blockweaver[bigquery]` dependency and import 
 Publish exactly:
 
 ```text
-ROOT/<chain>-<resolved-start-utc>-<uuid4>/
+ROOT/<uuid4>/
   manifest.json
   blocks.parquet | blocks.csv
 ```
 
 Parquet is the default. CSV contains canonical decimal integers and UTF-8 strings; the manifest is its type authority. Both formats represent the same ordered logical schema.
 
-Manifest version 1 is canonical sorted UTF-8 JSON with a final newline. It records dataset/tool versions, UUID, completion time, chain name and verified ID, source and non-secret profile names, requested and resolved range, ordered feature schema and units, normalized acquisition plan, row count, output filename/format/bytes/SHA-256, target hash, finalized anchor, and verification facts. It contains no URLs, credentials, environment values, raw SQL, or transient paths.
+The exact unversioned manifest is canonical sorted UTF-8 JSON with a final newline. It records the tool version, UUID, completion time, chain name and verified ID, source and non-secret profile names, requested and resolved range, ordered feature schema and units, normalized acquisition plan, row count, output filename/format/bytes/SHA-256, target hash, finalized anchor, and verification facts. The directory UUID must match its manifest UUID. It contains no URLs, credentials, environment values, raw SQL, or transient paths.
 
 Generate a UUID4 when omitted and emit it before acquisition. An explicit UUID resumes only an exact immutable binding of chain, range, features, format, source, and profiles. Operational retry/concurrency values may change. Keep partial state under a hidden work directory. Validate complete deterministic chunks, assemble and fully validate the candidate, fsync files/directories, then atomically rename. Never overwrite a destination.
 
