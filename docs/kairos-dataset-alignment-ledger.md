@@ -147,7 +147,7 @@ The CLI hands acquisition one trusted request. RPC and BigQuery each hide their 
 
 ## Slice 1B: artifact lifecycle, identity, and durability
 
-- Status: second correction committed at `fcffca52de56f8aaf39da625cd96bdca8a9cfbf2`; focused re-review pending.
+- Status: green and integrated on `main` at `5d53fa6fcbd92c392f44b471bbcff3e4693d9b2f`; Standards 0 and Spec 0.
 - Repository: Blockweaver.
 - Planned baseline: integrated Slice 1A head; repin immediately before execution.
 - Dependencies: Slice 1A.
@@ -325,5 +325,7 @@ GitHub issue [#2](https://github.com/edoski/blockweaver/issues/2) records the au
 - Slice 1B correction: `04bb8c227c916b4ca12739094e7a6a37f924f676` (`fix(artifact): harden staged and concurrent recovery`). It deletes the duplicate source protocol, validates and live-reseals staged candidates before considering obsolete checkpoints, and binds cleanup to the locked directory device/inode generation with retry for stale generations. Worker reported 76 passing tests and all gates green. Four same-UUID subprocess races each produced one valid publication and one `DESTINATION_EXISTS`, never `ENOENT`/`IO_FAILED`, with no hidden residue. Re-review range is `3627b583bb6a99ffe19a1799821d9fb239f9e363...04bb8c227c916b4ca12739094e7a6a37f924f676`.
 - Slice 1B first correction review: Spec 0, Standards 1. All original findings closed. The remaining P3 is correction-introduced unsupported-platform generality: `getattr(os, "O_DIRECTORY", 0)` silently weakens directory-only opening. The supported Linux/macOS clean break requires direct `os.O_DIRECTORY` and fail-closed import/runtime behavior.
 - Slice 1B second correction: `fcffca52de56f8aaf39da625cd96bdca8a9cfbf2` (`fix(artifact): require directory lock support`). One line now uses `os.O_DIRECTORY` directly with no unsupported-platform fallback. Worker reported the focused staged/concurrent tests, all 76 tests, and every gate green. Re-review range is `04bb8c227c916b4ca12739094e7a6a37f924f676...fcffca52de56f8aaf39da625cd96bdca8a9cfbf2`.
+- Slice 1B final re-review: Standards 0, Spec 0, overall green. Integration merge: `5d53fa6fcbd92c392f44b471bbcff3e4693d9b2f` (`merge(artifact): integrate consolidation slice 1b`). Main integration passed all 76 tests plus Ruff lint/format, Pyright, Vulture, lock, CLI, core/optional imports, diff, residue, module, dependency, and clean-status checks. No provider, output, KAIROS, job, campaign, GPU/image, push, release, or PyPI action occurred.
+- Slice 1B cleanup: removed run-owned worktree `/Users/edo/dev/python/blockweaver-slice-1b` and branch `codex/consolidation-slice-1b` after integration. Only the normal `main` worktree remains.
 
 No consolidation implementation, provider call, migration script, output mutation, KAIROS slice, cleanup, or deployment exists yet. The completed Servatus work and active HPO are external protected state, not work owned by this run.
