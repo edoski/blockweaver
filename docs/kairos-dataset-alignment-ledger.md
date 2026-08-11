@@ -190,7 +190,7 @@ Filesystem safety has one locality and one small interface. Every durable state 
 
 ## Slice 1C: client and platform truth
 
-- Status: planned; blocked by Slice 1B green.
+- Status: queued; Slice 1B is green.
 - Repository: Blockweaver.
 - Planned baseline: integrated Slice 1B head; repin immediately before execution.
 - Dependencies: Slice 1B.
