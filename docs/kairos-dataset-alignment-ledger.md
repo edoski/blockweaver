@@ -46,7 +46,7 @@
 - `STORAGE_ROOT` remains KAIROS's single root. Corpus loading resolves `STORAGE_ROOT/datasets/<corpus_id>`; no second environment variable or repository-specific absolute path is introduced.
 - KAIROS takes a runtime dependency on the compatible Blockweaver release and uses only its public artifact interface.
 - KAIROS should lose roughly 15–30 production lines by deleting `CorpusRequest`, three corpus address helpers, JSON parsing, and row `chain_id`, net of the thin dataset-to-`BlockFrame` mapping. The main simplification is one metadata authority, not a large LOC reduction.
-- Slice 1 remained near LOC-neutral. The consolidation should remove caller knowledge and repeated work, with a directional combined target of 100–220 production lines and 40–100 test lines. These are deletion guides, not acceptance quotas; architecture and preserved behavior decide acceptance.
+- Slice 1 remained near LOC-neutral. The consolidation should remove caller knowledge and repeated work, with a directional production-code deletion target of 100–220 lines. Tests should consolidate around public and fake-service behavior without an arbitrary line-count cap. Architecture and preserved behavior decide acceptance.
 
 ## Consolidation design
 
@@ -82,7 +82,7 @@
 - Replace the old manifest with the one exact unversioned clean-break shape and remove artifact-version tags.
 - Promote a small public immutable dataset value/loader from the existing strict local loader.
 - Keep `download` and `verify` behavior source-independent and update documentation.
-- Consolidate tests as needed to remain within five implementation modules, five runtime dependencies including extras, and 900 test lines.
+- Consolidate tests around behavior while remaining within five implementation modules and five runtime dependencies including extras.
 
 ### Non-goals
 
@@ -99,14 +99,14 @@ Every newly downloaded dataset has one durable UUID address independent of chain
 ### Checks
 
 - Focused CLI/public-reader tests for UUID addressing, manifest binding, both native sources, both formats, invalid artifacts, and no-clobber publication.
-- Full Pytest, Ruff lint/format, Pyright, Vulture, lock check, `git diff --check`, CLI smoke, residue search, module/dependency/test-line limits.
+- Full Pytest, Ruff lint/format, Pyright, Vulture, lock check, `git diff --check`, CLI smoke, residue search, and module/dependency limits.
 - Explicitly not run: public RPC, live BigQuery, KAIROS, real outputs.
 
 ## Slice 1A: trusted request and deep source acquisition
 
-- Status: queued; issue and execution gates satisfied.
+- Status: implementation committed at `b1c2c67de472cdb7c7d1fa9f131a8b572af746e8`; awaiting independent review.
 - Repository: Blockweaver.
-- Planned baseline: current green `main`; repin immediately before execution.
+- Baseline: `c4c8da1ee8c95d76ea6444f6ffab6e2b2b1dacc7`.
 - Dependencies: completed Slice 1.
 
 ### Scope
@@ -142,7 +142,7 @@ The CLI hands acquisition one trusted request. RPC and BigQuery each hide their 
 - Prove header-only work emits no fee-history call or allocation path; selected percentiles still coalesce; `tx_count` requests no extra RPC method.
 - Fake BigQuery proves only required fields/tables, every schema/dry-run/cost gate before execution, bounded pages, optional dependency behavior, and RPC truth proof.
 - RPC/BigQuery logical artifact parity and unchanged canonical manifests for both formats.
-- Full Pytest, Ruff lint/format, Pyright, Vulture, lock and diff checks, optional BigQuery import, CLI smoke, source/registry residue search, five modules, no new dependency, at most 900 test lines.
+- Full Pytest, Ruff lint/format, Pyright, Vulture, lock and diff checks, optional BigQuery import, CLI smoke, source/registry residue search, five modules, no new dependency, and focused behavior-level tests.
 - Explicitly not run: public RPC, live/billable BigQuery, ADC, real outputs, KAIROS, push, release.
 
 ## Slice 1B: artifact lifecycle, identity, and durability
@@ -299,15 +299,18 @@ GitHub issue [#2](https://github.com/edoski/blockweaver/issues/2) records the au
 - Reviewer: `/root/dataset_contract_review`, with separate Standards and Spec lanes. Initial result: Standards rejected with three findings; Spec green with zero findings.
 - Corrections: `f676eda38bbc66fb1cac012dd7e9baf0be2135a7` (`fix(dataset): close contract review findings`) closed stale API documentation, a coupled private test oracle, and the broad output-format type.
 - Final review range: `38fda515f2f71a104e19461e386176868a1d2d74..f676eda38bbc66fb1cac012dd7e9baf0be2135a7`; Standards 0, Spec 0, overall green.
-- Integration: clean fast-forward to Blockweaver `main`. Main rerun passed 39 tests, Ruff lint/format, Pyright, Vulture, lock check, and diff check. The result has five implementation modules, four runtime dependencies including extras, and exactly 900 test lines.
+- Integration: clean fast-forward to Blockweaver `main`. Main rerun passed 39 tests, Ruff lint/format, Pyright, Vulture, lock check, and diff check. The result has five implementation modules and four runtime dependencies including extras.
 - Excluded and untouched: public RPC, live BigQuery, KAIROS, all real outputs, jobs, campaigns, releases, pushes, and PyPI.
 
-- Consolidation design baseline: clean `cd8018212388e4549ed994dc90877c95a6eeda3c`, with 2,983 production lines, five implementation modules, four runtime dependencies including the optional extra, and exactly 900 test lines.
+- Consolidation design baseline: clean `cd8018212388e4549ed994dc90877c95a6eeda3c`, with 2,983 production lines, five implementation modules, and four runtime dependencies including the optional extra.
 - Read-only architecture evidence: `/root/architecture_structure_audit` and `/root/api_validation_audit`; both confirmed the external interface is already small and the cleanup belongs behind it.
 - Design-It-Twice lanes: `/root/consolidation_min_interface`, `/root/consolidation_default_caller`, `/root/consolidation_flexible_sources`, and `/root/consolidation_safety_ports`. They compared four-module, caller-first, source-flexible, and safety-first seam placements.
 - Specialist lanes: `/root/checkpoint_correctness_research` produced the durable-state/trust model and found six publication/recovery correctness gaps; `/root/validation_platform_research` mapped validation ownership and platform/client cleanup; `/root/consolidation_slice_planner` resolved ordering and review gates.
 - Selected result: retain five modules and use three ordered slices. Reject a four-module acquisition mega-module, public plugins, an exposed caller-driven artifact transaction, a filesystem adapter, compatibility code, and partial Windows writers.
 - The architecture report was generated outside the repository as an ephemeral research artifact. No product, provider, output, KAIROS, job, campaign, release, push, or PyPI mutation occurred during research.
 - Consolidation execution issue: [#3](https://github.com/edoski/blockweaver/issues/3). Pre-run checkout: clean `main` at `edea482ef777a4a5005928e5483fd170d28cdf69`, nine commits ahead of `origin/main`, with only the normal `/Users/edo/dev/python/blockweaver` worktree and no run-owned branches.
+- Slice 1A baseline: `c4c8da1ee8c95d76ea6444f6ffab6e2b2b1dacc7`. Implementer: `/root/consolidation_1a_impl`; worktree `/Users/edo/dev/python/blockweaver-slice-1a`; branch `codex/consolidation-slice-1a`.
+- Slice 1A implementation head: `b1c2c67de472cdb7c7d1fa9f131a8b572af746e8` (`refactor(source): consolidate acquisition boundary`). Worker reported 51 passing tests plus green Ruff lint/format, Pyright, Vulture, lock, diff, CLI, lazy/optional-import, residue, module, and dependency checks. Orchestrator verified the clean head and nonempty fixed diff; independent review is pending.
+- User correction during Slice 1A: the numeric test-line cap was false/stale. Remove every explicit cap from repository standards, historical specs, this ledger, and issue #3; keep tests lean by behavior and seam quality rather than line count.
 
 No consolidation implementation, provider call, migration script, output mutation, KAIROS slice, cleanup, or deployment exists yet. The completed Servatus work and active HPO are external protected state, not work owned by this run.
