@@ -142,10 +142,9 @@ class FakeBigQuery:
             for name, dtype in {"block_number": "INTEGER", "block_timestamp": "TIMESTAMP", "block_hash": "STRING", "parent_hash": "STRING"}.items()
         },
         "block_features": {name: ("INTEGER", "NULLABLE") for name in ("base_fee_per_gas", "gas_used", "gas_limit")},
-        "transactions": {"block_number": ("INTEGER", "NULLABLE"), "block_timestamp": ("TIMESTAMP", "NULLABLE")},
+        "transactions": {"block_hash": ("STRING", "NULLABLE"), "block_timestamp": ("TIMESTAMP", "NULLABLE")},
         "receipts": {
-            name: (dtype, "NULLABLE")
-            for name, dtype in {"block_number": "INTEGER", "block_hash": "STRING", "block_timestamp": "TIMESTAMP", "transaction_index": "INTEGER"}.items()
+            name: (dtype, "NULLABLE") for name, dtype in {"block_hash": "STRING", "block_timestamp": "TIMESTAMP", "transaction_index": "INTEGER"}.items()
         },
         "receipt_features": {name: ("INTEGER", "NULLABLE") for name in ("gas_used", "effective_gas_price")},
     }
@@ -177,7 +176,7 @@ class FakeBigQuery:
         del maximum_bytes_billed
         columns = _query_schema(sql)
         rows = []
-        receipt_join_is_fork_safe = "r.block_number = b.block_number AND r.block_hash = b.block_hash" in sql
+        receipt_join_is_fork_safe = "ON r.block_hash = b.block_hash" in sql
         for number in range(parameters["first_block"], parameters["last_block"] + 1):
             block = self.chain.block(number)
             values = {"block_number": number, "_proof_timestamp": self.chain.timestamp_base + number, "timestamp": self.chain.timestamp_base + number}

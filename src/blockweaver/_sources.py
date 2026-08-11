@@ -95,12 +95,14 @@ class BigQueryClient:
             yield (dict(row.items()) for row in page)
 
     def _config(self, parameters: dict[str, int], *, dry_run: bool = False, maximum_bytes_billed: int | None = None) -> Any:
-        return self._module.QueryJobConfig(
-            dry_run=dry_run,
-            use_query_cache=False,
-            maximum_bytes_billed=maximum_bytes_billed,
-            query_parameters=[self._module.ScalarQueryParameter(name, "INT64", value) for name, value in parameters.items()],
-        )
+        options = {
+            "dry_run": dry_run,
+            "use_query_cache": False,
+            "query_parameters": [self._module.ScalarQueryParameter(name, "INT64", value) for name, value in parameters.items()],
+        }
+        if maximum_bytes_billed is not None:
+            options["maximum_bytes_billed"] = maximum_bytes_billed
+        return self._module.QueryJobConfig(**options)
 
 
 def open_bigquery(project: str) -> BigQueryClient:
@@ -161,20 +163,18 @@ def compile_bigquery(dataset: str, plan: Plan) -> BigQueryPlan:
         projections.extend(["b.gas_used AS _proof_gas_used", "b.gas_limit AS _proof_gas_limit"])
         result_schema.update({"_proof_gas_used": "INTEGER", "_proof_gas_limit": "INTEGER"})
     if any(feature.bigquery_family == "transactions" for feature in plan.features):
-        tables["transactions"] = {"block_number": "INTEGER", "block_timestamp": "TIMESTAMP"}
+        tables["transactions"] = {"block_hash": "STRING", "block_timestamp": "TIMESTAMP"}
         ctes.append(
             "tx_counts AS (\n"
-            "  SELECT block_number, COUNT(*) AS tx_count\n"
+            "  SELECT block_hash, COUNT(*) AS tx_count\n"
             f"  FROM `{dataset}.transactions`\n"
-            "  WHERE block_number BETWEEN @first_block AND @last_block\n"
-            "    AND block_timestamp BETWEEN TIMESTAMP_SECONDS(@from_timestamp) AND TIMESTAMP_SECONDS(@to_timestamp)\n"
-            "  GROUP BY block_number\n"
+            "  WHERE block_timestamp BETWEEN TIMESTAMP_SECONDS(@from_timestamp) AND TIMESTAMP_SECONDS(@to_timestamp)\n"
+            "  GROUP BY block_hash\n"
             ")"
         )
-        joins.append("LEFT JOIN tx_counts AS t USING (block_number)")
+        joins.append("LEFT JOIN tx_counts AS t USING (block_hash)")
     if plan.percentiles:
         tables["receipts"] = {
-            "block_number": "INTEGER",
             "block_hash": "STRING",
             "block_timestamp": "TIMESTAMP",
             "transaction_index": "INTEGER",
@@ -184,19 +184,18 @@ def compile_bigquery(dataset: str, plan: Plan) -> BigQueryPlan:
         ctes.extend(
             [
                 "requested_receipts AS (\n"
-                "  SELECT block_number, block_hash, transaction_index, gas_used, effective_gas_price\n"
+                "  SELECT block_hash, transaction_index, gas_used, effective_gas_price\n"
                 f"  FROM `{dataset}.receipts`\n"
-                "  WHERE block_number BETWEEN @first_block AND @last_block\n"
-                "    AND block_timestamp BETWEEN TIMESTAMP_SECONDS(@from_timestamp) AND TIMESTAMP_SECONDS(@to_timestamp)\n"
+                "  WHERE block_timestamp BETWEEN TIMESTAMP_SECONDS(@from_timestamp) AND TIMESTAMP_SECONDS(@to_timestamp)\n"
                 ")",
                 "weighted_receipts AS (\n"
-                "  SELECT r.block_number, r.transaction_index, r.gas_used, b.gas_used AS block_gas_used,\n"
+                "  SELECT b.block_number, r.transaction_index, r.gas_used, b.gas_used AS block_gas_used,\n"
                 "    r.effective_gas_price - b.base_fee_per_gas AS priority_fee,\n"
-                "    SUM(r.gas_used) OVER (PARTITION BY r.block_number "
+                "    SUM(r.gas_used) OVER (PARTITION BY b.block_number "
                 "ORDER BY r.effective_gas_price - b.base_fee_per_gas, r.transaction_index "
                 "ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS cumulative_gas\n"
                 "  FROM requested_receipts AS r JOIN requested_blocks AS b\n"
-                "    ON r.block_number = b.block_number AND r.block_hash = b.block_hash\n"
+                "    ON r.block_hash = b.block_hash\n"
                 ")",
                 "receipt_stats AS (\n"
                 "  SELECT block_number, SUM(gas_used) AS receipt_gas_used,\n    "

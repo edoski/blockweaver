@@ -153,13 +153,13 @@ def _bigquery_plan_document(plan: Plan) -> dict[str, object]:
         fields.update({"base_fee_per_gas", "gas_used"})
     families: list[dict[str, object]] = [{"family": "blocks", "table": "blocks", "fields": sorted(fields)}]
     if any(feature.bigquery_family == "transactions" for feature in plan.features):
-        families.append({"family": "transactions", "table": "transactions", "fields": ["block_number", "block_timestamp"]})
+        families.append({"family": "transactions", "table": "transactions", "fields": ["block_hash", "block_timestamp"]})
     if any(feature.bigquery_family == "receipts" for feature in plan.features):
         families.append(
             {
                 "family": "receipts",
                 "table": "receipts",
-                "fields": ["block_number", "block_hash", "block_timestamp", "effective_gas_price", "gas_used", "transaction_index"],
+                "fields": ["block_hash", "block_timestamp", "effective_gas_price", "gas_used", "transaction_index"],
                 "reward_percentiles": list(plan.percentiles),
             }
         )

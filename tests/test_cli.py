@@ -1265,7 +1265,7 @@ def test_bigquery_schema_and_cost_fail_before_billable_query(
     primary, verifier = chains
     config = bigquery_config(make_config, tmp_path / "config.toml", primary, verifier, tmp_path / "out", features=("effective_priority_fee_per_gas_p50",))
     unavailable = FakeBigQuery(verifier)
-    unavailable.tables["receipts"] = {"block_number": ("INTEGER", "NULLABLE")}
+    unavailable.tables["receipts"] = {"block_hash": ("STRING", "NULLABLE")}
     monkeypatch.setattr(_sources, "open_bigquery", lambda _project: unavailable)
     assert error(invoke(download_args(config)))["code"] == "SOURCE_FEATURE_UNAVAILABLE"
     assert "dry_run" not in unavailable.calls and "execute" not in unavailable.calls
