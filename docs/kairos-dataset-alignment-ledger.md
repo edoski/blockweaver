@@ -2,13 +2,13 @@
 
 ## Run
 
-- Status: execution authorized on 2026-08-11. Blockweaver Slice 1 may proceed under issue [#2](https://github.com/edoski/blockweaver/issues/2); additive local/research dataset preparation may proceed after Slice 1 is green and its noninterference checks pass; KAIROS integration remains blocked by the active legacy HPO.
+- Status: Blockweaver Slice 1 completed and integrated at `f676eda38bbc66fb1cac012dd7e9baf0be2135a7` on 2026-08-11. Additive local/research dataset preparation may proceed after its noninterference checks pass; KAIROS integration remains blocked by the active legacy HPO.
 - Authoritative spec: this ledger plus the user-approved decisions below.
 - Blockweaver clean execution baseline before this authorization update: `39116c8e65090da6dc181ebbd17f69237167c842`, clean `main`, four plan commits ahead of `origin/main`.
 - KAIROS current baseline: `c0021cb99fa1c28295059a1cc827d6d68afca633`, clean `main`, two focused commits ahead of GitHub and research remotes.
 - Servatus state: execution/lifecycle extraction is complete, independently green, and synchronized at `2ccf749e2a4c3f5ad7ca572ee34fe78e5b1bb78f` (`v0.4.1`). This plan requires no Servatus code, API, release, or data change.
 - KAIROS working tree is clean. The approved `fsevents` allowance is committed at `7cca6fcb`; coherent K-study/HPO figure work is committed at `c0021cb9`; the four discarded epigraph notes are absent.
-- Pre-run worktrees: one normal worktree per repository; no run-owned branch or worktree exists.
+- Pre-run worktrees: one normal worktree per repository. Slice 1 used `/Users/edo/dev/python/blockweaver-dataset-contract` on `codex/dataset-contract-clean-break`; it is eligible for removal after this execution record is committed.
 - Execution checkout policy: use isolated `codex/` branches and worktrees, one writer at a time. Integrate only after each repository slice is green. Never include protected dirt.
 - Current authority: implement and independently review the declared slices; create the required GitHub issue; read PublicNode and BigQuery verification facts; and add the six declared local/research dataset directories after their gate passes. Do not push code, publish releases or PyPI packages, alter jobs or campaigns, regenerate source rows, deploy images, or change unrelated outputs.
 
@@ -54,7 +54,7 @@
 
 ## Slice 1: Blockweaver dataset contract
 
-- Status: authorized under issue #2; ready for an isolated implementation/review loop.
+- Status: complete and integrated at `f676eda38bbc66fb1cac012dd7e9baf0be2135a7`; Standards 0 and Spec 0.
 - Repository: Blockweaver.
 - Planned baseline: the realignment ledger commit; repin before execution.
 - Dependencies: none.
@@ -150,4 +150,15 @@ KAIROS consumes one verified Blockweaver dataset directly from its own `outputs/
 
 ## Execution ledger
 
-GitHub issue [#2](https://github.com/edoski/blockweaver/issues/2) records the authorized Blockweaver contract change. No alignment slice worker, reviewer, branch, worktree, implementation commit, review range, finding, correction, provider call, migration script, output mutation, or deployment exists yet. The completed Servatus work and active HPO are external protected state, not work owned by this run.
+GitHub issue [#2](https://github.com/edoski/blockweaver/issues/2) records the authorized Blockweaver contract change.
+
+- Slice 1 baseline: `38fda515f2f71a104e19461e386176868a1d2d74`.
+- Implementer: `/root/dataset_contract_impl`; worktree `/Users/edo/dev/python/blockweaver-dataset-contract`; branch `codex/dataset-contract-clean-break`.
+- Initial implementation: `ac256693804579f2632da5019cbc4b3bad8882b4` (`feature(dataset): adopt UUID-only artifact contract`).
+- Reviewer: `/root/dataset_contract_review`, with separate Standards and Spec lanes. Initial result: Standards rejected with three findings; Spec green with zero findings.
+- Corrections: `f676eda38bbc66fb1cac012dd7e9baf0be2135a7` (`fix(dataset): close contract review findings`) closed stale API documentation, a coupled private test oracle, and the broad output-format type.
+- Final review range: `38fda515f2f71a104e19461e386176868a1d2d74..f676eda38bbc66fb1cac012dd7e9baf0be2135a7`; Standards 0, Spec 0, overall green.
+- Integration: clean fast-forward to Blockweaver `main`. Main rerun passed 39 tests, Ruff lint/format, Pyright, Vulture, lock check, and diff check. The result has five implementation modules, four runtime dependencies including extras, and exactly 900 test lines.
+- Excluded and untouched: public RPC, live BigQuery, KAIROS, all real outputs, jobs, campaigns, releases, pushes, and PyPI.
+
+No provider call, migration script, output mutation, KAIROS slice, cleanup, or deployment exists yet. The completed Servatus work and active HPO are external protected state, not work owned by this run.
