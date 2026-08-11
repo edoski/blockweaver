@@ -147,7 +147,7 @@ The CLI hands acquisition one trusted request. RPC and BigQuery each hide their 
 
 ## Slice 1B: artifact lifecycle, identity, and durability
 
-- Status: queued; Slice 1A is green and the active-hidden-work inventory gate is clear.
+- Status: implementation committed at `3627b583bb6a99ffe19a1799821d9fb239f9e363`; awaiting independent review.
 - Repository: Blockweaver.
 - Planned baseline: integrated Slice 1A head; repin immediately before execution.
 - Dependencies: Slice 1A.
@@ -319,5 +319,7 @@ GitHub issue [#2](https://github.com/edoski/blockweaver/issues/2) records the au
 - Slice 1A final re-review: Standards 0, Spec 0, overall green. The last fixed range contained only the 19 test deletions. Integration merge: `78893379edfc0d7750104ee810bddd99cc52e695` (`merge(source): integrate consolidation slice 1a`). Main integration passed 53 tests, Ruff lint/format, Pyright, Vulture, lock, CLI, core/optional imports, diff, residue, module, dependency, and clean-status checks. No provider, output, KAIROS, job, campaign, GPU/image, push, release, or PyPI action occurred.
 - Slice 1A cleanup: removed run-owned worktree `/Users/edo/dev/python/blockweaver-slice-1a` and branch `codex/consolidation-slice-1a` after integration. Only the normal `main` worktree remains.
 - Slice 1B hidden-work inventory: the platform config path `/Users/edo/Library/Application Support/blockweaver/config.toml` is absent, and a bounded read-only scan under `/Users/edo/dev/python` found no `.blockweaver-<uuid>` directory. No work state needs completion, compatibility, or abandonment before the clean break.
+- Slice 1B baseline: `b0edf0a5417c8ff6247d58b3db4a8e731e0005b6`. Implementer: `/root/consolidation_1b_impl`; worktree `/Users/edo/dev/python/blockweaver-slice-1b`; branch `codex/consolidation-slice-1b`.
+- Slice 1B implementation head: `3627b583bb6a99ffe19a1799821d9fb239f9e363` (`refactor(artifact): centralize durable lifecycle`). Worker reported 72 passing tests and every static, lock, import, CLI, residue, module, dependency, and diff gate green. Temporary three-chunk measurement reduced fresh/resume checkpoint hashes from `9/10` to `6/6` and semantic reads from `6/7` to `3/3`, while retaining one assembly and one independent strict candidate scan. macOS publication and `F_FULLFSYNC` were exercised; Linux was statically/type checked but not natively run. Orchestrator verified the clean head and nonempty fixed diff; independent review is pending.
 
 No consolidation implementation, provider call, migration script, output mutation, KAIROS slice, cleanup, or deployment exists yet. The completed Servatus work and active HPO are external protected state, not work owned by this run.
