@@ -147,7 +147,7 @@ The CLI hands acquisition one trusted request. RPC and BigQuery each hide their 
 
 ## Slice 1B: artifact lifecycle, identity, and durability
 
-- Status: planned; blocked by Slice 1A green and the active-hidden-work inventory gate.
+- Status: queued; Slice 1A is green and the active-hidden-work inventory gate is clear.
 - Repository: Blockweaver.
 - Planned baseline: integrated Slice 1A head; repin immediately before execution.
 - Dependencies: Slice 1A.
@@ -317,5 +317,7 @@ GitHub issue [#2](https://github.com/edoski/blockweaver/issues/2) records the au
 - Slice 1A first correction review: Spec 0, Standards 1. All original functional findings closed. The remaining P2 finding is a correction-introduced private `Header`/`Header.row` monkeypatch and sentinel assertion in `tests/test_cli.py`; replace it with observable CLI/artifact and no-fee-history evidence rather than testing an internal transition.
 - Slice 1A second correction: `f30e90737e5250ede10087688f5f3421fe8e596f` (`test(source): keep header proof at boundary`). It removes 19 private-oracle test lines while retaining CLI/artifact output and fake-RPC no-fee-history evidence. No product code changed; worker reported 53 passing tests and all gates green. Re-review range is `7e3e009058ffda0cad58ee320b0d199c0614a5ec...f30e90737e5250ede10087688f5f3421fe8e596f`.
 - Slice 1A final re-review: Standards 0, Spec 0, overall green. The last fixed range contained only the 19 test deletions. Integration merge: `78893379edfc0d7750104ee810bddd99cc52e695` (`merge(source): integrate consolidation slice 1a`). Main integration passed 53 tests, Ruff lint/format, Pyright, Vulture, lock, CLI, core/optional imports, diff, residue, module, dependency, and clean-status checks. No provider, output, KAIROS, job, campaign, GPU/image, push, release, or PyPI action occurred.
+- Slice 1A cleanup: removed run-owned worktree `/Users/edo/dev/python/blockweaver-slice-1a` and branch `codex/consolidation-slice-1a` after integration. Only the normal `main` worktree remains.
+- Slice 1B hidden-work inventory: the platform config path `/Users/edo/Library/Application Support/blockweaver/config.toml` is absent, and a bounded read-only scan under `/Users/edo/dev/python` found no `.blockweaver-<uuid>` directory. No work state needs completion, compatibility, or abandonment before the clean break.
 
 No consolidation implementation, provider call, migration script, output mutation, KAIROS slice, cleanup, or deployment exists yet. The completed Servatus work and active HPO are external protected state, not work owned by this run.
