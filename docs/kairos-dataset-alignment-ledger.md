@@ -2,7 +2,7 @@
 
 ## Run
 
-- Status: Blockweaver Slice 1 completed and integrated at `f676eda38bbc66fb1cac012dd7e9baf0be2135a7` on 2026-08-11. The user approved the complete read-only consolidation findings for ledger inclusion. Consolidation Slices 1A–1C are planned but not implemented; dataset preparation and KAIROS integration now wait for all three to be green.
+- Status: Blockweaver Slice 1 completed and integrated at `f676eda38bbc66fb1cac012dd7e9baf0be2135a7` on 2026-08-11. The user authorized the consolidation execution loop on 2026-08-11. Slice 1A is queued from the pinned baseline below; dataset preparation and KAIROS integration wait for Slices 1A–1C to be green.
 - Authoritative spec: this ledger plus the user-approved decisions below.
 - Blockweaver clean execution baseline before this authorization update: `39116c8e65090da6dc181ebbd17f69237167c842`, clean `main`, four plan commits ahead of `origin/main`.
 - KAIROS current baseline: `c0021cb99fa1c28295059a1cc827d6d68afca633`, clean `main`, two focused commits ahead of GitHub and research remotes.
@@ -10,7 +10,7 @@
 - KAIROS working tree is clean. The approved `fsevents` allowance is committed at `7cca6fcb`; coherent K-study/HPO figure work is committed at `c0021cb9`; the four discarded epigraph notes are absent.
 - Pre-run worktrees: one normal worktree per repository. Slice 1 used `/Users/edo/dev/python/blockweaver-dataset-contract` on `codex/dataset-contract-clean-break`; both the worktree and its integrated branch were removed after the execution record was committed.
 - Execution checkout policy: use isolated `codex/` branches and worktrees, one writer at a time. Integrate only after each repository slice is green. Never include protected dirt.
-- Current authority: the new consolidation work is ledger/design work only. Product implementation requires its own issue and an explicit execution start. Previously granted PublicNode/BigQuery verification and additive dataset-write authority remains valid but is deferred until Slices 1A–1C are green. Do not push code, publish releases or PyPI packages, alter jobs or campaigns, regenerate source rows, deploy images, or change unrelated outputs.
+- Current authority: implement and independently review consolidation Slices 1A–1C through the declared loop. Previously granted PublicNode/BigQuery verification and additive dataset-write authority remains valid but is deferred until all three slices are green. Do not push code, publish releases or PyPI packages, alter jobs or campaigns, regenerate source rows, deploy images, or change unrelated outputs.
 
 ## Confirmed decisions
 
@@ -62,7 +62,7 @@
 ## Gates before implementation
 
 - Blockweaver `CONTRIBUTING.md` requires a GitHub issue before broadening the CLI or durable format. The user authorized issue creation, and [issue #2](https://github.com/edoski/blockweaver/issues/2) is the execution issue for Slice 1.
-- Open one new consolidation issue before implementing Slices 1A–1C. Issue #2 remains the completed UUID/unversioned-artifact issue; it does not silently expand to cover this refactor and its deliberate machine-interface changes.
+- Gate satisfied by [issue #3](https://github.com/edoski/blockweaver/issues/3), opened before implementation. Issue #2 remains the completed UUID/unversioned-artifact issue; it does not silently expand to cover this refactor and its deliberate machine-interface changes.
 - Active HPO `dfd33e91-702e-46c5-8cb1-3c510af4c048` remains under the old image and `jobs.tsv` lifecycle. Never touch its jobs, local/remote bundle, corpora, logs, scratch, image, or automation authority. It must close normally before the KAIROS loader cutover or first Servatus K-study launch.
 - Pin fresh baselines and status immediately before every slice.
 - Do not begin a later slice until the current implementation has a committed head and a distinct reviewer returns zero Standards and zero Spec findings.
@@ -104,7 +104,7 @@ Every newly downloaded dataset has one durable UUID address independent of chain
 
 ## Slice 1A: trusted request and deep source acquisition
 
-- Status: planned; requires the consolidation issue and explicit implementation start.
+- Status: queued; issue and execution gates satisfied.
 - Repository: Blockweaver.
 - Planned baseline: current green `main`; repin immediately before execution.
 - Dependencies: completed Slice 1.
@@ -308,5 +308,6 @@ GitHub issue [#2](https://github.com/edoski/blockweaver/issues/2) records the au
 - Specialist lanes: `/root/checkpoint_correctness_research` produced the durable-state/trust model and found six publication/recovery correctness gaps; `/root/validation_platform_research` mapped validation ownership and platform/client cleanup; `/root/consolidation_slice_planner` resolved ordering and review gates.
 - Selected result: retain five modules and use three ordered slices. Reject a four-module acquisition mega-module, public plugins, an exposed caller-driven artifact transaction, a filesystem adapter, compatibility code, and partial Windows writers.
 - The architecture report was generated outside the repository as an ephemeral research artifact. No product, provider, output, KAIROS, job, campaign, release, push, or PyPI mutation occurred during research.
+- Consolidation execution issue: [#3](https://github.com/edoski/blockweaver/issues/3). Pre-run checkout: clean `main` at `edea482ef777a4a5005928e5483fd170d28cdf69`, nine commits ahead of `origin/main`, with only the normal `/Users/edo/dev/python/blockweaver` worktree and no run-owned branches.
 
 No consolidation implementation, provider call, migration script, output mutation, KAIROS slice, cleanup, or deployment exists yet. The completed Servatus work and active HPO are external protected state, not work owned by this run.
