@@ -190,7 +190,7 @@ Filesystem safety has one locality and one small interface. Every durable state 
 
 ## Slice 1C: client and platform truth
 
-- Status: implementation committed at `d4096944b06e44d1680bbff754f09b89700f2a48`; awaiting independent review.
+- Status: initial implementation `d4096944b06e44d1680bbff754f09b89700f2a48` rejected by independent review; focused test correction pending.
 - Repository: Blockweaver.
 - Planned baseline: integrated Slice 1B head; repin immediately before execution.
 - Dependencies: Slice 1B.
@@ -329,5 +329,6 @@ GitHub issue [#2](https://github.com/edoski/blockweaver/issues/2) records the au
 - Slice 1B cleanup: removed run-owned worktree `/Users/edo/dev/python/blockweaver-slice-1b` and branch `codex/consolidation-slice-1b` after integration. Only the normal `main` worktree remains.
 - Slice 1C baseline: `b792faebeba76b78f92c5dde73d1d9b387695bcb`. Implementer: `/root/consolidation_1c_impl`; worktree `/Users/edo/dev/python/blockweaver-slice-1c`; branch `codex/consolidation-slice-1c`.
 - Slice 1C implementation head: `d4096944b06e44d1680bbff754f09b89700f2a48` (`refactor(client): align CLI and platform truth`). Worker reported 90 passing tests and every static, lock, diff, CLI, import, residue, metadata, module, and dependency gate green. Inert version fields are absent; verify combinations validate before artifact/network access; discovery/error vocabulary is unified; generated TOML is authoritative; README duplication is shortened; Linux/macOS support is declared; false Windows configuration and proven dead arguments are removed. Orchestrator verified the clean head and nonempty fixed diff; independent review is pending.
+- Slice 1C reviewer: `/root/consolidation_1c_review`, with parallel Standards and Spec lanes over `b792faebeba76b78f92c5dde73d1d9b387695bcb...d4096944b06e44d1680bbff754f09b89700f2a48`. Initial result: Standards 0, Spec 1. The sole P3 finding is partial `chains` success-envelope coverage: the product payload is correct, but the test extracts only the nested list and would not reject a reintroduced top-level field. Required correction: compare the complete document with the exact expected envelope.
 
 No consolidation implementation, provider call, migration script, output mutation, KAIROS slice, cleanup, or deployment exists yet. The completed Servatus work and active HPO are external protected state, not work owned by this run.
