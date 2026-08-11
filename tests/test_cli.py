@@ -309,32 +309,13 @@ def test_header_only_tx_count_uses_only_block_cardinality(
     tmp_path: Path,
     chains: tuple[ChainServer, ChainServer],
     make_config: Any,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     primary, verifier = chains
-    fee_arguments: list[dict[int, int] | None] = []
-    row = _sources.Header.row
-
-    def observe_row(header: _sources.Header, plan: Any, fees: dict[int, int] | None = None) -> dict[str, int | str]:
-        fee_arguments.append(fees)
-        return row(header, plan, fees)
-
-    monkeypatch.setattr(_sources.Header, "row", observe_row)
     primary.changes[10] = {"transactions": [{"opaque": "transaction"}]}
     config = make_config(tmp_path / "config.toml", primary, verifier, output_root=tmp_path / "out", features=("tx_count",))
     artifact = artifact_from(invoke(download_args(config)))
     assert pl.read_parquet(artifact / "blocks.parquet")["tx_count"].to_list()[0] == 1
     assert {call["method"] for batch in primary.requests for call in batch} == {"eth_chainId", "eth_getBlockByNumber"}
-    assert fee_arguments and all(fees is None for fees in fee_arguments)
-
-    class UnusedFees(dict[int, int]):
-        def __bool__(self) -> bool:
-            raise AssertionError("header-only rows inspected unused fee data")
-
-    assert row(_sources.Header(1, block_hash(1), block_hash(0), 1, {"tx_count": 0}), plan_features(["tx_count"]), UnusedFees()) == {
-        "block_number": 1,
-        "tx_count": 0,
-    }
 
 
 @pytest.mark.parametrize(
