@@ -2,15 +2,15 @@
 
 ## Run
 
-- Status: Blockweaver Slice 1 completed and integrated at `f676eda38bbc66fb1cac012dd7e9baf0be2135a7` on 2026-08-11. Additive local/research dataset preparation may proceed after its noninterference checks pass; KAIROS integration remains blocked by the active legacy HPO.
+- Status: Blockweaver Slice 1 completed and integrated at `f676eda38bbc66fb1cac012dd7e9baf0be2135a7` on 2026-08-11. The user approved the complete read-only consolidation findings for ledger inclusion. Consolidation Slices 1A–1C are planned but not implemented; dataset preparation and KAIROS integration now wait for all three to be green.
 - Authoritative spec: this ledger plus the user-approved decisions below.
 - Blockweaver clean execution baseline before this authorization update: `39116c8e65090da6dc181ebbd17f69237167c842`, clean `main`, four plan commits ahead of `origin/main`.
 - KAIROS current baseline: `c0021cb99fa1c28295059a1cc827d6d68afca633`, clean `main`, two focused commits ahead of GitHub and research remotes.
 - Servatus state: execution/lifecycle extraction is complete, independently green, and synchronized at `2ccf749e2a4c3f5ad7ca572ee34fe78e5b1bb78f` (`v0.4.1`). This plan requires no Servatus code, API, release, or data change.
 - KAIROS working tree is clean. The approved `fsevents` allowance is committed at `7cca6fcb`; coherent K-study/HPO figure work is committed at `c0021cb9`; the four discarded epigraph notes are absent.
-- Pre-run worktrees: one normal worktree per repository. Slice 1 used `/Users/edo/dev/python/blockweaver-dataset-contract` on `codex/dataset-contract-clean-break`; it is eligible for removal after this execution record is committed.
+- Pre-run worktrees: one normal worktree per repository. Slice 1 used `/Users/edo/dev/python/blockweaver-dataset-contract` on `codex/dataset-contract-clean-break`; both the worktree and its integrated branch were removed after the execution record was committed.
 - Execution checkout policy: use isolated `codex/` branches and worktrees, one writer at a time. Integrate only after each repository slice is green. Never include protected dirt.
-- Current authority: implement and independently review the declared slices; create the required GitHub issue; read PublicNode and BigQuery verification facts; and add the six declared local/research dataset directories after their gate passes. Do not push code, publish releases or PyPI packages, alter jobs or campaigns, regenerate source rows, deploy images, or change unrelated outputs.
+- Current authority: the new consolidation work is ledger/design work only. Product implementation requires its own issue and an explicit execution start. Previously granted PublicNode/BigQuery verification and additive dataset-write authority remains valid but is deferred until Slices 1A–1C are green. Do not push code, publish releases or PyPI packages, alter jobs or campaigns, regenerate source rows, deploy images, or change unrelated outputs.
 
 ## Confirmed decisions
 
@@ -30,6 +30,10 @@
 - File schema, row count, range, timestamps, output digest, target hash, finalized anchor, and verification samples are generated from the files and provider verification during migration.
 - Record Ethereum and Polygon acquisition as PublicNode RPC and Avalanche acquisition as BigQuery through `bigquery-public-data.goog_blockchain_avalanche_contract_chain_us`. Do not add an evidence-status distinction. No endpoint URL, credential, billing project, or secret enters the manifest.
 - Use one unversioned clean-break durable contract for UUID-only addressing and migrated source metadata. Remove `manifest_version` and `dataset_version`; the loader accepts only the exact current shape and retains no legacy branch.
+- Remove every arbitrary constant `"version": 1` tag from private work state and public machine envelopes during the consolidation clean break. Keep the package semantic version, manifest `tool_version`, UUID4 validation, and JSON-RPC's required `"jsonrpc": "2.0"` protocol member because those express release provenance, identifier facts, or external protocol framing rather than Blockweaver contract branching.
+- Preserve the five command names and the public `BlockweaverError`, `Dataset`, and `open_dataset` symbols. Make `Dataset` loader-controlled so ordinary direct construction cannot forge a value described as strictly validated; keep its documented immutable properties and runtime type identity.
+- Keep the product closed to exactly RPC and BigQuery. Do not add source plugins, filesystem ports, configuration bags, or speculative extension machinery.
+- Treat Linux and macOS as the supported writer platforms; Python documents [`fcntl`](https://docs.python.org/3/library/fcntl.html) as Unix-only, and current CI covers those two systems. Remove false Windows writer/configuration branches and add no platform dependency. Genuine Windows durability is a separate future feature requiring locking, directory-sync, atomic publication, and Windows CI; do not imply it here.
 - Existing local and research `outputs/corpora/` directories are not deleted by migration. Their later cleanup is authorized only after the active legacy HPO and every old-image consumer have closed, all six new dataset directories pass acceptance, KAIROS's new loader is proven, and a fresh read-only dependency inventory finds no remaining consumer. If any condition is uncertain, defer deletion.
 - The same additive dataset conversion is required under the research storage root before any new KAIROS image uses the Blockweaver loader. Old local and research `corpora/` directories remain available to the active legacy image.
 - Do not run a GPU smoke for this alignment. Repository tests and, if separately authorized later, `apptainer test` are sufficient image checks.
@@ -40,16 +44,29 @@
 - Add a new Blockweaver dataset-authority ADR that supersedes only ADR 0006's Corpus clause. ADR 0006 remains authoritative for Study, artifact, and evaluation objects; ADR 0008 and the completed Servatus boundary remain unchanged.
 - `BlockFrame` becomes an eight-column value. `CorpusDefinition` remains because chain identity and range affect scientific feature construction.
 - `STORAGE_ROOT` remains KAIROS's single root. Corpus loading resolves `STORAGE_ROOT/datasets/<corpus_id>`; no second environment variable or repository-specific absolute path is introduced.
-- KAIROS takes a runtime dependency on the compatible Blockweaver release and uses only its public artifact API.
+- KAIROS takes a runtime dependency on the compatible Blockweaver release and uses only its public artifact interface.
 - KAIROS should lose roughly 15–30 production lines by deleting `CorpusRequest`, three corpus address helpers, JSON parsing, and row `chain_id`, net of the thin dataset-to-`BlockFrame` mapping. The main simplification is one metadata authority, not a large LOC reduction.
-- Blockweaver should remain near LOC-neutral: UUID addressing and a public reader replace existing private/path logic rather than add another workflow.
+- Slice 1 remained near LOC-neutral. The consolidation should remove caller knowledge and repeated work, with a directional combined target of 100–220 production lines and 40–100 test lines. These are deletion guides, not acceptance quotas; architecture and preserved behavior decide acceptance.
+
+## Consolidation design
+
+- External flow remains: CLI values and TOML resolve to one trusted request; one of two closed source adapters acquires normalized chunks and proves them; one deep artifact-work module recovers, assembles, validates, and publishes; `open_dataset` independently validates raw artifact bytes.
+- `_contract.py` owns raw configuration, feature/range values, and a closed source-complete resolved request. `_sources.py` owns the RPC and BigQuery adapters and their external failures. `_build.py` owns source-neutral download/verification coordination. `_corpus.py` owns artifact identity, strict loading, resumable work, checkpoints, durability, and publication. `cli.py` owns Typer translation, machine I/O, redaction, and signal behavior. Remain at five implementation modules.
+- The source seam is real because RPC and BigQuery vary. Replace the reflective 15-field `SourceDefinition`, dotted attribute paths, runner strings, runtime-requirement strings, `_DOWNLOADERS`, and nullable impossible request states with closed typed RPC/BigQuery request variants and two concrete adapters. Do not introduce a public protocol or registry.
+- The artifact-work module exposes one narrow one-shot workflow to coordination; it does not expose a caller-driven transaction whose methods can be misordered. Hidden names, locks, binding, checkpoints, candidate states, receipts, fsync order, atomic rename, and cleanup remain implementation details.
+- One normalized artifact identity/state derives private binding, manifest/receipt projections, anchor, target, plan, fingerprints, and verification views. The strict reader remains independently byte-driven and must not trust producer objects.
+- RPC and BigQuery are true-external dependencies with production and fake adapters. Filesystem work uses real temporary directories and has no abstract adapter. Polars and standard-library computation remain direct in-process dependencies.
+- Validate strict raw TOML/CLI/environment inputs once after resolution. Continue to validate every raw provider response, recovered checkpoint, candidate, published artifact, and publication transition. Do not delete checks merely because similar facts cross different trust seams.
+- Split implementation into three slices despite shared files: source/provider behavior, filesystem/durable correctness, and public client/platform truth are distinct failure domains. Their final ownership is pinned here to avoid temporary interfaces. Reject the four-module mega-module alternative because it would combine external acquisition and use-case coordination into one roughly 900-line module.
 
 ## Gates before implementation
 
 - Blockweaver `CONTRIBUTING.md` requires a GitHub issue before broadening the CLI or durable format. The user authorized issue creation, and [issue #2](https://github.com/edoski/blockweaver/issues/2) is the execution issue for Slice 1.
+- Open one new consolidation issue before implementing Slices 1A–1C. Issue #2 remains the completed UUID/unversioned-artifact issue; it does not silently expand to cover this refactor and its deliberate machine-interface changes.
 - Active HPO `dfd33e91-702e-46c5-8cb1-3c510af4c048` remains under the old image and `jobs.tsv` lifecycle. Never touch its jobs, local/remote bundle, corpora, logs, scratch, image, or automation authority. It must close normally before the KAIROS loader cutover or first Servatus K-study launch.
 - Pin fresh baselines and status immediately before every slice.
 - Do not begin a later slice until the current implementation has a committed head and a distinct reviewer returns zero Standards and zero Spec findings.
+- Before Slice 1B, inventory local work roots read-only for active `.blockweaver-<uuid>` state. Finish active work on the current binary or obtain explicit abandonment authority; the clean break adds no private-work compatibility reader.
 - Public RPC and BigQuery reads are authorized only for the declared migration verification after Slice 1 is green. Output writes are authorized only for the six additive dataset destinations after the preparation gate passes. Releases, pushes, PyPI, scheduler changes, and campaign actions remain unauthorized.
 
 ## Slice 1: Blockweaver dataset contract
@@ -85,12 +102,136 @@ Every newly downloaded dataset has one durable UUID address independent of chain
 - Full Pytest, Ruff lint/format, Pyright, Vulture, lock check, `git diff --check`, CLI smoke, residue search, module/dependency/test-line limits.
 - Explicitly not run: public RPC, live BigQuery, KAIROS, real outputs.
 
+## Slice 1A: trusted request and deep source acquisition
+
+- Status: planned; requires the consolidation issue and explicit implementation start.
+- Repository: Blockweaver.
+- Planned baseline: current green `main`; repin immediately before execution.
+- Dependencies: completed Slice 1.
+
+### Scope
+
+- Resolve raw CLI overrides, TOML defaults, environment values, range, features, output, and source selection into one trusted source-complete request. Invalid source runtime combinations must be unrepresentable after this seam.
+- Replace `SourceDefinition`, reflective field names and paths, runtime-requirement strings, runner strings, `_DOWNLOADERS`, and nullable `primary`/`bigquery` states with a closed RPC-or-BigQuery request union and two concrete adapters.
+- Keep discovery, manifest-source facts, acquisition-plan facts, and persisted verification-fact parsing source-aware but dependency-free. Opening a local BigQuery-origin dataset must not import Google libraries, read credentials, or require configuration.
+- Make `_build.py` source-neutral: it coordinates one normalized chunk stream and proof result without source switches or source-specific exception blocks.
+- Give `_sources.py` locality for external acquisition: RPC/BigQuery initialization, range resolution, source-specific planning, normalized chunks, target/sample/ancestry/finality proof, and recovered-candidate revalidation.
+- Allow a BigQuery-only configuration without an unused primary provider; its verifier remains mandatory. RPC continues to require an independent primary and verifier.
+- Classify JSON-RPC errors using numeric codes from [JSON-RPC 2.0](https://www.jsonrpc.org/specification) and [EIP-1474](https://eips.ethereum.org/EIPS/eip-1474): known invalid/unsupported errors fail immediately; explicit limit errors split multi-call batches and fail singletons; known transient and unknown server errors remain bounded retries. Never expose provider error text. Preserve original request-ID order through retries and output, concurrency, sibling cancellation, validated and capped `Retry-After`, bounded backoff, and jitter for genuinely transient failures.
+- Make acquisition feature-minimal: do not create fee-history work or empty per-block fee dictionaries without selected percentiles; preserve one coalesced fee-history call when selected; require the transaction list for `tx_count` cardinality without regex-validating unused transaction hashes; keep every integrity/hash/domain fact actually consumed.
+- Remove repeated provider/project/source validation after the trusted request is constructed. Raw TOML literals, environment values, and direct CLI overrides still validate at their real input seam.
+
+### Non-goals
+
+- Artifact lifecycle or manifest shape changes; public machine-envelope cleanup; platform changes; plugins; a third source; new dependencies; live providers; outputs; KAIROS; release or push.
+
+### Protected behavior
+
+- Exact RPC/BigQuery manifest-source and acquisition-plan documents; lazy optional Google import; no arbitrary SQL; BigQuery schema modes, dry run, byte cap, fork-safe receipt join, bounded pages, and verifier RPC.
+- RPC provider independence; strict JSON-RPC IDs/shapes/quantities; chain identity; exact time edges and ranges; target, deterministic samples, ancestry, finality, and full verification.
+- Secret exclusion/redaction; invalid configuration, feature, range, or source options failing before network access; same five commands and artifact bytes.
+
+### Expected outcome
+
+The CLI hands acquisition one trusted request. RPC and BigQuery each hide their complete external behavior behind the same small closed seam, while `_build.py` contains no reflective dispatch, impossible source state, or source-specific workflow.
+
+### Checks
+
+- Compact request-resolution matrix for defaults/overrides, RPC/BigQuery completeness, source-inapplicable options, BigQuery-only configuration, environment validation, independence, and redaction.
+- Fake RPC tests for fatal/transient/limit/unknown error dispositions, bounded attempts, split behavior, pending-only retries, stable output order, concurrency/cancellation, `Retry-After`, and no provider-message leakage.
+- Prove header-only work emits no fee-history call or allocation path; selected percentiles still coalesce; `tx_count` requests no extra RPC method.
+- Fake BigQuery proves only required fields/tables, every schema/dry-run/cost gate before execution, bounded pages, optional dependency behavior, and RPC truth proof.
+- RPC/BigQuery logical artifact parity and unchanged canonical manifests for both formats.
+- Full Pytest, Ruff lint/format, Pyright, Vulture, lock and diff checks, optional BigQuery import, CLI smoke, source/registry residue search, five modules, no new dependency, at most 900 test lines.
+- Explicitly not run: public RPC, live/billable BigQuery, ADC, real outputs, KAIROS, push, release.
+
+## Slice 1B: artifact lifecycle, identity, and durability
+
+- Status: planned; blocked by Slice 1A green and the active-hidden-work inventory gate.
+- Repository: Blockweaver.
+- Planned baseline: integrated Slice 1A head; repin immediately before execution.
+- Dependencies: Slice 1A.
+
+### Scope
+
+- Deepen `_corpus.py` so one narrow artifact-work interface owns exclusive locking, binding, recovery classification, checkpoint admission/write, candidate assembly, receipt persistence, fsync order, atomic no-replace publication, and cleanup. `_build.py` must not know hidden filenames, checkpoint paths, ready states, or publication ordering.
+- Retain one normalized validated artifact state and identity. Derive binding comparison, anchor, target, feature plan, source facts, receipt fields, and pair fingerprints without repeated manifest decoding or manually synchronized field maps.
+- Keep `Dataset` exported, flat, immutable, and usable for normal runtime type checks, but make ordinary direct construction fail; `open_dataset(path)` is the only supported constructor and preserves every documented property.
+- Carry a bounded metadata-only validated checkpoint set. Admit each recovered checkpoint with one digest plus semantic/proof/prefix/link validation, re-seal it immediately before assembly after long work, assemble once, and retain one independent strict final-candidate scan. Do not retain full frames or all headers in memory.
+- Bind provider proof to published bytes: retain externally verified sample facts, strict-open the assembled candidate, and require candidate samples to equal those facts before commit.
+- Capture normalized manifest/data fingerprints during strict-open. After any RPC wait during verification or staged-candidate recovery, rehash and compare before success or publication.
+- Always live-revalidate an unpublished staged candidate before rename, even when a valid receipt exists. Treat a corrupt or mismatching receipt as absent, revalidate the candidate, and recreate the per-attempt receipt; binding mismatches remain fatal.
+- Recover a valid committed destination after partial hidden-work cleanup even when binding/chunks are incomplete. Keep the unavoidable terminal case where publication succeeded but stdout was lost; the pre-emitted UUID remains the recovery handle.
+- Correct cross-directory durability: after rename, sync the destination parent and then the hidden source parent; after hidden cleanup, sync the root. Before publication, use `F_FULLFSYNC` for final artifact files on macOS as documented by [Apple's `fsync(2)` manual](https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/fsync.2.html), and retain `fsync` on Linux. Keep fail-closed Darwin/Linux no-replace primitives and do not add check-then-rename fallbacks.
+- Remove private binding/receipt version tags only after the pre-slice inventory proves no active hidden work needs them. No compatibility parser is added.
+
+### Non-goals
+
+- Changing the published manifest or data schema; public machine-envelope cleanup; source redesign; filesystem abstraction; network-filesystem guarantees; Windows writers; live providers; real outputs; KAIROS; release or push.
+
+### Protected behavior
+
+- Exact UUID/unversioned two-file artifact; strict independent byte-driven loader; canonical JSON; exact file set/schema/order/range/domains; output size/digest; target/anchor/verification facts.
+- Exact resume binding; deterministic complete checkpoint prefix; proof/export agreement; corruption and ancestry detection; bounded memory; interruption recovery; no-clobber races; redaction and stable failure codes.
+- Producer construction never replaces independent final validation. The cooperative lock does not claim protection from a privileged or noncooperating same-owner process.
+
+### Expected outcome
+
+Filesystem safety has one locality and one small interface. Every durable state is recoverable or safely terminal, provider proof is tied to the candidate bytes actually published, and redundant full checkpoint/artifact reads disappear without merging distinct trust transitions.
+
+### Checks
+
+- State-table tests through the deep interface for empty, incomplete setup, checkpointing, provisional candidate, receipt-only, staged with/without receipt, committed-dirty, and committed states.
+- Preserve corruption, gap, duplicate, proof/export, rebinding, ancestry, interruption, racing-destination, ready recovery, published recovery, and RPC/BigQuery recovery parity outcomes.
+- Add focused outcomes for partial hidden cleanup, staged live revalidation, corrupt-receipt regeneration, verified-sample/candidate equality, post-network fingerprint sealing, both-parent/root sync ordering, and unsupported publication capability failing before destination mutation.
+- Direct `Dataset(...)` fails; `open_dataset` retains every documented property and rejects malformed JSON, UUID/path mismatch, extra files, digest/schema/range/domain/target/verification corruption.
+- Record one temporary before/after multi-chunk fresh/resume hash/read measurement. Target: fresh and resumed checkpoints each receive at most admission plus preassembly digest passes, one assembly scan, and one independent candidate scan. Do not retain a brittle call-count or architecture-transition test.
+- Full repository gates and limits from Slice 1A, plus filesystem residue checks. Explicitly no NFS/SMB durability claim, Windows writer claim, provider call, output mutation, KAIROS, push, or release.
+
+## Slice 1C: client and platform truth
+
+- Status: planned; blocked by Slice 1B green.
+- Repository: Blockweaver.
+- Planned baseline: integrated Slice 1B head; repin immediately before execution.
+- Dependencies: Slice 1B.
+
+### Scope
+
+- Remove every arbitrary constant `"version": 1` field from `init`, `chains`, `features`, download/verify receipts, and any remaining private work document. Keep `operation`, package semantic version, manifest `tool_version`, UUID4 validation, and the required JSON-RPC 2.0 protocol member.
+- Make the verify interface exact: local verification accepts no RPC-only tuning; `--rpc-url` selects direct RPC; `--provider [--config]` selects a profile; `--rpc-url` may override a named profile; `--full-rpc`, batch size, concurrency, and timeout require a provider or URL; explicit `--config` requires `--provider`. Reject invalid combinations before reading the dataset or contacting a provider.
+- Normalize discovery vocabulary once: chains expose `available_sources`; the features document exposes top-level `available_sources`; each feature exposes `supported_sources`; remove repeated per-feature configured-source arrays.
+- Normalize the optional-dependency error code to `SOURCE_DEPENDENCY_MISSING` and convert unknown configured default sources to `CONFIG_INVALID` at the configuration seam.
+- Keep the generated TOML as the single full example. Shorten README duplication to the `init` workflow, precedence, and a small user-specific override excerpt; add no resource loader or synchronization test.
+- Declare Linux and macOS writer support in package metadata and documentation. Remove misleading Windows configuration/publication branches. Add no Windows dependency or mocked support; a real Windows writer requires a separate issue, locking/publication design, and Windows CI.
+- Remove remaining proven dead machinery after its owning deep module exists: `format_utc(..., filename=...)`, `_validate_eager_frame(..., resolved)`, `plan_features_for_header`, a still-trivial `dataset_path`, and the one-use receipt-operation parameter. Remove stale names and residue. Do not expose a helper merely to deduplicate a few filesystem lines.
+
+### Non-goals
+
+- New commands/options/providers/formats/dependencies; manifest or dataset-property changes; Windows implementation; compatibility envelopes; live providers; outputs; KAIROS; release or push.
+
+### Protected behavior
+
+- All previously valid meaningful download/verify operations; JSON Lines stderr; stable machine error `code` and `message`; secret redaction; mode-0600 non-overwriting config initialization.
+- Exact artifact and manifest; source parity; strict loader; provider and publication safety from Slices 1A–1B.
+
+### Expected outcome
+
+The client-facing interface says exactly what Blockweaver supports: no inert version tags, no ignored options, one discovery vocabulary, one configuration example, consistent error codes, and truthful Linux/macOS writer support.
+
+### Checks
+
+- Exact success/error payloads for all five commands prove version tags absent, operation discriminators retained where useful, discovery names consistent, and secrets absent.
+- Table-driven verify option matrix proves invalid combinations fail before disk/network and every supported invocation remains valid.
+- BigQuery-only and RPC configurations remain strict; optional-extra error is uppercase; unknown configured sources are configuration failures.
+- `blockweaver init` creates loadable authoritative TOML; README contains no full duplicate; platform metadata/docs/workflow agree and false Windows branches are absent.
+- Full repository gates and limits. No transition tests for old machine envelopes; no Windows mock; no provider/output/KAIROS/push/release action.
+
 ## Slice 2: KAIROS direct dataset consumption
 
-- Status: pending; blocked by active legacy HPO closure, Slice 1 release/pin, and additive local/research dataset preparation.
+- Status: pending; blocked by active legacy HPO closure, Slices 1A–1C, the final Blockweaver release/pin, and additive local/research dataset preparation.
 - Repository: KAIROS.
 - Planned baseline: `c0021cb99fa1c28295059a1cc827d6d68afca633`; repin after the active scientific work settles and preserve every later user-owned commit.
-- Dependencies: Blockweaver Slice 1 green with a released or otherwise reproducibly pinned package artifact; Servatus remains pinned at its accepted version and requires no change.
+- Dependencies: Blockweaver Slices 1 and 1A–1C green with a released or otherwise reproducibly pinned package artifact; Servatus remains pinned at its accepted version and requires no change.
 
 ### Scope
 
@@ -122,9 +263,9 @@ KAIROS consumes one verified Blockweaver dataset directly from its own `outputs/
 
 ## Externally authorized dataset preparation gate
 
-- Status: authorized after Blockweaver Slice 1 is green and the preconditions below pass.
-- Timing: after Blockweaver Slice 1 is green and before KAIROS Slice 2 is integrated or deployed. The active legacy HPO may continue because this gate is strictly additive and leaves every old corpus path untouched.
-- Preconditions: compatible Blockweaver artifact available; exact local and research source/destination paths resolved read-only; sufficient space on both filesystems; current HPO state checked; no destination collision; no write to a legacy path. The user authorized local/research dataset writes and PublicNode/BigQuery verification reads subject to these checks.
+- Status: authorized but deliberately deferred until Blockweaver Slices 1A–1C are green and the preconditions below pass.
+- Timing: after the final consolidated Blockweaver head is green and reproducibly pinned, and before KAIROS Slice 2 is integrated or deployed. The active legacy HPO may continue because this gate is strictly additive and leaves every old corpus path untouched.
+- Preconditions: compatible final consolidated Blockweaver artifact available; exact local and research source/destination paths resolved read-only; sufficient space on both filesystems; current HPO state checked; no destination collision; no write to a legacy path. The user authorized local/research dataset writes and PublicNode/BigQuery verification reads subject to these checks.
 - Migration implementation: a temporary script in a temporary git repository. Exercise it against synthetic fixtures and copies, commit it only in that temporary repository, review its fixed diff through the same independent Standards/Spec gate, record its commit and SHA-256, then delete the repository and script after successful migration. Do not commit migration code to Blockweaver or KAIROS and do not rely on conversational memory for destructive logic.
 - Local inputs: the three existing `outputs/corpora/<uuid>/blocks.parquet` files. Research inputs: the matching canonical corpora under the configured research storage root. All old directories remain untouched.
 - Destinations: matching local and research `datasets/<uuid>/` directories, published without replacement. Prefer one verified conversion plus checksum-proven transfer when source files agree; never perform two uncorrelated conversions under one UUID.
@@ -161,4 +302,11 @@ GitHub issue [#2](https://github.com/edoski/blockweaver/issues/2) records the au
 - Integration: clean fast-forward to Blockweaver `main`. Main rerun passed 39 tests, Ruff lint/format, Pyright, Vulture, lock check, and diff check. The result has five implementation modules, four runtime dependencies including extras, and exactly 900 test lines.
 - Excluded and untouched: public RPC, live BigQuery, KAIROS, all real outputs, jobs, campaigns, releases, pushes, and PyPI.
 
-No provider call, migration script, output mutation, KAIROS slice, cleanup, or deployment exists yet. The completed Servatus work and active HPO are external protected state, not work owned by this run.
+- Consolidation design baseline: clean `cd8018212388e4549ed994dc90877c95a6eeda3c`, with 2,983 production lines, five implementation modules, four runtime dependencies including the optional extra, and exactly 900 test lines.
+- Read-only architecture evidence: `/root/architecture_structure_audit` and `/root/api_validation_audit`; both confirmed the external interface is already small and the cleanup belongs behind it.
+- Design-It-Twice lanes: `/root/consolidation_min_interface`, `/root/consolidation_default_caller`, `/root/consolidation_flexible_sources`, and `/root/consolidation_safety_ports`. They compared four-module, caller-first, source-flexible, and safety-first seam placements.
+- Specialist lanes: `/root/checkpoint_correctness_research` produced the durable-state/trust model and found six publication/recovery correctness gaps; `/root/validation_platform_research` mapped validation ownership and platform/client cleanup; `/root/consolidation_slice_planner` resolved ordering and review gates.
+- Selected result: retain five modules and use three ordered slices. Reject a four-module acquisition mega-module, public plugins, an exposed caller-driven artifact transaction, a filesystem adapter, compatibility code, and partial Windows writers.
+- The architecture report was generated outside the repository as an ephemeral research artifact. No product, provider, output, KAIROS, job, campaign, release, push, or PyPI mutation occurred during research.
+
+No consolidation implementation, provider call, migration script, output mutation, KAIROS slice, cleanup, or deployment exists yet. The completed Servatus work and active HPO are external protected state, not work owned by this run.
