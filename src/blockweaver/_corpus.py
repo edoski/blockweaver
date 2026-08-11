@@ -370,7 +370,7 @@ def _locked_work(identity: ArtifactIdentity) -> Iterator[WorkLock]:
         except FileExistsError:
             recoverable = True
         try:
-            descriptor = os.open(hidden, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+            descriptor = os.open(hidden, os.O_RDONLY | os.O_DIRECTORY)
         except FileNotFoundError:
             continue
         try:
