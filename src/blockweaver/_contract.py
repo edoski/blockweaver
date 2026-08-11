@@ -750,9 +750,9 @@ class Header:
 
     def row(self, plan: Plan, fees: dict[int, int] | None = None) -> dict[str, Value]:
         result: dict[str, Value] = {"block_number": self.block_number}
-        fees = fees or {}
         for feature in plan.features:
             if feature.percentile is not None:
+                assert fees is not None
                 result[feature.name] = fees[feature.percentile]
             elif feature.name == "block_hash":
                 result[feature.name] = self.block_hash

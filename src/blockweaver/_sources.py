@@ -12,7 +12,7 @@ from email.utils import parsedate_to_datetime
 from importlib import import_module
 from math import isfinite
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Protocol, TypeVar
 from uuid import UUID
 
 import aiohttp
@@ -43,6 +43,8 @@ _LIMIT_RPC = -32005
 CHUNK_SIZE = 1024
 Validator = Callable[[Any], Any]
 BigQuerySchema = dict[str, tuple[str, str]]
+_Left = TypeVar("_Left")
+_Right = TypeVar("_Right")
 
 
 @dataclass(frozen=True, slots=True)
@@ -50,6 +52,19 @@ class BigQueryPlan:
     sql: str
     table_fields: dict[str, dict[str, str]]
     result_schema: dict[str, str]
+
+
+async def _paired(left: Awaitable[_Left], right: Awaitable[_Right]) -> tuple[_Left, _Right]:
+    left_task = asyncio.ensure_future(left)
+    right_task = asyncio.ensure_future(right)
+    try:
+        left_result, right_result = await asyncio.gather(left_task, right_task)
+    except BaseException:
+        left_task.cancel()
+        right_task.cancel()
+        await asyncio.gather(left_task, right_task, return_exceptions=True)
+        raise
+    return left_result, right_result
 
 
 class BigQueryClient:
@@ -285,17 +300,10 @@ class Rpc:
         if not plan.percentiles:
             headers = await self.headers(range(first_block, last_block + 1), plan)
             return headers, [header.row(plan) for header in headers]
-        tasks = [
-            asyncio.create_task(self.headers(range(first_block, last_block + 1), plan)),
-            asyncio.create_task(self.fee_history(first_block, last_block, plan.percentiles)),
-        ]
-        try:
-            headers, fees = await asyncio.gather(*tasks)
-        except BaseException:
-            for task in tasks:
-                task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
-            raise
+        headers, fees = await _paired(
+            self.headers(range(first_block, last_block + 1), plan),
+            self.fee_history(first_block, last_block, plan.percentiles),
+        )
         return headers, [header.row(plan, fee) for header, fee in zip(headers, fees, strict=True)]
 
     async def _run(self, calls: list[dict[str, Any]], validators: dict[int, Validator], prior_attempts: int = 0) -> dict[int, Any]:
@@ -308,7 +316,7 @@ class Rpc:
             if status not in _TRANSIENT_HTTP:
                 if status != 200:
                     raise RuntimeError(f"RPC returned non-retryable HTTP status {status}")
-                accepted, retry, limit = self._parse(payload, set(pending), validators)
+                accepted, retry, limit = self._parse(payload, tuple(pending), validators)
                 complete.update(accepted)
                 pending = {item_id: pending[item_id] for item_id in retry}
                 if limit:
@@ -366,18 +374,18 @@ class Rpc:
             return 408, None, None
 
     @staticmethod
-    def _parse(payload: Any, expected: set[int], validators: dict[int, Validator]) -> tuple[dict[int, Any], set[int], bool]:
+    def _parse(payload: Any, expected: tuple[int, ...], validators: dict[int, Validator]) -> tuple[dict[int, Any], tuple[int, ...], bool]:
         if not isinstance(payload, list):
             raise ValueError("Invalid JSON-RPC batch response shape")
         accepted: dict[int, Any] = {}
-        retry = set(expected)
+        expected_ids = set(expected)
         seen: set[int] = set()
         limit = False
         for member in payload:
             if not isinstance(member, dict) or member.get("jsonrpc") != "2.0":
                 raise ValueError("Invalid JSON-RPC response member")
             item_id = member.get("id")
-            if type(item_id) is not int or item_id not in expected or item_id in seen:
+            if type(item_id) is not int or item_id not in expected_ids or item_id in seen:
                 raise ValueError("JSON-RPC response ID mismatch")
             seen.add(item_id)
             has_result = "result" in member
@@ -395,8 +403,7 @@ class Rpc:
             if member["result"] is None:
                 continue
             accepted[item_id] = validators[item_id](member["result"])
-            retry.remove(item_id)
-        return accepted, retry, limit
+        return accepted, tuple(item_id for item_id in expected if item_id not in accepted), limit
 
 
 def _retry_after(value: str | None) -> float | None:
@@ -546,10 +553,10 @@ async def acquire(request: DownloadRequest, progress: Progress, operation: Sourc
 async def _acquire_rpc(request: RpcDownloadRequest, operation: SourceOperation) -> dict[str, object]:
     try:
         async with _rpc(request.primary) as primary, _rpc(request.verifier) as verifier:
-            primary_chain_id, verifier_chain_id = await asyncio.gather(primary.chain_id(), verifier.chain_id())
+            primary_chain_id, verifier_chain_id = await _paired(primary.chain_id(), verifier.chain_id())
             if primary_chain_id != request.chain.chain_id or verifier_chain_id != request.chain.chain_id:
                 raise BlockweaverError("RPC_CHAIN_MISMATCH", "RPC chain ID does not match the configured chain")
-            primary_tag, verifier_tag = await asyncio.gather(
+            primary_tag, verifier_tag = await _paired(
                 primary.tagged_header(request.chain.finality_tag, _INTEGRITY_PLAN),
                 verifier.tagged_header(request.chain.finality_tag, _INTEGRITY_PLAN),
             )
@@ -674,7 +681,7 @@ async def _verify_time_boundaries(
     verifier_finalized: int,
 ) -> None:
     boundary_numbers = sorted({resolved.first_block, resolved.last_block})
-    primary_boundaries, verifier_boundaries = await asyncio.gather(
+    primary_boundaries, verifier_boundaries = await _paired(
         primary.headers(boundary_numbers, _INTEGRITY_PLAN),
         verifier.headers(boundary_numbers, _INTEGRITY_PLAN),
     )

@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from unittest.mock import Mock
+from uuid import UUID
 
 import polars as pl
 import pytest
@@ -15,7 +16,7 @@ from typer.testing import CliRunner
 
 from blockweaver import BlockweaverError, Dataset, _build, _corpus, _sources, open_dataset
 from blockweaver import cli as cli_module
-from blockweaver._contract import parse_time, plan_features
+from blockweaver._contract import Chain, Provider, RpcDownloadRequest, parse_time, plan_features, requested_range
 from blockweaver.cli import app
 
 DATASET_ID = "11111111-1111-4111-8111-111111111111"
@@ -308,13 +309,32 @@ def test_header_only_tx_count_uses_only_block_cardinality(
     tmp_path: Path,
     chains: tuple[ChainServer, ChainServer],
     make_config: Any,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     primary, verifier = chains
+    fee_arguments: list[dict[int, int] | None] = []
+    row = _sources.Header.row
+
+    def observe_row(header: _sources.Header, plan: Any, fees: dict[int, int] | None = None) -> dict[str, int | str]:
+        fee_arguments.append(fees)
+        return row(header, plan, fees)
+
+    monkeypatch.setattr(_sources.Header, "row", observe_row)
     primary.changes[10] = {"transactions": [{"opaque": "transaction"}]}
     config = make_config(tmp_path / "config.toml", primary, verifier, output_root=tmp_path / "out", features=("tx_count",))
     artifact = artifact_from(invoke(download_args(config)))
     assert pl.read_parquet(artifact / "blocks.parquet")["tx_count"].to_list()[0] == 1
     assert {call["method"] for batch in primary.requests for call in batch} == {"eth_chainId", "eth_getBlockByNumber"}
+    assert fee_arguments and all(fees is None for fees in fee_arguments)
+
+    class UnusedFees(dict[int, int]):
+        def __bool__(self) -> bool:
+            raise AssertionError("header-only rows inspected unused fee data")
+
+    assert row(_sources.Header(1, block_hash(1), block_hash(0), 1, {"tx_count": 0}), plan_features(["tx_count"]), UnusedFees()) == {
+        "block_number": 1,
+        "tx_count": 0,
+    }
 
 
 @pytest.mark.parametrize(
@@ -360,6 +380,22 @@ def test_rpc_limit_splits_immediately_and_retries_only_pending_calls(chains: tup
     with pytest.raises(RuntimeError, match="limit exceeded"):
         asyncio.run(request())
     assert len(primary.requests) == 1
+
+
+def test_rpc_retries_preserve_original_pending_order(chains: tuple[ChainServer, ChainServer]) -> None:
+    primary, _verifier = chains
+    for number in (11, 19, 27):
+        primary.item_errors[number] = [-32603, -32603]
+
+    async def request() -> list[_sources.Header]:
+        async with _sources.Rpc(primary.url, batch_size=18, concurrency=1, timeout=2) as rpc:
+            return await rpc.headers(range(10, 28), plan_features([]))
+
+    assert [header.block_number for header in asyncio.run(request())] == list(range(10, 28))
+    assert [[call["params"][0] for call in batch] for batch in primary.requests[1:]] == [
+        ["0xb", "0x13", "0x1b"],
+        ["0xb", "0x13", "0x1b"],
+    ]
 
 
 def test_rpc_retry_is_bounded_and_retry_after_is_validated(chains: tuple[ChainServer, ChainServer], monkeypatch: pytest.MonkeyPatch) -> None:
@@ -440,6 +476,63 @@ def test_rpc_groups_are_concurrent_and_cancel_siblings(chains: tuple[ChainServer
 
     maximum, cancelled = asyncio.run(exercise())
     assert maximum == 3 and cancelled
+
+
+def test_paired_provider_failure_cancels_and_awaits_sibling(
+    tmp_path: Path,
+    chains: tuple[ChainServer, ChainServer],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    primary, verifier = chains
+    request = RpcDownloadRequest(
+        dataset_id=UUID(DATASET_ID),
+        chain=Chain("test", 1, "finalized", None, None, None),
+        requested_range=requested_range(10, 14, None, None),
+        plan=plan_features(["timestamp"]),
+        output_root=tmp_path,
+        output_format="parquet",
+        primary=Provider("primary", primary.url, 3, 2, 2),
+        verifier=Provider("verifier", verifier.url, 3, 2, 2),
+    )
+    ready: asyncio.Event | None = None
+    started = 0
+    sibling_cancelled = False
+
+    async def chain_id(rpc: _sources.Rpc) -> int:
+        nonlocal ready, sibling_cancelled, started
+        if ready is None:
+            ready = asyncio.Event()
+        current = ready
+        started += 1
+        if started == 2:
+            current.set()
+        await current.wait()
+        if rpc._url == primary.url:
+            raise RuntimeError("primary failed")
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            sibling_cancelled = True
+            raise
+        raise AssertionError("unreachable")
+
+    monkeypatch.setattr(_sources.Rpc, "chain_id", chain_id)
+
+    async def exercise() -> tuple[bool, int]:
+        async def unused(_source: _sources.SourceAdapter) -> dict[str, object]:
+            raise AssertionError("acquisition continued after provider failure")
+
+        with pytest.raises(BlockweaverError, match="primary failed"):
+            await _sources.acquire(request, lambda _event: None, unused)
+        current = asyncio.current_task()
+        pending = [task for task in asyncio.all_tasks() if task is not current and not task.done()]
+        cancelled_before_cleanup = sibling_cancelled
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+        return cancelled_before_cleanup, len(pending)
+
+    assert asyncio.run(exercise()) == (True, 0)
 
 
 def test_time_range_csv_and_reduced_precision(tmp_path: Path, chains: tuple[ChainServer, ChainServer], make_config: Any) -> None:

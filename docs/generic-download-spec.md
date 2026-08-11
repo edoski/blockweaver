@@ -146,7 +146,7 @@ Scope:
 - Replace the legacy CLI, fixed request/schema, corpus naming, and extension flow with the configuration, discovery, range, feature-planning, download, manifest, Parquet/CSV, resume, publication, and verification contracts above.
 - Implement the RPC source only.
 - Delete the dedicated BigQuery implementation and make the core package independent of the Google client until Slice 2.
-- Rewrite tests through the CLI, fake JSON-RPC seam, and published artifact. Keep them lean and below the repository limit.
+- Rewrite tests through the CLI, fake JSON-RPC seam, and published artifact. Keep each case focused on an observable boundary outcome rather than implementation transitions.
 - Update README and security guidance for the new public contract.
 
 Non-goals:
