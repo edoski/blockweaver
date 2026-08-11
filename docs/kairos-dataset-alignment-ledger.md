@@ -4,10 +4,10 @@
 
 - Status: realigned to current repositories on 2026-08-11; Blockweaver Slice 1 is ready after its issue-rule gate, while KAIROS integration and all data/deployment work remain blocked.
 - Authoritative spec: this ledger plus the user-approved decisions below.
-- Blockweaver current baseline: `35847591ea934a253bac3ec27083a022086ac114`, clean `main`, two plan commits ahead of `origin/main`.
-- KAIROS current baseline: `e96c9f4d0917c35c58f23b3cd43accd61e005d61`, clean committed `main` equal to GitHub and research remotes before protected working-tree dirt.
+- Blockweaver plan head before this clean-slate update: `0931f62661d90dba1345c98da767cd5d33d813af`, clean `main`, three plan commits ahead of `origin/main`.
+- KAIROS current baseline: `c0021cb99fa1c28295059a1cc827d6d68afca633`, clean `main`, two focused commits ahead of GitHub and research remotes.
 - Servatus state: execution/lifecycle extraction is complete, independently green, and synchronized at `2ccf749e2a4c3f5ad7ca572ee34fe78e5b1bb78f` (`v0.4.1`). This plan requires no Servatus code, API, release, or data change.
-- Protected KAIROS dirt: modified `app/package.json`, `docs/KAIROS.md`, `experiments/figure_hpo.py`, and `tests/experiments/test_figures.py`; untracked `experiments/figure_k_study.py` plus four `docs/research/thesis-epigraph-*.md` files.
+- KAIROS working tree is clean. The approved `fsevents` allowance is committed at `7cca6fcb`; coherent K-study/HPO figure work is committed at `c0021cb9`; the four discarded epigraph notes are absent.
 - Pre-run worktrees: one normal worktree per repository; no run-owned branch or worktree exists.
 - Execution checkout policy: use isolated `codex/` branches and worktrees, one writer at a time. Integrate only after each repository slice is green. Never include protected dirt.
 - Current authority: this realignment ledger only. Do not change product code, either repository's outputs, remote storage, providers, jobs, GitHub, releases, or PyPI until the corresponding gate is explicitly opened.
@@ -46,7 +46,6 @@
 
 - Blockweaver `CONTRIBUTING.md` requires a GitHub issue before broadening the CLI, durable format, or provider model. Issue creation is not authorized in this planning phase. Implementation remains blocked until the user authorizes the issue or explicitly waives that repository rule.
 - Active HPO `dfd33e91-702e-46c5-8cb1-3c510af4c048` remains under the old image and `jobs.tsv` lifecycle. Never touch its jobs, local/remote bundle, corpora, logs, scratch, image, or automation authority. It must close normally before the KAIROS loader cutover or first Servatus K-study launch.
-- Do not integrate the KAIROS slice while protected working-tree files remain unresolved, especially `docs/KAIROS.md`, which the slice must also update.
 - Pin fresh baselines and status immediately before every slice.
 - Do not begin a later slice until the current implementation has a committed head and a distinct reviewer returns zero Standards and zero Spec findings.
 - No public RPC, BigQuery, output, GitHub, release, push, or PyPI action is implied by implementation authorization.
@@ -86,9 +85,9 @@ Every newly downloaded dataset has one durable UUID address independent of chain
 
 ## Slice 2: KAIROS direct dataset consumption
 
-- Status: pending; blocked by active legacy HPO closure, protected KAIROS dirt, Slice 1 release/pin, and additive local/research dataset preparation.
+- Status: pending; blocked by active legacy HPO closure, Slice 1 release/pin, and additive local/research dataset preparation.
 - Repository: KAIROS.
-- Planned baseline: `e96c9f4d0917c35c58f23b3cd43accd61e005d61`; repin after the active scientific work settles and preserve every later user-owned commit.
+- Planned baseline: `c0021cb99fa1c28295059a1cc827d6d68afca633`; repin after the active scientific work settles and preserve every later user-owned commit.
 - Dependencies: Blockweaver Slice 1 green with a released or otherwise reproducibly pinned package artifact; Servatus remains pinned at its accepted version and requires no change.
 
 ### Scope
@@ -134,7 +133,7 @@ KAIROS consumes one verified Blockweaver dataset directly from its own `outputs/
 ## Deployment and clean-break gate
 
 - Status: blocked; follows green KAIROS Slice 2 and accepted local/research datasets.
-- Integrate the reviewed KAIROS head only after protected dirt is resolved and all three datasets strict-load locally.
+- Integrate the reviewed KAIROS head only after all three datasets strict-load locally and any later user-owned work is resolved.
 - Build a new immutable KAIROS image from the exact integrated SHA through the documented `sbuild` procedure; run `apptainer test` and a bounded GPU smoke before changing future campaign configuration.
 - Preserve the old image and old `corpora/` paths for the completed legacy HPO record. The first new campaign using the aligned code must use Servatus, the new image, and `datasets/<uuid>` exclusively.
 - Do not mix loaders, images, campaign ledgers, or corpus paths within one campaign. No compatibility branch is added.
