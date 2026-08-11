@@ -89,7 +89,7 @@ effective_priority_fee_per_gas_p90
 
 The closed registry owns each feature's name, ordered output position, Int64 or UTF-8 type, unit, domain rule, source support, hidden dependencies, and acquisition recipe. The planner unions requirements and coalesces work. Header features share block reads; selected priority-fee percentiles share one `eth_feeHistory` call containing only those percentiles. Integrity and range-resolution calls remain mandatory even when their fields are not exported. Unknown or source-incompatible features fail before acquisition or a billable query.
 
-`features` reports type, unit, source support, acquisition family, and configured availability. `chains` reports configured chain profiles without secrets.
+`features` reports top-level `available_sources` plus each feature's type, unit, `supported_sources`, acquisition family, and dependencies. `chains` reports configured chain profiles with `available_sources` and no secrets.
 
 ### Source contract
 
@@ -111,6 +111,8 @@ ROOT/<uuid4>/
 ```
 
 Parquet is the default. CSV contains canonical decimal integers and UTF-8 strings; the manifest is its type authority. Both formats represent the same ordered logical schema.
+
+Dataset writing is supported on Linux and macOS. Other platforms fail closed before publication.
 
 The exact unversioned manifest is canonical sorted UTF-8 JSON with a final newline. It records the tool version, UUID, completion time, chain name and verified ID, source and non-secret profile names, requested and resolved range, ordered feature schema and units, normalized acquisition plan, row count, output filename/format/bytes/SHA-256, target hash, finalized anchor, and verification facts. The directory UUID must match its manifest UUID. It contains no URLs, credentials, environment values, raw SQL, or transient paths.
 

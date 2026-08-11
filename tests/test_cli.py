@@ -74,11 +74,13 @@ def test_init_precedence_permissions_and_no_overwrite(tmp_path: Path) -> None:
     configured = tmp_path / "configured.toml"
     explicit = tmp_path / "explicit.toml"
     result = invoke(["init"], {"BLOCKWEAVER_CONFIG": str(configured)})
-    assert json.loads(result.stdout)["path"] == str(configured)
+    assert json.loads(result.stdout) == {"operation": "init", "path": str(configured)}
     assert configured.stat().st_mode & 0o777 == 0o600
     assert "url_env" in configured.read_text()
+    generated = invoke(["chains", "--config", str(configured)])
+    assert generated.exit_code == 0 and json.loads(generated.stdout)["chains"][0]["name"] == "local"
     explicit_result = invoke(["init", "--config", str(explicit)], {"BLOCKWEAVER_CONFIG": str(configured)})
-    assert json.loads(explicit_result.stdout)["path"] == str(explicit)
+    assert json.loads(explicit_result.stdout) == {"operation": "init", "path": str(explicit)}
     assert error(invoke(["init", "--config", str(explicit)]))["code"] == "CONFIG_EXISTS"
 
 
@@ -94,13 +96,19 @@ def test_strict_config_discovery_has_no_secrets(tmp_path: Path, chains: tuple[Ch
             "finality_tag": "finalized",
             "name": "test",
             "provider": "primary",
-            "source_support": ["rpc"],
+            "available_sources": ["rpc"],
             "verifier": "verifier",
         }
     ]
     catalog = json.loads(feature_result.stdout)
+    assert set(catalog) == {"chain", "available_sources", "mandatory", "features"}
+    assert catalog["available_sources"] == ["rpc"]
     assert catalog["mandatory"]["name"] == "block_number"
     assert {item["name"] for item in catalog["features"]} >= {"timestamp", "block_hash", "effective_priority_fee_per_gas_p90"}
+    assert all(item["supported_sources"] == ["rpc", "bigquery"] for item in catalog["features"])
+    assert all(
+        set(item) == {"name", "type", "unit", "supported_sources", "acquisition_families", "domain_rule", "hidden_dependencies"} for item in catalog["features"]
+    )
     assert primary.url not in chain_result.output + feature_result.output
     assert verifier.url not in chain_result.output + feature_result.output
     with config.open("a") as stream:
@@ -133,6 +141,20 @@ def test_config_rejects_malformed_urls_and_unbounded_timeouts(
     text = text.replace(f'url = "{primary.url}"', replacement, 1) if replacement.startswith("url") else text.replace("timeout = 2", replacement, 1)
     config.write_text(text)
     assert error(invoke(["chains", "--config", str(config)]))["code"] == "CONFIG_INVALID"
+
+
+def test_unknown_default_source_is_a_configuration_failure(
+    tmp_path: Path,
+    chains: tuple[ChainServer, ChainServer],
+    make_config: Any,
+) -> None:
+    primary, verifier = chains
+    config = make_config(tmp_path / "config.toml", primary, verifier, output_root=tmp_path / "out", source="unknown")
+
+    failure = error(invoke(["chains", "--config", str(config)]))
+
+    assert failure["code"] == "CONFIG_INVALID"
+    assert primary.requests == verifier.requests == []
 
 
 def test_download_cli_values_override_defaults_and_profiles(tmp_path: Path, chains: tuple[ChainServer, ChainServer], make_config: Any) -> None:
@@ -268,6 +290,20 @@ def test_parquet_download_selects_and_coalesces_features(tmp_path: Path, chains:
         ]
     )
     artifact = artifact_from(result)
+    receipt = json.loads(result.stdout)
+    assert set(receipt) == {
+        "operation",
+        "dataset_id",
+        "path",
+        "chain",
+        "resolved_range",
+        "rows",
+        "reused_rows",
+        "acquired_rows",
+        "finalized_anchor",
+        "artifact_sha256",
+    }
+    assert receipt["operation"] == "download"
     dataset = open_dataset(str(artifact))
     assert isinstance(dataset, Dataset) and artifact == tmp_path / "out" / DATASET_ID == dataset.path
     with pytest.raises(TypeError, match="open_dataset"):
@@ -993,7 +1029,9 @@ def test_verify_is_strict_locally_and_against_rpc(tmp_path: Path, chains: tuple[
     config = make_config(tmp_path / "config.toml", primary, verifier, output_root=tmp_path / "out")
     artifact = artifact_from(invoke(download_args(config)))
     full = invoke(["verify", str(artifact), "--config", str(config), "--provider", "verifier", "--full-rpc"])
-    assert json.loads(full.stdout)["verification"]["mode"] == "full_rpc"
+    full_receipt = json.loads(full.stdout)
+    assert set(full_receipt) == {"operation", "dataset_id", "path", "rows", "artifact_sha256", "verification"}
+    assert full_receipt["operation"] == "verify" and full_receipt["verification"]["mode"] == "full_rpc"
     moved = artifact.with_name("22222222-2222-4222-8222-222222222222")
     artifact.rename(moved)
     with pytest.raises(BlockweaverError, match="directory name"):
@@ -1004,6 +1042,65 @@ def test_verify_is_strict_locally_and_against_rpc(tmp_path: Path, chains: tuple[
         artifact / "blocks.parquet"
     )
     assert error(invoke(["verify", str(artifact)]))["code"] == "ARTIFACT_INVALID"
+
+
+@pytest.mark.parametrize(
+    "options,message",
+    [
+        (["--full-rpc"], "--full-rpc, --batch-size, --concurrency, and --timeout require --provider or --rpc-url"),
+        (["--batch-size", "1"], "--full-rpc, --batch-size, --concurrency, and --timeout require --provider or --rpc-url"),
+        (["--concurrency", "1"], "--full-rpc, --batch-size, --concurrency, and --timeout require --provider or --rpc-url"),
+        (["--timeout", "1"], "--full-rpc, --batch-size, --concurrency, and --timeout require --provider or --rpc-url"),
+        (["--config", "missing.toml"], "--config requires --provider for RPC verification"),
+        (["--config", "missing.toml", "--rpc-url", "http://127.0.0.1:1"], "--config requires --provider for RPC verification"),
+    ],
+)
+def test_verify_rejects_inapplicable_rpc_options_before_dataset_or_network(
+    options: list[str],
+    message: str,
+    chains: tuple[ChainServer, ChainServer],
+) -> None:
+    primary, verifier = chains
+    failure = error(invoke(["verify", "missing-dataset", *options]))
+    assert failure == {"event": "error", "code": "VERIFY_INVALID", "message": message}
+    assert primary.requests == verifier.requests == []
+
+
+@pytest.mark.parametrize(
+    "options,use_environment,expected_server",
+    [
+        ([], False, None),
+        (["--rpc-url", "{url}"], False, "verifier"),
+        (["--rpc-url", "{url}", "--full-rpc", "--batch-size", "2", "--concurrency", "1", "--timeout", "1"], False, "verifier"),
+        (["--provider", "verifier"], True, "verifier"),
+        (["--config", "{config}", "--provider", "verifier"], False, "verifier"),
+        (["--config", "{config}", "--provider", "verifier", "--batch-size", "2", "--concurrency", "1", "--timeout", "1"], False, "verifier"),
+        (["--config", "{config}", "--provider", "verifier", "--rpc-url", "{override_url}"], False, "primary"),
+    ],
+)
+def test_verify_preserves_each_meaningful_mode(
+    tmp_path: Path,
+    chains: tuple[ChainServer, ChainServer],
+    make_config: Any,
+    options: list[str],
+    use_environment: bool,
+    expected_server: str | None,
+) -> None:
+    primary, verifier = chains
+    config = make_config(tmp_path / "config.toml", primary, verifier, output_root=tmp_path / "out")
+    artifact = artifact_from(invoke(download_args(config)))
+    primary.requests.clear()
+    verifier.requests.clear()
+    resolved = [item.format(url=verifier.url, override_url=primary.url, config=config) for item in options]
+    env = {"BLOCKWEAVER_CONFIG": str(config)} if use_environment else None
+
+    result = invoke(["verify", str(artifact), *resolved], env)
+
+    assert result.exit_code == 0, result.output
+    expected_mode = "local" if not resolved else "full_rpc" if "--full-rpc" in resolved else "sample_rpc"
+    assert json.loads(result.stdout)["verification"]["mode"] == expected_mode
+    assert bool(primary.requests) is (expected_server == "primary")
+    assert bool(verifier.requests) is (expected_server == "verifier")
 
 
 @pytest.mark.parametrize(
@@ -1156,7 +1253,7 @@ def test_bigquery_rejects_invalid_dataset_and_missing_optional_dependency(
     assert error(invoke(["chains", "--config", str(config)]))["code"] == "CONFIG_INVALID"
     config = bigquery_config(make_config, tmp_path / "valid.toml", primary, verifier, tmp_path / "out")
     monkeypatch.setattr(_sources, "import_module", Mock(side_effect=ModuleNotFoundError))
-    assert error(invoke(download_args(config)))["code"] == "source_dependency_missing"
+    assert error(invoke(download_args(config)))["code"] == "SOURCE_DEPENDENCY_MISSING"
     assert primary.requests == verifier.requests == []
 
 

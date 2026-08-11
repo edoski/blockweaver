@@ -108,7 +108,7 @@ def open_bigquery(project: str) -> BigQueryClient:
         module = import_module("google.cloud.bigquery")
     except ModuleNotFoundError:
         raise BlockweaverError(
-            "source_dependency_missing",
+            "SOURCE_DEPENDENCY_MISSING",
             "BigQuery source requires the optional blockweaver[bigquery] dependency",
         ) from None
     try:

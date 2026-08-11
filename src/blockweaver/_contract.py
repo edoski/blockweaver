@@ -52,16 +52,15 @@ class Feature:
     percentile: int | None = None
     domain: str = ""
 
-    def document(self, *, available_sources: tuple[Source, ...] = ("rpc",)) -> dict[str, object]:
+    def document(self) -> dict[str, object]:
         return {
             "name": self.name,
             "type": self.dtype,
             "unit": self.unit,
-            "source_support": ["rpc", "bigquery"],
+            "supported_sources": ["rpc", "bigquery"],
             "acquisition_families": {"rpc": self.family, "bigquery": self.bigquery_family},
             "domain_rule": self.domain,
             "hidden_dependencies": {"rpc": list(self.dependencies), "bigquery": list(self.bigquery_dependencies)},
-            "configured_sources": list(available_sources),
         }
 
 
@@ -175,7 +174,7 @@ def parse_source(value: object) -> Source:
     raise BlockweaverError("SOURCE_UNAVAILABLE", f"Unknown source: {value}")
 
 
-def configured_sources(config: Config, chain: Chain) -> tuple[Source, ...]:
+def available_sources(config: Config, chain: Chain) -> tuple[Source, ...]:
     verifier = chain.verifier or config.defaults.verifier
     sources: list[Source] = []
     primary = chain.provider or config.defaults.provider
@@ -371,8 +370,6 @@ class Config:
 def default_config_path() -> Path:
     if sys.platform == "darwin":
         return Path.home() / "Library" / "Application Support" / "blockweaver" / "config.toml"
-    if sys.platform == "win32" and (appdata := os.environ.get("APPDATA")):
-        return Path(appdata) / "blockweaver" / "config.toml"
     return Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "blockweaver" / "config.toml"
 
 
@@ -401,7 +398,10 @@ def load_config(path: Path) -> Config:
             "defaults",
             required={"chain", "source", "verifier", "output_root", "format", "features"},
         )
-        source = parse_source(_string(defaults_raw["source"], "defaults.source"))
+        try:
+            source = parse_source(_string(defaults_raw["source"], "defaults.source"))
+        except BlockweaverError as error:
+            raise ValueError(str(error)) from error
         output_format = _string(defaults_raw["format"], "defaults.format")
         if output_format not in {"parquet", "csv"}:
             raise ValueError("defaults.format must be parquet or csv")
@@ -432,7 +432,7 @@ def load_config(path: Path) -> Config:
         if defaults.verifier not in providers:
             raise ValueError("defaults.verifier must name a configured provider")
         config = Config(path, defaults, chains, providers, bigquery)
-        if defaults.source not in configured_sources(config, chains[defaults.chain]):
+        if defaults.source not in available_sources(config, chains[defaults.chain]):
             raise ValueError(f"default {defaults.source} source is not fully configured")
         return config
     except BlockweaverError:
@@ -662,7 +662,7 @@ def resolve_download_request(
 ) -> DownloadRequest:
     selected_chain = config.chain(chain)
     selected_source = parse_source(source or config.defaults.source)
-    if selected_source not in configured_sources(config, selected_chain):
+    if selected_source not in available_sources(config, selected_chain):
         raise BlockweaverError("SOURCE_UNAVAILABLE", f"Chain {selected_chain.name} does not configure source={selected_source}")
     plan = plan_features(features if features is not None else config.defaults.features)
     bounds = requested_range(from_block, to_block, from_time, to_time)
@@ -735,9 +735,8 @@ def parse_time(value: str, *, end: bool) -> int:
         ) from None
 
 
-def format_utc(timestamp: int, *, filename: bool = False) -> str:
-    value = datetime.fromtimestamp(timestamp, UTC)
-    return value.strftime("%Y%m%dT%H%M%SZ" if filename else "%Y-%m-%dT%H:%M:%SZ")
+def format_utc(timestamp: int) -> str:
+    return datetime.fromtimestamp(timestamp, UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 @dataclass(frozen=True, slots=True)

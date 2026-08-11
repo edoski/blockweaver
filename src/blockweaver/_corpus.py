@@ -513,7 +513,7 @@ def _read_checkpoint(path: Path, plan: Plan, digest: str, *, digest_verified: bo
         frame = pl.read_parquet(path)
         if frame.schema != checkpoint_schema(plan) or frame.is_empty() or frame.null_count().row(0) != (0,) * len(frame.columns):
             raise ValueError
-        _validate_eager_frame(frame.select(plan.columns), plan, None)
+        _validate_eager_frame(frame.select(plan.columns), plan)
         for row in frame.iter_rows(named=True):
             if "timestamp" in plan.columns and row["timestamp"] != row["_proof_timestamp"]:
                 raise ValueError
@@ -640,7 +640,7 @@ async def materialize_artifact(
                 **({"recovered": True} if recovered else {}),
             }
         )
-        return {"version": 1, **receipt}
+        return receipt
 
 
 def _validate_verified_samples(candidate: Dataset, proof: VerifiedProof) -> None:
@@ -882,7 +882,7 @@ def _validate_data(path: Path, plan: Plan, output_format: str, resolved: dict[st
     return expected_rows
 
 
-def _validate_eager_frame(frame: pl.DataFrame, plan: Plan, resolved: dict[str, int] | None) -> None:
+def _validate_eager_frame(frame: pl.DataFrame, plan: Plan) -> None:
     if frame.schema != _polars_schema(plan) or frame.null_count().row(0) != (0,) * len(frame.columns):
         raise ValueError("Invalid checkpoint values")
     if frame["block_number"].to_list() != list(range(int(frame[0, "block_number"]), int(frame[-1, "block_number"]) + 1)):
@@ -902,7 +902,6 @@ def _validate_eager_frame(frame: pl.DataFrame, plan: Plan, resolved: dict[str, i
             if previous_timestamp is not None and timestamp < previous_timestamp:
                 raise ValueError("Checkpoint timestamps decrease")
             previous_timestamp = timestamp
-    del resolved
 
 
 def _validate_csv_tokens(path: Path, plan: Plan) -> None:
