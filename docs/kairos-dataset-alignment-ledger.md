@@ -147,7 +147,7 @@ The CLI hands acquisition one trusted request. RPC and BigQuery each hide their 
 
 ## Slice 1B: artifact lifecycle, identity, and durability
 
-- Status: first correction closed every Spec finding but retained one Standards finding; second focused correction pending.
+- Status: second correction committed at `fcffca52de56f8aaf39da625cd96bdca8a9cfbf2`; focused re-review pending.
 - Repository: Blockweaver.
 - Planned baseline: integrated Slice 1A head; repin immediately before execution.
 - Dependencies: Slice 1A.
@@ -324,5 +324,6 @@ GitHub issue [#2](https://github.com/edoski/blockweaver/issues/2) records the au
 - Slice 1B reviewer: `/root/consolidation_1b_review`, with parallel Standards and Spec lanes over `b0edf0a5417c8ff6247d58b3db4a8e731e0005b6...3627b583bb6a99ffe19a1799821d9fb239f9e363`. Initial result: rejected. Standards found one P3 duplicated source protocol across `_corpus.py` and `_sources.py`. Spec found two P2 issues: staged recovery admitted obsolete checkpoints before validating an already staged candidate, and a same-UUID waiter could acquire a lock on an unlinked hidden-directory generation then fail cleanup with `ENOENT`. Required correction: one lifecycle-owned protocol, staged-first validation, and descriptor/path-generation verification with cleanup only by the owning lock.
 - Slice 1B correction: `04bb8c227c916b4ca12739094e7a6a37f924f676` (`fix(artifact): harden staged and concurrent recovery`). It deletes the duplicate source protocol, validates and live-reseals staged candidates before considering obsolete checkpoints, and binds cleanup to the locked directory device/inode generation with retry for stale generations. Worker reported 76 passing tests and all gates green. Four same-UUID subprocess races each produced one valid publication and one `DESTINATION_EXISTS`, never `ENOENT`/`IO_FAILED`, with no hidden residue. Re-review range is `3627b583bb6a99ffe19a1799821d9fb239f9e363...04bb8c227c916b4ca12739094e7a6a37f924f676`.
 - Slice 1B first correction review: Spec 0, Standards 1. All original findings closed. The remaining P3 is correction-introduced unsupported-platform generality: `getattr(os, "O_DIRECTORY", 0)` silently weakens directory-only opening. The supported Linux/macOS clean break requires direct `os.O_DIRECTORY` and fail-closed import/runtime behavior.
+- Slice 1B second correction: `fcffca52de56f8aaf39da625cd96bdca8a9cfbf2` (`fix(artifact): require directory lock support`). One line now uses `os.O_DIRECTORY` directly with no unsupported-platform fallback. Worker reported the focused staged/concurrent tests, all 76 tests, and every gate green. Re-review range is `04bb8c227c916b4ca12739094e7a6a37f924f676...fcffca52de56f8aaf39da625cd96bdca8a9cfbf2`.
 
 No consolidation implementation, provider call, migration script, output mutation, KAIROS slice, cleanup, or deployment exists yet. The completed Servatus work and active HPO are external protected state, not work owned by this run.
