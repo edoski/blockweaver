@@ -15,7 +15,7 @@ import typer
 from typer._click.exceptions import ClickException
 from typer.core import TyperGroup
 
-from ._build import DownloadSpec, Publication, verify_dataset
+from ._build import Publication, verify_dataset
 from ._build import download as download_dataset
 from ._contract import (
     FEATURES,
@@ -23,11 +23,8 @@ from ._contract import (
     Provider,
     configured_sources,
     load_config,
-    plan_features,
-    requested_range,
+    resolve_download_request,
     selected_config_path,
-    source_definition,
-    source_definitions,
 )
 
 _EXAMPLE_CONFIG = """[defaults]
@@ -121,8 +118,8 @@ def chains(config: ConfigPath = None) -> None:
                 "source_support": list(configured_sources(settings, chain)),
                 "default": chain.name == settings.defaults.chain,
             }
-            for definition in source_definitions():
-                value.update(definition.chain_document(chain))
+            if chain.bigquery_dataset is not None:
+                value["bigquery_dataset"] = chain.bigquery_dataset
             values.append(value)
         _output({"version": 1, "chains": values})
     except BlockweaverError as error:
@@ -177,38 +174,27 @@ def download(
     secrets = [value for value in (rpc_url, verify_rpc_url) if value]
     try:
         settings = load_config(selected_config_path(config))
-        selected_chain = settings.chain(chain)
-        selected_source = source_definition(source or settings.defaults.source)
-        if not selected_source.configured(settings, selected_chain):
-            raise BlockweaverError("SOURCE_UNAVAILABLE", f"Chain {selected_chain.name} does not configure source={selected_source.name}")
-        if not selected_source.accepts_primary_options and (provider is not None or rpc_url is not None):
-            raise BlockweaverError("SOURCE_OPTION_INVALID", f"--provider and --rpc-url do not apply to source={selected_source.name}")
-        verifier_name = verifier or selected_chain.verifier or settings.defaults.verifier
-        verifying = settings.provider(verifier_name, url=verify_rpc_url, batch_size=batch_size, concurrency=concurrency, timeout=timeout)
-        primary_name = provider or selected_chain.provider or settings.defaults.provider
-        primary = (
-            settings.provider(primary_name, url=rpc_url, batch_size=batch_size, concurrency=concurrency, timeout=timeout)
-            if "primary" in selected_source.runtime_requirements
-            else None
-        )
-        bigquery = settings.bigquery_settings() if "bigquery" in selected_source.runtime_requirements else None
-        if primary is not None:
-            secrets.append(primary.url)
-        if bigquery is not None:
-            secrets.append(bigquery.project)
-        secrets.append(verifying.url)
-        spec = DownloadSpec(
+        spec = resolve_download_request(
+            settings,
             dataset_id=dataset_id or uuid4(),
-            chain=selected_chain,
-            requested_range=requested_range(from_block, to_block, from_time, to_time),
-            plan=plan_features(feature if feature is not None else settings.defaults.features),
-            output_root=(output_root or settings.defaults.output_root).expanduser(),
-            output_format=output_format or settings.defaults.output_format,
-            source=selected_source,
-            primary=primary,
-            verifier=verifying,
-            bigquery=bigquery,
+            chain=chain,
+            source=source,
+            provider=provider,
+            verifier=verifier,
+            rpc_url=rpc_url,
+            verify_rpc_url=verify_rpc_url,
+            output_root=output_root,
+            output_format=output_format,
+            features=feature,
+            from_block=from_block,
+            to_block=to_block,
+            from_time=from_time,
+            to_time=to_time,
+            batch_size=batch_size,
+            concurrency=concurrency,
+            timeout=timeout,
         )
+        secrets.extend(spec.secrets())
     except BlockweaverError as error:
         _abort(error, secrets)
     _execute(lambda publication: download_dataset(spec, progress=_progress, publication=publication), secrets)

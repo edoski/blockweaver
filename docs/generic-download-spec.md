@@ -174,7 +174,7 @@ Execution:
 - Correction 1 `1bebe8ed0bea80f32fceef567386e6791ba5d2a5`: closed all original findings and passed 30 tests plus all gates. Delta review found three correction-introduced findings: a private-helper publication test, brittle README byte coupling, and rejection of valid Basic-auth RPC URLs.
 - Correction 2 `b020dcef01e76559d6e416e8f9419f86bed36962`: moved the race test through the CLI seam, removed Markdown byte coupling, and accepted/redacted valid credentialed RPC URLs. It passed 31 tests plus Ruff lint/format, Pyright, Vulture, `uv lock --check`, and `git diff --check`.
 - Final proportional integration: 31 tests passed; CLI exposes only `init`, `chains`, `features`, `download`, and `verify`; legacy/fixed-schema/Avalanche/Google implementation residue search was empty; checkout was clean.
-- Final limits: five implementation modules, three core runtime dependencies, 752 test lines.
+- Final limits: five implementation modules and three core runtime dependencies.
 - Not run: public RPC, archival-provider, quota, or real cross-provider validation.
 
 ### Slice 2: Generic BigQuery source
@@ -217,9 +217,9 @@ Execution:
 
 - Initial implementation `8f02a8e668b1d974f84408653b0d359f56b34de1`: 34 tests and all static/lock/optional-dependency/residue gates passed. Fixed-range review rejected it with three Standards and three Spec findings.
 - Findings: source dispatch was scattered; BigQuery lived in the RPC-specific module; one unused constructor remained; receipts were joined without block hashes; schema mode was discarded before billing; and BigQuery recovery plus RPC-rejection tests were missing.
-- Correction `ef56083a08dd1e167e4136d1a4a6e05442c58548`: centralized source policy in one closed registry, renamed `_rpc.py` to `_sources.py` without a shim, removed unused state, joined receipts on block number and hash, preserved/rejected incompatible schema modes before billing, and added compact recovery plus target/sample/ancestry/finality rejection coverage.
+- Correction `ef56083a08dd1e167e4136d1a4a6e05442c58548`: centralized source policy in `_sources.py` without a shim, removed unused state, joined receipts on block number and hash, preserved/rejected incompatible schema modes before billing, and added compact recovery plus target/sample/ancestry/finality rejection coverage.
 - Correction checks: 39 tests; Ruff lint/format; Pyright; Vulture; `uv lock --check`; `git diff --check`; optional BigQuery import; core export without Google; residue and limit audits.
 - Correction-only review returned `GREEN LIGHT` with zero Standards or Spec findings and no correction-introduced findings.
 - Final integration repeated the complete 39-test/static/lock/optional-import/CLI/residue/status gate successfully.
-- Final limits: five implementation modules, four runtime dependencies including the optional extra, 899 test lines.
+- Final limits: five implementation modules and four runtime dependencies including the optional extra.
 - Not run: public RPC, live BigQuery schema or dry run, billable queries, ADC/auth, billing/quota, archival coverage, or live cross-provider validation.

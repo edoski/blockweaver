@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 from datetime import UTC, datetime
@@ -14,7 +15,7 @@ from typer.testing import CliRunner
 
 from blockweaver import BlockweaverError, Dataset, _build, _corpus, _sources, open_dataset
 from blockweaver import cli as cli_module
-from blockweaver._contract import parse_time
+from blockweaver._contract import parse_time, plan_features
 from blockweaver.cli import app
 
 DATASET_ID = "11111111-1111-4111-8111-111111111111"
@@ -161,6 +162,61 @@ def test_download_cli_values_override_defaults_and_profiles(tmp_path: Path, chai
     assert not configured_root.exists()
 
 
+def test_bigquery_only_configuration_needs_no_unused_primary(
+    tmp_path: Path,
+    chains: tuple[ChainServer, ChainServer],
+    make_config: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    primary, verifier = chains
+    config = make_config(
+        tmp_path / "config.toml",
+        primary,
+        verifier,
+        output_root=tmp_path / "out",
+        source="bigquery",
+        dataset=BQ_DATASET,
+        include_primary=False,
+    )
+    warehouse = FakeBigQuery(verifier)
+    monkeypatch.setattr(_sources, "open_bigquery", lambda _project: warehouse)
+    rejected = error(invoke([*download_args(config), "--provider", "verifier"]))
+    assert rejected["code"] == "SOURCE_OPTION_INVALID"
+    assert verifier.requests == [] and warehouse.calls == []
+    artifact_from(invoke(download_args(config)))
+    assert verifier.requests and primary.requests == []
+
+
+def test_request_resolution_rejects_missing_environment_and_dependent_providers_before_network(
+    tmp_path: Path,
+    chains: tuple[ChainServer, ChainServer],
+    make_config: Any,
+) -> None:
+    primary, verifier = chains
+    config = make_config(tmp_path / "rpc.toml", primary, verifier, output_root=tmp_path / "out")
+    config.write_text(config.read_text().replace(f'url = "{primary.url}"', 'url_env = "BLOCKWEAVER_TEST_MISSING"', 1))
+    assert error(invoke(download_args(config)))["code"] == "CONFIG_ENV_MISSING"
+    assert error(invoke([*download_args(config), "--feature", "unknown"]))["code"] == "FEATURE_INVALID"
+    assert primary.requests == verifier.requests == []
+
+    independent = make_config(tmp_path / "independent.toml", primary, verifier, output_root=tmp_path / "out")
+    assert error(invoke([*download_args(independent), "--provider", "verifier"]))["code"] == "PROVIDER_INVALID"
+    assert primary.requests == verifier.requests == []
+
+    warehouse = make_config(
+        tmp_path / "warehouse.toml",
+        primary,
+        verifier,
+        output_root=tmp_path / "out",
+        source="bigquery",
+        dataset=BQ_DATASET,
+        include_primary=False,
+    )
+    warehouse.write_text(warehouse.read_text().replace('project = "billing-project"', 'project_env = "BLOCKWEAVER_BQ_MISSING"'))
+    assert error(invoke(download_args(warehouse)))["code"] == "CONFIG_ENV_MISSING"
+    assert primary.requests == verifier.requests == []
+
+
 def test_basic_auth_rpc_urls_are_accepted_and_fully_redacted(
     tmp_path: Path,
     chains: tuple[ChainServer, ChainServer],
@@ -246,6 +302,144 @@ def test_parquet_download_selects_and_coalesces_features(tmp_path: Path, chains:
     assert manifest["verification"]["target_agreement"] is True
     assert primary.url not in manifest_text and verifier.url not in manifest_text
     assert all(json.loads(line)["event"] for line in result.stderr.splitlines())
+
+
+def test_header_only_tx_count_uses_only_block_cardinality(
+    tmp_path: Path,
+    chains: tuple[ChainServer, ChainServer],
+    make_config: Any,
+) -> None:
+    primary, verifier = chains
+    primary.changes[10] = {"transactions": [{"opaque": "transaction"}]}
+    config = make_config(tmp_path / "config.toml", primary, verifier, output_root=tmp_path / "out", features=("tx_count",))
+    artifact = artifact_from(invoke(download_args(config)))
+    assert pl.read_parquet(artifact / "blocks.parquet")["tx_count"].to_list()[0] == 1
+    assert {call["method"] for batch in primary.requests for call in batch} == {"eth_chainId", "eth_getBlockByNumber"}
+
+
+@pytest.mark.parametrize(
+    ("code", "retries"),
+    [(-32601, False), (-32000, False), (-32603, True), (-32002, True), (-32042, True)],
+)
+def test_rpc_error_disposition_uses_numeric_codes_without_provider_messages(chains: tuple[ChainServer, ChainServer], code: int, retries: bool) -> None:
+    primary, _verifier = chains
+    primary.rpc_errors = [code]
+
+    async def request() -> list[_sources.Header]:
+        async with _sources.Rpc(primary.url, batch_size=3, concurrency=2, timeout=2) as rpc:
+            return await rpc.headers([10], plan_features([]))
+
+    if retries:
+        assert [header.block_number for header in asyncio.run(request())] == [10]
+        assert len(primary.requests) == 2
+    else:
+        with pytest.raises(RuntimeError, match="rejected") as failure:
+            asyncio.run(request())
+        assert "provider detail" not in str(failure.value)
+        assert len(primary.requests) == 1
+
+
+def test_rpc_limit_splits_immediately_and_retries_only_pending_calls(chains: tuple[ChainServer, ChainServer]) -> None:
+    primary, _verifier = chains
+    primary.limit_batches = True
+
+    async def request() -> list[_sources.Header]:
+        async with _sources.Rpc(primary.url, batch_size=3, concurrency=2, timeout=2) as rpc:
+            return await rpc.headers([10, 11, 12], plan_features([]))
+
+    assert [header.block_number for header in asyncio.run(request())] == [10, 11, 12]
+    batch_sizes = [len(batch) for batch in primary.requests]
+    assert batch_sizes[0] == 3 and all(size < 3 for size in batch_sizes[1:])
+    primary.requests.clear()
+    primary.limit_batches = False
+    primary.item_errors[11] = [-32603]
+    assert [header.block_number for header in asyncio.run(request())] == [10, 11, 12]
+    assert [[call["params"][0] for call in batch] for batch in primary.requests] == [["0xa", "0xb", "0xc"], ["0xb"]]
+    primary.requests.clear()
+    primary.rpc_errors = [-32005]
+    with pytest.raises(RuntimeError, match="limit exceeded"):
+        asyncio.run(request())
+    assert len(primary.requests) == 1
+
+
+def test_rpc_retry_is_bounded_and_retry_after_is_validated(chains: tuple[ChainServer, ChainServer], monkeypatch: pytest.MonkeyPatch) -> None:
+    primary, _verifier = chains
+    delays: list[float] = []
+
+    async def sleep(delay: float) -> None:
+        delays.append(delay)
+
+    async def request() -> None:
+        async with _sources.Rpc(primary.url, batch_size=1, concurrency=1, timeout=2) as rpc:
+            await rpc.headers([10], plan_features([]))
+
+    monkeypatch.setattr(_sources.asyncio, "sleep", sleep)
+    monkeypatch.setattr(_sources.random, "uniform", lambda _start, _end: 0.25)
+    primary.http_failures, primary.retry_after = 1, "999"
+    asyncio.run(request())
+    assert delays == [60.0]
+    delays.clear()
+    primary.http_failures, primary.retry_after = 1, "-1"
+    asyncio.run(request())
+    assert delays == [0.25]
+    delays.clear()
+    primary.rpc_errors = [-32603] * 12
+    with pytest.raises(RuntimeError, match="12 attempts") as failure:
+        asyncio.run(request())
+    assert "provider detail" not in str(failure.value)
+    assert len(delays) == 11
+
+
+def test_rpc_groups_are_concurrent_and_cancel_siblings(chains: tuple[ChainServer, ChainServer], monkeypatch: pytest.MonkeyPatch) -> None:
+    primary, _verifier = chains
+
+    async def exercise() -> tuple[int, bool]:
+        rpc = _sources.Rpc("http://unused", batch_size=1, concurrency=3, timeout=2)
+        active = maximum = started = 0
+        release = asyncio.Event()
+
+        async def concurrent(calls: list[dict[str, Any]]) -> tuple[int, Any, float | None]:
+            nonlocal active, maximum, started
+            active += 1
+            started += 1
+            maximum = max(maximum, active)
+            if started == 3:
+                release.set()
+            await release.wait()
+            call = calls[0]
+            number = int(call["params"][0], 16)
+            active -= 1
+            return 200, [{"jsonrpc": "2.0", "id": call["id"], "result": primary.block(number)}], None
+
+        monkeypatch.setattr(rpc, "_post", concurrent)
+        assert [item.block_number for item in await rpc.headers([10, 11, 12], plan_features([]))] == [10, 11, 12]
+
+        cancelled = False
+        ready = asyncio.Event()
+        waiting = 0
+
+        async def fail_one(calls: list[dict[str, Any]]) -> tuple[int, Any, float | None]:
+            nonlocal cancelled, waiting
+            waiting += 1
+            if waiting == 2:
+                ready.set()
+            await ready.wait()
+            if calls[0]["params"][0] == "0xa":
+                raise ValueError("bad sibling")
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancelled = True
+                raise
+            raise AssertionError("unreachable")
+
+        monkeypatch.setattr(rpc, "_post", fail_one)
+        with pytest.raises(ValueError, match="bad sibling"):
+            await rpc.headers([10, 11], plan_features([]))
+        return maximum, cancelled
+
+    maximum, cancelled = asyncio.run(exercise())
+    assert maximum == 3 and cancelled
 
 
 def test_time_range_csv_and_reduced_precision(tmp_path: Path, chains: tuple[ChainServer, ChainServer], make_config: Any) -> None:
@@ -340,7 +534,7 @@ def test_resume_reuses_only_complete_chunks_and_rejects_rebinding(
 ) -> None:
     primary, verifier = chains
     config = make_config(tmp_path / "config.toml", primary, verifier, output_root=tmp_path / "out")
-    monkeypatch.setattr(_build, "_CHUNK_SIZE", 2)
+    monkeypatch.setattr(_sources, "CHUNK_SIZE", 2)
     primary.changes[12] = {"hash": "invalid"}
     failed = invoke(download_args(config))
     assert error(failed)["code"] == "RPC_INVALID"
@@ -374,7 +568,7 @@ def test_resume_integrity_binds_checkpoint_bytes_and_exported_proofs(
         output_root=tmp_path / "out",
         features=("timestamp", "base_fee_per_gas"),
     )
-    monkeypatch.setattr(_build, "_CHUNK_SIZE", 2)
+    monkeypatch.setattr(_sources, "CHUNK_SIZE", 2)
     primary.changes[12] = {"hash": "invalid"}
     assert error(invoke(download_args(config)))["code"] == "RPC_INVALID"
     primary.changes.clear()
@@ -546,7 +740,7 @@ def test_full_rpc_verification_is_chunked_and_checks_cross_chunk_ancestry(
         features=("effective_priority_fee_per_gas_p50",),
     )
     artifact = artifact_from(invoke(download_args(config, last=15)))
-    monkeypatch.setattr(_build, "_CHUNK_SIZE", 2)
+    monkeypatch.setattr(_sources, "CHUNK_SIZE", 2)
     verifier.requests.clear()
 
     verified = invoke(["verify", str(artifact), "--config", str(config), "--provider", "verifier", "--full-rpc"])
@@ -588,20 +782,38 @@ def test_bigquery_schema_and_cost_fail_before_billable_query(
     config = bigquery_config(make_config, tmp_path / "config.toml", primary, verifier, tmp_path / "out", features=("effective_priority_fee_per_gas_p50",))
     unavailable = FakeBigQuery(verifier)
     unavailable.tables["receipts"] = {"block_number": ("INTEGER", "NULLABLE")}
-    monkeypatch.setattr(_build, "open_bigquery", lambda _project: unavailable)
+    monkeypatch.setattr(_sources, "open_bigquery", lambda _project: unavailable)
     assert error(invoke(download_args(config)))["code"] == "SOURCE_FEATURE_UNAVAILABLE"
     assert "dry_run" not in unavailable.calls and "execute" not in unavailable.calls
 
     repeated = FakeBigQuery(verifier)
     repeated.tables["receipts"]["effective_gas_price"] = ("INTEGER", "REPEATED")
-    monkeypatch.setattr(_build, "open_bigquery", lambda _project: repeated)
+    monkeypatch.setattr(_sources, "open_bigquery", lambda _project: repeated)
     assert error(invoke(download_args(config, dataset_id="33333333-3333-4333-8333-333333333333")))["code"] == "SOURCE_FEATURE_UNAVAILABLE"
     assert "dry_run" not in repeated.calls and "execute" not in repeated.calls
 
     expensive = FakeBigQuery(verifier, bytes_processed=1001)
-    monkeypatch.setattr(_build, "open_bigquery", lambda _project: expensive)
+    monkeypatch.setattr(_sources, "open_bigquery", lambda _project: expensive)
     assert error(invoke(download_args(config, dataset_id="22222222-2222-4222-8222-222222222222")))["code"] == "BIGQUERY_COST_LIMIT"
     assert expensive.calls[-1] == "dry_run" and "execute" not in expensive.calls
+
+
+def test_bigquery_header_only_plan_reads_only_required_block_fields(
+    tmp_path: Path,
+    chains: tuple[ChainServer, ChainServer],
+    make_config: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    primary, verifier = chains
+    config = bigquery_config(make_config, tmp_path / "config.toml", primary, verifier, tmp_path / "out", features=("timestamp",))
+    warehouse = FakeBigQuery(verifier)
+    monkeypatch.setattr(_sources, "open_bigquery", lambda _project: warehouse)
+    artifact = artifact_from(invoke(download_args(config)))
+    assert warehouse.calls == [f"schema:{BQ_DATASET}.blocks", "dry_run", "execute"]
+    assert ".transactions`" not in warehouse.sql and ".receipts`" not in warehouse.sql
+    assert "base_fee_per_gas" not in warehouse.sql and "gas_used" not in warehouse.sql
+    monkeypatch.setattr(_sources, "import_module", Mock(side_effect=AssertionError("local loading imported Google")))
+    assert open_dataset(artifact).schema == ("block_number", "timestamp")
 
 
 def test_bigquery_streams_selected_fields_and_matches_rpc_artifacts(
@@ -612,8 +824,8 @@ def test_bigquery_streams_selected_fields_and_matches_rpc_artifacts(
     config = bigquery_config(make_config, tmp_path / "config.toml", primary, verifier, tmp_path / "out", features=features)
     clients = [FakeBigQuery(verifier, wrong_hash_receipts=True), FakeBigQuery(verifier, wrong_hash_receipts=True)]
     queued_clients = iter(clients)
-    monkeypatch.setattr(_build, "open_bigquery", lambda _project: next(queued_clients))
-    monkeypatch.setattr(_build, "_CHUNK_SIZE", 2)
+    monkeypatch.setattr(_sources, "open_bigquery", lambda _project: next(queued_clients))
+    monkeypatch.setattr(_sources, "CHUNK_SIZE", 2)
     start = datetime.fromtimestamp(verifier.timestamp_base + 10, UTC).isoformat().replace("+00:00", "Z")
     end = datetime.fromtimestamp(verifier.timestamp_base + 14, UTC).isoformat().replace("+00:00", "Z")
     base = ["download", "--config", str(config), "--from-time", start, "--to-time", end]
@@ -636,7 +848,7 @@ def test_bigquery_recovery_requires_exact_binding(
     primary, verifier = chains
     config = bigquery_config(make_config, tmp_path / "config.toml", primary, verifier, tmp_path / "out")
     clients = iter(FakeBigQuery(primary) for _ in range(3))
-    monkeypatch.setattr(_build, "open_bigquery", lambda _project: next(clients))
+    monkeypatch.setattr(_sources, "open_bigquery", lambda _project: next(clients))
     real_publish = _build.publish
 
     monkeypatch.setattr(_build, "publish", Mock(side_effect=KeyboardInterrupt))
@@ -660,7 +872,7 @@ def test_bigquery_rpc_disagreement_prevents_publication(
     else:
         number, change = changes[disagreement]
         verifier.changes[number] = change
-    monkeypatch.setattr(_build, "open_bigquery", lambda _project: FakeBigQuery(primary))
+    monkeypatch.setattr(_sources, "open_bigquery", lambda _project: FakeBigQuery(primary))
 
     assert error(invoke(download_args(config)))["code"] == "RPC_MISMATCH"
     assert not any(path.name.endswith(DATASET_ID) and not path.name.startswith(".") for path in (tmp_path / "out").glob("*"))

@@ -123,6 +123,7 @@ uv tool install 'blockweaver[bigquery]'
 ```
 
 Configure a strictly validated `project.dataset` identifier on the chain and one billing project or environment reference. The byte cap is mandatory.
+When BigQuery is the default source, configuration may omit `defaults.provider` and the unused primary profile; the verifier profile remains mandatory.
 
 ```toml
 [chains.my_chain]
