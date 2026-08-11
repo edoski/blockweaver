@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import hashlib
 import json
+import shutil
+import subprocess
+import sys
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -14,7 +18,7 @@ import pytest
 from conftest import ChainServer, FakeBigQuery, block_hash
 from typer.testing import CliRunner
 
-from blockweaver import BlockweaverError, Dataset, _build, _corpus, _sources, open_dataset
+from blockweaver import BlockweaverError, Dataset, _corpus, _sources, open_dataset
 from blockweaver import cli as cli_module
 from blockweaver._contract import Chain, Provider, RpcDownloadRequest, parse_time, plan_features, requested_range
 from blockweaver.cli import app
@@ -266,6 +270,8 @@ def test_parquet_download_selects_and_coalesces_features(tmp_path: Path, chains:
     artifact = artifact_from(result)
     dataset = open_dataset(str(artifact))
     assert isinstance(dataset, Dataset) and artifact == tmp_path / "out" / DATASET_ID == dataset.path
+    with pytest.raises(TypeError, match="open_dataset"):
+        Dataset()
     assert (str(dataset.dataset_id), dataset.chain_name, dataset.chain_id, dataset.first_block, dataset.last_block) == (DATASET_ID, "test", 1, 10, 14)
     assert dataset.schema == ("block_number", "timestamp", "block_hash", "gas_used", "effective_priority_fee_per_gas_p50")
     assert dataset.output_format == "parquet" and dataset.row_count == 5
@@ -500,7 +506,7 @@ def test_paired_provider_failure_cancels_and_awaits_sibling(
     monkeypatch.setattr(_sources.Rpc, "chain_id", chain_id)
 
     async def exercise() -> tuple[bool, int]:
-        async def unused(_source: _sources.SourceAdapter) -> dict[str, object]:
+        async def unused(_source: _corpus.ArtifactSource) -> dict[str, object]:
             raise AssertionError("acquisition continued after provider failure")
 
         with pytest.raises(BlockweaverError, match="primary failed"):
@@ -679,18 +685,18 @@ def test_publication_failure_recovers_ready_candidate(
 ) -> None:
     primary, verifier = chains
     config = make_config(tmp_path / "config.toml", primary, verifier, output_root=tmp_path / "out")
-    real_publish = _build.publish
+    real_rename = _corpus._rename_no_replace
 
-    def interrupt(_hidden: Path, _destination: Path) -> None:
+    def interrupt(_source: Path, _destination: Path) -> None:
         raise KeyboardInterrupt
 
-    monkeypatch.setattr(_build, "publish", interrupt)
+    monkeypatch.setattr(_corpus, "_rename_no_replace", interrupt)
     assert error(invoke(download_args(config)))["code"] == "INTERRUPTED"
     hidden = tmp_path / "out" / f".blockweaver-{DATASET_ID}"
     assert {path.name for path in (hidden / "ready").iterdir()} == {"manifest.json", "blocks.parquet"}
 
     requests = len(primary.requests) + len(verifier.requests)
-    monkeypatch.setattr(_build, "publish", real_publish)
+    monkeypatch.setattr(_corpus, "_rename_no_replace", real_rename)
     artifact = artifact_from(invoke(download_args(config)))
     assert len(primary.requests) + len(verifier.requests) > requests  # range and identity are re-resolved
     assert not hidden.exists()
@@ -708,15 +714,15 @@ def test_recovery_rejects_artifacts_outside_the_immutable_binding(
 ) -> None:
     primary, verifier = chains
     config = make_config(tmp_path / "config.toml", primary, verifier, output_root=tmp_path / "out")
-    real_publish, real_discard = _build.publish, _build.discard_work
+    real_rename, real_discard = _corpus._rename_no_replace, _corpus._discard_work
 
     def interrupt(*_args: object) -> None:
         raise KeyboardInterrupt
 
-    monkeypatch.setattr(_build, "discard_work" if published else "publish", interrupt)
+    monkeypatch.setattr(_corpus, "_discard_work" if published else "_rename_no_replace", interrupt)
     assert error(invoke(download_args(config)))["code"] == "INTERRUPTED"
-    monkeypatch.setattr(_build, "publish", real_publish)
-    monkeypatch.setattr(_build, "discard_work", real_discard)
+    monkeypatch.setattr(_corpus, "_rename_no_replace", real_rename)
+    monkeypatch.setattr(_corpus, "_discard_work", real_discard)
 
     hidden = tmp_path / "out" / f".blockweaver-{DATASET_ID}"
     artifact = next(path for path in (tmp_path / "out").iterdir() if not path.name.startswith(".")) if published else hidden / "ready"
@@ -726,7 +732,7 @@ def test_recovery_rejects_artifacts_outside_the_immutable_binding(
     manifest_path.write_text(json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n")
     receipt_path = hidden / "receipt.json"
     receipt = json.loads(receipt_path.read_text())
-    receipt["artifact_sha256"] = _corpus.pair_hashes(artifact)
+    receipt["artifact_sha256"] = {path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in sorted(artifact.iterdir()) if path.is_file()}
     receipt_path.write_text(json.dumps(receipt, sort_keys=True, separators=(",", ":")) + "\n")
 
     assert error(invoke(download_args(config)))["code"] == "RESUME_MISMATCH"
@@ -741,17 +747,244 @@ def test_publication_never_replaces_a_racing_destination(
     primary, verifier = chains
     output_root = tmp_path / "out"
     config = make_config(tmp_path / "config.toml", primary, verifier, output_root=output_root)
-    real_publish = _build.publish
+    real_rename = _corpus._rename_no_replace
 
-    def race(hidden: Path, destination: Path) -> None:
+    def race(source: Path, destination: Path) -> None:
         destination.mkdir()
-        real_publish(hidden, destination)
+        real_rename(source, destination)
 
-    monkeypatch.setattr(_build, "publish", race)
+    monkeypatch.setattr(_corpus, "_rename_no_replace", race)
     result = invoke(download_args(config))
     assert error(result)["code"] == "DESTINATION_EXISTS"
     destination = next(path for path in output_root.iterdir() if not path.name.startswith("."))
     assert list(destination.iterdir()) == []
+    assert (output_root / f".blockweaver-{DATASET_ID}" / "ready").is_dir()
+
+
+@pytest.mark.parametrize(
+    "dataset_id",
+    [
+        "44444444-4444-4444-8444-444444444444",
+        "55555555-5555-4555-8555-555555555555",
+        "66666666-6666-4666-8666-666666666666",
+        "77777777-7777-4777-8777-777777777777",
+    ],
+)
+def test_same_uuid_concurrent_cli_has_one_publication_and_stable_loser(
+    tmp_path: Path,
+    chains: tuple[ChainServer, ChainServer],
+    make_config: Any,
+    dataset_id: str,
+) -> None:
+    primary, verifier = chains
+    output_root = tmp_path / "out"
+    config = make_config(tmp_path / "config.toml", primary, verifier, output_root=output_root)
+    command = [
+        sys.executable,
+        "-m",
+        "blockweaver",
+        "download",
+        "--config",
+        str(config),
+        "--id",
+        dataset_id,
+        "--from-block",
+        "10",
+        "--to-block",
+        "30",
+    ]
+    processes = [subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) for _ in range(2)]
+    results = [(process.returncode, stdout, stderr) for process in processes for stdout, stderr in [process.communicate(timeout=30)]]
+
+    assert sorted(code for code, _stdout, _stderr in results) == [0, 1]
+    winner = next(json.loads(stdout) for code, stdout, _stderr in results if code == 0)
+    loser = next(json.loads(stderr.splitlines()[-1]) for code, _stdout, stderr in results if code == 1)
+    assert loser["code"] == "DESTINATION_EXISTS"
+    assert "ENOENT" not in "".join(stdout + stderr for _code, stdout, stderr in results)
+    artifact = Path(winner["path"])
+    assert artifact == output_root / dataset_id and open_dataset(artifact).row_count == 21
+    assert not (output_root / f".blockweaver-{dataset_id}").exists()
+
+
+@pytest.mark.parametrize("state", ["incomplete", "receipt_only", "provisional"])
+def test_incomplete_work_states_restart_cleanly(
+    tmp_path: Path,
+    chains: tuple[ChainServer, ChainServer],
+    make_config: Any,
+    state: str,
+) -> None:
+    primary, verifier = chains
+    output_root = tmp_path / "out"
+    hidden = output_root / f".blockweaver-{DATASET_ID}"
+    hidden.mkdir(parents=True)
+    if state == "incomplete":
+        (hidden / "orphan").write_text("incomplete")
+    elif state == "receipt_only":
+        (hidden / "receipt.json").write_text("{}\n")
+    else:
+        (hidden / "ready.tmp").mkdir()
+        (hidden / "ready.tmp" / "partial").write_text("partial")
+    config = make_config(tmp_path / "config.toml", primary, verifier, output_root=output_root)
+
+    artifact = artifact_from(invoke(download_args(config)))
+
+    assert artifact.is_dir() and not hidden.exists()
+
+
+def test_staged_recovery_ignores_obsolete_checkpoints_and_regenerates_a_corrupt_receipt(
+    tmp_path: Path,
+    chains: tuple[ChainServer, ChainServer],
+    make_config: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    primary, verifier = chains
+    config = make_config(tmp_path / "config.toml", primary, verifier, output_root=tmp_path / "out")
+    real_rename = _corpus._rename_no_replace
+    monkeypatch.setattr(_corpus, "_rename_no_replace", Mock(side_effect=KeyboardInterrupt))
+    assert error(invoke(download_args(config)))["code"] == "INTERRUPTED"
+    hidden = tmp_path / "out" / f".blockweaver-{DATASET_ID}"
+    assert "version" not in json.loads((hidden / "binding.json").read_text())
+    assert "version" not in json.loads((hidden / "receipt.json").read_text())
+    with next((hidden / "chunks").iterdir()).open("ab") as stream:
+        stream.write(b"obsolete checkpoint corruption")
+
+    monkeypatch.setattr(_corpus, "_rename_no_replace", real_rename)
+    verifier.changes[14] = {"hash": block_hash(999)}
+    assert error(invoke(download_args(config)))["code"] == "RPC_MISMATCH"
+    verifier.changes.clear()
+    (hidden / "receipt.json").write_text("{broken\n")
+
+    receipt = json.loads(invoke(download_args(config)).stdout)
+
+    assert receipt["reused_rows"] == receipt["rows"] and receipt["acquired_rows"] == 0
+    assert not hidden.exists()
+
+
+def test_committed_recovery_survives_partial_hidden_cleanup(
+    tmp_path: Path,
+    chains: tuple[ChainServer, ChainServer],
+    make_config: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    primary, verifier = chains
+    config = make_config(tmp_path / "config.toml", primary, verifier, output_root=tmp_path / "out")
+    real_discard = _corpus._discard_work
+    monkeypatch.setattr(_corpus, "_discard_work", Mock(side_effect=KeyboardInterrupt))
+    assert error(invoke(download_args(config)))["code"] == "INTERRUPTED"
+    hidden = tmp_path / "out" / f".blockweaver-{DATASET_ID}"
+    (hidden / "binding.json").unlink()
+    shutil.rmtree(hidden / "chunks")
+    (hidden / "receipt.json").write_text("{}\n")
+    monkeypatch.setattr(_corpus, "_discard_work", real_discard)
+
+    receipt = json.loads(invoke(download_args(config)).stdout)
+
+    assert receipt["reused_rows"] == receipt["rows"] and receipt["acquired_rows"] == 0
+    assert not hidden.exists()
+
+
+def test_candidate_samples_must_equal_retained_provider_verified_facts(
+    tmp_path: Path,
+    chains: tuple[ChainServer, ChainServer],
+    make_config: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    primary, verifier = chains
+    config = make_config(tmp_path / "config.toml", primary, verifier, output_root=tmp_path / "out", features=("timestamp",))
+    real_write = _corpus._write_candidate
+
+    def change_candidate(*args: Any, **kwargs: Any) -> Dataset:
+        dataset = real_write(*args, **kwargs)
+        frame = pl.read_parquet(dataset.data_path)
+        frame.with_columns((pl.col("timestamp") + 1).alias("timestamp")).write_parquet(dataset.data_path)
+        return dataset
+
+    monkeypatch.setattr(_corpus, "_write_candidate", change_candidate)
+
+    result = invoke(download_args(config))
+
+    assert error(result)["code"] == "RPC_MISMATCH"
+    assert not (tmp_path / "out" / DATASET_ID).exists()
+
+
+def test_candidate_fingerprint_is_resealed_after_live_rpc_validation(
+    tmp_path: Path,
+    chains: tuple[ChainServer, ChainServer],
+    make_config: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    primary, verifier = chains
+    config = make_config(tmp_path / "config.toml", primary, verifier, output_root=tmp_path / "out", features=("timestamp",))
+    real_rename = _corpus._rename_no_replace
+    monkeypatch.setattr(_corpus, "_rename_no_replace", Mock(side_effect=KeyboardInterrupt))
+    assert error(invoke(download_args(config)))["code"] == "INTERRUPTED"
+    monkeypatch.setattr(_corpus, "_rename_no_replace", real_rename)
+    real_revalidate = _sources.RpcSource.revalidate
+
+    async def mutate_after_rpc(source: _sources.RpcSource, dataset: Dataset) -> None:
+        await real_revalidate(source, dataset)
+        with dataset.data_path.open("ab") as stream:
+            stream.write(b"changed")
+
+    monkeypatch.setattr(_sources.RpcSource, "revalidate", mutate_after_rpc)
+
+    result = invoke(download_args(config))
+
+    assert error(result)["code"] == "ARTIFACT_INVALID"
+    assert not (tmp_path / "out" / DATASET_ID).exists()
+
+
+def test_publication_syncs_both_rename_parents_then_root_after_cleanup(
+    tmp_path: Path,
+    chains: tuple[ChainServer, ChainServer],
+    make_config: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    primary, verifier = chains
+    output_root = (tmp_path / "out").resolve()
+    hidden = output_root / f".blockweaver-{DATASET_ID}"
+    config = make_config(tmp_path / "config.toml", primary, verifier, output_root=output_root)
+    synced: list[Path] = []
+    final_files: list[str] = []
+    real_directory_sync = _corpus._fsync_directory
+    real_file_sync = _corpus._sync_final_file
+
+    def sync_directory(path: Path) -> None:
+        synced.append(path.resolve())
+        real_directory_sync(path)
+
+    def sync_file(path: Path) -> None:
+        final_files.append(path.name)
+        real_file_sync(path)
+
+    monkeypatch.setattr(_corpus, "_fsync_directory", sync_directory)
+    monkeypatch.setattr(_corpus, "_sync_final_file", sync_file)
+
+    artifact_from(invoke(download_args(config)))
+
+    assert synced[-3:] == [output_root, hidden, output_root]
+    assert set(final_files) == {"manifest.json", "blocks.parquet"}
+
+
+def test_unsupported_publication_capability_fails_before_destination_mutation(
+    tmp_path: Path,
+    chains: tuple[ChainServer, ChainServer],
+    make_config: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    primary, verifier = chains
+    output_root = tmp_path / "out"
+    config = make_config(tmp_path / "config.toml", primary, verifier, output_root=output_root)
+    monkeypatch.setattr(
+        _corpus,
+        "_ensure_publication_supported",
+        Mock(side_effect=OSError(errno.ENOTSUP, "Atomic no-replace publication is unavailable")),
+    )
+
+    result = invoke(download_args(config))
+
+    assert error(result)["code"] == "IO_FAILED"
+    assert not (output_root / DATASET_ID).exists()
     assert (output_root / f".blockweaver-{DATASET_ID}" / "ready").is_dir()
 
 
@@ -771,6 +1004,84 @@ def test_verify_is_strict_locally_and_against_rpc(tmp_path: Path, chains: tuple[
         artifact / "blocks.parquet"
     )
     assert error(invoke(["verify", str(artifact)]))["code"] == "ARTIFACT_INVALID"
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    ["json", "uuid_path", "extra", "digest", "schema", "range", "domain", "target", "verification"],
+)
+def test_open_dataset_rejects_corrupt_artifact_boundaries(
+    tmp_path: Path,
+    chains: tuple[ChainServer, ChainServer],
+    make_config: Any,
+    corruption: str,
+) -> None:
+    primary, verifier = chains
+    config = make_config(
+        tmp_path / "config.toml",
+        primary,
+        verifier,
+        output_root=tmp_path / "out",
+        features=("timestamp", "block_hash", "gas_used", "gas_limit"),
+    )
+    artifact = artifact_from(invoke(download_args(config)))
+    manifest_path = artifact / "manifest.json"
+    data_path = artifact / "blocks.parquet"
+    manifest = json.loads(manifest_path.read_text())
+    if corruption == "json":
+        manifest_path.write_text("{broken\n")
+    elif corruption == "uuid_path":
+        moved = artifact.with_name("22222222-2222-4222-8222-222222222222")
+        artifact.rename(moved)
+        artifact = moved
+    elif corruption == "extra":
+        (artifact / "extra").write_text("unexpected")
+    elif corruption == "digest":
+        with data_path.open("ab") as stream:
+            stream.write(b"changed")
+    else:
+        if corruption == "schema":
+            manifest["schema"][1]["unit"] = "wrong"
+        elif corruption == "range":
+            manifest["resolved_range"]["to_block"] += 1
+        elif corruption == "domain":
+            frame = pl.read_parquet(data_path).with_columns((pl.col("gas_limit") + 1).alias("gas_used"))
+            frame.write_parquet(data_path)
+            manifest["output"]["bytes"] = data_path.stat().st_size
+            manifest["output"]["sha256"] = hashlib.sha256(data_path.read_bytes()).hexdigest()
+        elif corruption == "target":
+            manifest["target_hash"] = block_hash(999)
+        else:
+            manifest["verification"]["target_agreement"] = False
+        manifest_path.write_text(json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n")
+
+    with pytest.raises(BlockweaverError) as failure:
+        open_dataset(artifact)
+    assert failure.value.code == "ARTIFACT_INVALID"
+
+
+def test_rpc_verify_reseals_artifact_bytes_after_network_wait(
+    tmp_path: Path,
+    chains: tuple[ChainServer, ChainServer],
+    make_config: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    primary, verifier = chains
+    config = make_config(tmp_path / "config.toml", primary, verifier, output_root=tmp_path / "out")
+    artifact = artifact_from(invoke(download_args(config)))
+    real_verify = _sources.verify_rpc
+
+    async def mutate_after_rpc(dataset: Dataset, provider: Any, full: bool) -> dict[str, object]:
+        result = await real_verify(dataset, provider, full)
+        with dataset.data_path.open("ab") as stream:
+            stream.write(b"changed")
+        return result
+
+    monkeypatch.setattr(_sources, "verify_rpc", mutate_after_rpc)
+
+    result = invoke(["verify", str(artifact), "--config", str(config), "--provider", "verifier"])
+
+    assert error(result)["code"] == "ARTIFACT_INVALID"
 
 
 def test_manifest_requires_canonical_json_and_completion_follows_data_assembly(
@@ -923,12 +1234,12 @@ def test_bigquery_recovery_requires_exact_binding(
     config = bigquery_config(make_config, tmp_path / "config.toml", primary, verifier, tmp_path / "out")
     clients = iter(FakeBigQuery(primary) for _ in range(3))
     monkeypatch.setattr(_sources, "open_bigquery", lambda _project: next(clients))
-    real_publish = _build.publish
+    real_rename = _corpus._rename_no_replace
 
-    monkeypatch.setattr(_build, "publish", Mock(side_effect=KeyboardInterrupt))
+    monkeypatch.setattr(_corpus, "_rename_no_replace", Mock(side_effect=KeyboardInterrupt))
     assert error(invoke(download_args(config)))["code"] == "INTERRUPTED"
     assert error(invoke([*download_args(config), "--format", "csv"]))["code"] == "RESUME_MISMATCH"
-    monkeypatch.setattr(_build, "publish", real_publish)
+    monkeypatch.setattr(_corpus, "_rename_no_replace", real_rename)
     resumed = invoke(download_args(config))
     assert Path(json.loads(resumed.stdout)["path"]).is_dir()
     assert json.loads(resumed.stderr.splitlines()[-1])["recovered"] is True

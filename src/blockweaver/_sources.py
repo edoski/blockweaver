@@ -11,8 +11,7 @@ from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from importlib import import_module
 from math import isfinite
-from pathlib import Path
-from typing import Any, Protocol, TypeVar
+from typing import Any, TypeVar
 from uuid import UUID
 
 import aiohttp
@@ -35,7 +34,7 @@ from ._contract import (
     quantity,
     validate_links,
 )
-from ._corpus import Dataset, checkpoint_facts
+from ._corpus import ArtifactSource, Dataset, FactReader, VerifiedProof
 
 _TRANSIENT_HTTP = {408, 425, 429, *range(500, 600)}
 _FATAL_RPC = {-32700, -32600, -32601, -32602, -32000, -32001, -32003, -32004, -32006}
@@ -432,17 +431,7 @@ def _parse_fee_history(value: Any, first_block: int, count: int, percentiles: tu
 
 
 Progress = Callable[[dict[str, object]], None]
-SourceOperation = Callable[["SourceAdapter"], Awaitable[dict[str, object]]]
-
-
-class SourceAdapter(Protocol):
-    resolved: ResolvedRange
-
-    def chunks(self, first: int, last: int) -> AsyncIterator[tuple[list[Header], list[dict[str, Value]]]]: ...
-
-    async def prove(self, target: Header, checkpoints: list[Path]) -> tuple[Anchor, dict[str, object]]: ...
-
-    async def revalidate(self, dataset: Dataset) -> None: ...
+SourceOperation = Callable[[ArtifactSource], Awaitable[dict[str, object]]]
 
 
 class RpcSource:
@@ -461,17 +450,22 @@ class RpcSource:
         self.resolved = resolved
         self._verification = {"primary_chain_id": primary_chain_id, "verifier_chain_id": verifier_chain_id}
 
+    @property
+    def chunk_size(self) -> int:
+        return CHUNK_SIZE
+
     async def chunks(self, first: int, last: int) -> AsyncIterator[tuple[list[Header], list[dict[str, Value]]]]:
         while first <= last:
             end = min(first + CHUNK_SIZE - 1, last)
             yield await self.primary.rows(first, end, self.request.plan)
             first = end + 1
 
-    async def prove(self, target: Header, checkpoints: list[Path]) -> tuple[Anchor, dict[str, object]]:
+    async def prove(self, target: Header, read_facts: FactReader) -> VerifiedProof:
         anchor, verifier_target = await _prove_finality(target, self.verifier, self.request)
         samples = sample_numbers(self.request.dataset_id, self.resolved.first_block, self.resolved.last_block)
-        await _check_rows(checkpoint_facts(checkpoints, self.request.plan, samples), samples, self.request.plan, self.verifier)
-        return anchor, {**self._verification, "target_agreement": target == verifier_target, "sampled_blocks": samples}
+        facts = read_facts(samples)
+        await _check_rows(facts, samples, self.request.plan, self.verifier)
+        return VerifiedProof(anchor, {**self._verification, "target_agreement": target == verifier_target, "sampled_blocks": samples}, facts)
 
     async def revalidate(self, dataset: Dataset) -> None:
         verifier_target = await _candidate_target(dataset, self.verifier, self.request)
@@ -498,6 +492,10 @@ class BigQuerySource:
         self.verifier_chain_id = verifier_chain_id
         self.progress = progress
         self.dry_run_bytes = 0
+
+    @property
+    def chunk_size(self) -> int:
+        return CHUNK_SIZE
 
     async def chunks(self, first: int, last: int) -> AsyncIterator[tuple[list[Header], list[dict[str, Value]]]]:
         if first > last:
@@ -528,16 +526,21 @@ class BigQuerySource:
         ):
             yield chunk
 
-    async def prove(self, target: Header, checkpoints: list[Path]) -> tuple[Anchor, dict[str, object]]:
+    async def prove(self, target: Header, read_facts: FactReader) -> VerifiedProof:
         anchor, verifier_target = await _prove_finality(target, self.verifier, self.request)
         samples = sample_numbers(self.request.dataset_id, self.resolved.first_block, self.resolved.last_block)
-        await _check_rows(checkpoint_facts(checkpoints, self.request.plan, samples), samples, self.request.plan, self.verifier)
-        return anchor, {
-            "verifier_chain_id": self.verifier_chain_id,
-            "dry_run_bytes": self.dry_run_bytes,
-            "target_agreement": target == verifier_target,
-            "sampled_blocks": samples,
-        }
+        facts = read_facts(samples)
+        await _check_rows(facts, samples, self.request.plan, self.verifier)
+        return VerifiedProof(
+            anchor,
+            {
+                "verifier_chain_id": self.verifier_chain_id,
+                "dry_run_bytes": self.dry_run_bytes,
+                "target_agreement": target == verifier_target,
+                "sampled_blocks": samples,
+            },
+            facts,
+        )
 
     async def revalidate(self, dataset: Dataset) -> None:
         verifier_target = await _candidate_target(dataset, self.verifier, self.request)
