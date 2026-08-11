@@ -147,7 +147,7 @@ The CLI hands acquisition one trusted request. RPC and BigQuery each hide their 
 
 ## Slice 1B: artifact lifecycle, identity, and durability
 
-- Status: implementation committed at `3627b583bb6a99ffe19a1799821d9fb239f9e363`; awaiting independent review.
+- Status: initial implementation `3627b583bb6a99ffe19a1799821d9fb239f9e363` rejected by independent review; focused correction pending.
 - Repository: Blockweaver.
 - Planned baseline: integrated Slice 1A head; repin immediately before execution.
 - Dependencies: Slice 1A.
@@ -321,5 +321,6 @@ GitHub issue [#2](https://github.com/edoski/blockweaver/issues/2) records the au
 - Slice 1B hidden-work inventory: the platform config path `/Users/edo/Library/Application Support/blockweaver/config.toml` is absent, and a bounded read-only scan under `/Users/edo/dev/python` found no `.blockweaver-<uuid>` directory. No work state needs completion, compatibility, or abandonment before the clean break.
 - Slice 1B baseline: `b0edf0a5417c8ff6247d58b3db4a8e731e0005b6`. Implementer: `/root/consolidation_1b_impl`; worktree `/Users/edo/dev/python/blockweaver-slice-1b`; branch `codex/consolidation-slice-1b`.
 - Slice 1B implementation head: `3627b583bb6a99ffe19a1799821d9fb239f9e363` (`refactor(artifact): centralize durable lifecycle`). Worker reported 72 passing tests and every static, lock, import, CLI, residue, module, dependency, and diff gate green. Temporary three-chunk measurement reduced fresh/resume checkpoint hashes from `9/10` to `6/6` and semantic reads from `6/7` to `3/3`, while retaining one assembly and one independent strict candidate scan. macOS publication and `F_FULLFSYNC` were exercised; Linux was statically/type checked but not natively run. Orchestrator verified the clean head and nonempty fixed diff; independent review is pending.
+- Slice 1B reviewer: `/root/consolidation_1b_review`, with parallel Standards and Spec lanes over `b0edf0a5417c8ff6247d58b3db4a8e731e0005b6...3627b583bb6a99ffe19a1799821d9fb239f9e363`. Initial result: rejected. Standards found one P3 duplicated source protocol across `_corpus.py` and `_sources.py`. Spec found two P2 issues: staged recovery admitted obsolete checkpoints before validating an already staged candidate, and a same-UUID waiter could acquire a lock on an unlinked hidden-directory generation then fail cleanup with `ENOENT`. Required correction: one lifecycle-owned protocol, staged-first validation, and descriptor/path-generation verification with cleanup only by the owning lock.
 
 No consolidation implementation, provider call, migration script, output mutation, KAIROS slice, cleanup, or deployment exists yet. The completed Servatus work and active HPO are external protected state, not work owned by this run.
