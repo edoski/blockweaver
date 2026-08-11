@@ -5,6 +5,8 @@ import errno
 import hashlib
 import json
 import shutil
+import subprocess
+import sys
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -504,7 +506,7 @@ def test_paired_provider_failure_cancels_and_awaits_sibling(
     monkeypatch.setattr(_sources.Rpc, "chain_id", chain_id)
 
     async def exercise() -> tuple[bool, int]:
-        async def unused(_source: _sources.SourceAdapter) -> dict[str, object]:
+        async def unused(_source: _corpus.ArtifactSource) -> dict[str, object]:
             raise AssertionError("acquisition continued after provider failure")
 
         with pytest.raises(BlockweaverError, match="primary failed"):
@@ -759,6 +761,51 @@ def test_publication_never_replaces_a_racing_destination(
     assert (output_root / f".blockweaver-{DATASET_ID}" / "ready").is_dir()
 
 
+@pytest.mark.parametrize(
+    "dataset_id",
+    [
+        "44444444-4444-4444-8444-444444444444",
+        "55555555-5555-4555-8555-555555555555",
+        "66666666-6666-4666-8666-666666666666",
+        "77777777-7777-4777-8777-777777777777",
+    ],
+)
+def test_same_uuid_concurrent_cli_has_one_publication_and_stable_loser(
+    tmp_path: Path,
+    chains: tuple[ChainServer, ChainServer],
+    make_config: Any,
+    dataset_id: str,
+) -> None:
+    primary, verifier = chains
+    output_root = tmp_path / "out"
+    config = make_config(tmp_path / "config.toml", primary, verifier, output_root=output_root)
+    command = [
+        sys.executable,
+        "-m",
+        "blockweaver",
+        "download",
+        "--config",
+        str(config),
+        "--id",
+        dataset_id,
+        "--from-block",
+        "10",
+        "--to-block",
+        "30",
+    ]
+    processes = [subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) for _ in range(2)]
+    results = [(process.returncode, stdout, stderr) for process in processes for stdout, stderr in [process.communicate(timeout=30)]]
+
+    assert sorted(code for code, _stdout, _stderr in results) == [0, 1]
+    winner = next(json.loads(stdout) for code, stdout, _stderr in results if code == 0)
+    loser = next(json.loads(stderr.splitlines()[-1]) for code, _stdout, stderr in results if code == 1)
+    assert loser["code"] == "DESTINATION_EXISTS"
+    assert "ENOENT" not in "".join(stdout + stderr for _code, stdout, stderr in results)
+    artifact = Path(winner["path"])
+    assert artifact == output_root / dataset_id and open_dataset(artifact).row_count == 21
+    assert not (output_root / f".blockweaver-{dataset_id}").exists()
+
+
 @pytest.mark.parametrize("state", ["incomplete", "receipt_only", "provisional"])
 def test_incomplete_work_states_restart_cleanly(
     tmp_path: Path,
@@ -784,7 +831,7 @@ def test_incomplete_work_states_restart_cleanly(
     assert artifact.is_dir() and not hidden.exists()
 
 
-def test_staged_recovery_revalidates_and_regenerates_a_corrupt_receipt(
+def test_staged_recovery_ignores_obsolete_checkpoints_and_regenerates_a_corrupt_receipt(
     tmp_path: Path,
     chains: tuple[ChainServer, ChainServer],
     make_config: Any,
@@ -798,6 +845,8 @@ def test_staged_recovery_revalidates_and_regenerates_a_corrupt_receipt(
     hidden = tmp_path / "out" / f".blockweaver-{DATASET_ID}"
     assert "version" not in json.loads((hidden / "binding.json").read_text())
     assert "version" not in json.loads((hidden / "receipt.json").read_text())
+    with next((hidden / "chunks").iterdir()).open("ab") as stream:
+        stream.write(b"obsolete checkpoint corruption")
 
     monkeypatch.setattr(_corpus, "_rename_no_replace", real_rename)
     verifier.changes[14] = {"hash": block_hash(999)}

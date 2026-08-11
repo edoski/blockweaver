@@ -11,7 +11,7 @@ from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from importlib import import_module
 from math import isfinite
-from typing import Any, Protocol, TypeVar
+from typing import Any, TypeVar
 from uuid import UUID
 
 import aiohttp
@@ -34,7 +34,7 @@ from ._contract import (
     quantity,
     validate_links,
 )
-from ._corpus import Dataset, FactReader, VerifiedProof
+from ._corpus import ArtifactSource, Dataset, FactReader, VerifiedProof
 
 _TRANSIENT_HTTP = {408, 425, 429, *range(500, 600)}
 _FATAL_RPC = {-32700, -32600, -32601, -32602, -32000, -32001, -32003, -32004, -32006}
@@ -431,20 +431,7 @@ def _parse_fee_history(value: Any, first_block: int, count: int, percentiles: tu
 
 
 Progress = Callable[[dict[str, object]], None]
-SourceOperation = Callable[["SourceAdapter"], Awaitable[dict[str, object]]]
-
-
-class SourceAdapter(Protocol):
-    resolved: ResolvedRange
-
-    @property
-    def chunk_size(self) -> int: ...
-
-    def chunks(self, first: int, last: int) -> AsyncIterator[tuple[list[Header], list[dict[str, Value]]]]: ...
-
-    async def prove(self, target: Header, read_facts: FactReader) -> VerifiedProof: ...
-
-    async def revalidate(self, dataset: Dataset) -> None: ...
+SourceOperation = Callable[[ArtifactSource], Awaitable[dict[str, object]]]
 
 
 class RpcSource:

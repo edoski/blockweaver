@@ -11,6 +11,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import sys
 from collections.abc import AsyncIterator, Callable, Iterator
 from contextlib import contextmanager
@@ -349,21 +350,50 @@ class Recovery:
     receipt: dict[str, Any] | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class WorkLock:
+    path: Path
+    recoverable: bool
+    generation: tuple[int, int]
+
+
 @contextmanager
-def _locked_work(identity: ArtifactIdentity) -> Iterator[tuple[Path, bool]]:
+def _locked_work(identity: ArtifactIdentity) -> Iterator[WorkLock]:
     identity.root.mkdir(parents=True, exist_ok=True)
     hidden = identity.root / f".blockweaver-{identity.dataset_id}"
-    existed = hidden.exists()
-    if identity.destination.exists() and not existed:
-        raise BlockweaverError("DESTINATION_EXISTS", f"Destination already exists: {identity.destination}")
-    hidden.mkdir(exist_ok=True)
-    descriptor = os.open(hidden, os.O_RDONLY)
+    while True:
+        if identity.destination.exists() and not hidden.exists():
+            raise BlockweaverError("DESTINATION_EXISTS", f"Destination already exists: {identity.destination}")
+        try:
+            hidden.mkdir()
+            recoverable = False
+        except FileExistsError:
+            recoverable = True
+        try:
+            descriptor = os.open(hidden, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        except FileNotFoundError:
+            continue
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            descriptor_stat = os.fstat(descriptor)
+            generation = (descriptor_stat.st_dev, descriptor_stat.st_ino)
+            if not _owns_generation(hidden, generation):
+                continue
+            try:
+                yield WorkLock(hidden, recoverable, generation)
+            finally:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+            return
+        finally:
+            os.close(descriptor)
+
+
+def _owns_generation(path: Path, generation: tuple[int, int]) -> bool:
     try:
-        fcntl.flock(descriptor, fcntl.LOCK_EX)
-        yield hidden, existed
-    finally:
-        fcntl.flock(descriptor, fcntl.LOCK_UN)
-        os.close(descriptor)
+        current = os.stat(path, follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    return stat.S_ISDIR(current.st_mode) and (current.st_dev, current.st_ino) == generation
 
 
 def _prepare_work(hidden: Path, identity: ArtifactIdentity, size: int, *, recoverable: bool) -> Recovery:
@@ -387,8 +417,7 @@ def _prepare_work(hidden: Path, identity: ArtifactIdentity, size: int, *, recove
         return Recovery("committed", dataset=dataset, receipt=_recover_receipt(receipt_path, dataset, identity.destination))
     for path in hidden.rglob("*.tmp"):
         shutil.rmtree(path) if path.is_dir() else path.unlink()
-    if binding_path.is_file() and chunks.is_dir():
-        checkpoints = CheckpointSet.recover(chunks, identity, size)
+    if binding_path.is_file():
         if ready.exists():
             try:
                 dataset = _open_dataset(ready, work=True)
@@ -397,9 +426,11 @@ def _prepare_work(hidden: Path, identity: ArtifactIdentity, size: int, *, recove
                 receipt_path.unlink(missing_ok=True)
             else:
                 identity.validate_dataset(dataset)
-                return Recovery("staged", checkpoints, dataset, _recover_receipt(receipt_path, dataset, identity.destination))
-        receipt_path.unlink(missing_ok=True)
-        return Recovery("checkpointing", checkpoints)
+                return Recovery("staged", dataset=dataset, receipt=_recover_receipt(receipt_path, dataset, identity.destination))
+        if chunks.is_dir():
+            checkpoints = CheckpointSet.recover(chunks, identity, size)
+            receipt_path.unlink(missing_ok=True)
+            return Recovery("checkpointing", checkpoints)
     for path in hidden.iterdir():
         shutil.rmtree(path) if path.is_dir() else path.unlink()
     chunks.mkdir()
@@ -546,8 +577,9 @@ async def materialize_artifact(
     """Recover or create one complete immutable artifact in a single ordered workflow."""
 
     identity = ArtifactIdentity.from_request(request, source.resolved)
-    with _locked_work(identity) as (hidden, recoverable):
-        recovery = _prepare_work(hidden, identity, source.chunk_size, recoverable=recoverable)
+    with _locked_work(identity) as lock:
+        hidden = lock.path
+        recovery = _prepare_work(hidden, identity, source.chunk_size, recoverable=lock.recoverable)
         recovered = recovery.kind != "checkpointing" or bool(recovery.checkpoints and recovery.checkpoints.items)
         if recovery.kind == "committed":
             assert recovery.dataset is not None
@@ -599,7 +631,7 @@ async def materialize_artifact(
             publication("publishing")
             _publish(hidden, identity.destination)
             publication("committed")
-        _discard_work(hidden)
+        _discard_work(lock)
         progress(
             {
                 "event": "published",
@@ -920,9 +952,14 @@ def _publish(hidden: Path, destination: Path) -> None:
     _fsync_directory(hidden)
 
 
-def _discard_work(hidden: Path) -> None:
-    root = hidden.parent
-    shutil.rmtree(hidden)
+def _discard_work(lock: WorkLock) -> None:
+    root = lock.path.parent
+    if not _owns_generation(lock.path, lock.generation):
+        raise BlockweaverError("PUBLICATION_FAILED", "Work directory generation changed before cleanup")
+    try:
+        shutil.rmtree(lock.path)
+    except FileNotFoundError:
+        raise BlockweaverError("PUBLICATION_FAILED", "Work directory disappeared before cleanup") from None
     _fsync_directory(root)
 
 
