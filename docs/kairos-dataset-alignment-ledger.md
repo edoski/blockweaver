@@ -28,7 +28,7 @@
 - Do not add a permanent import command, import source, migration API, or migration module to either product. Migration is a one-time operation, not product scope.
 - File schema, row count, range, timestamps, output digest, target hash, finalized anchor, and verification samples are generated from the files and provider verification during migration.
 - Record Ethereum and Polygon acquisition as PublicNode RPC and Avalanche acquisition as BigQuery through `bigquery-public-data.goog_blockchain_avalanche_contract_chain_us`. Do not add an evidence-status distinction. No endpoint URL, credential, billing project, or secret enters the manifest.
-- Use a versioned clean-break durable contract for UUID-only addressing and migrated source metadata. Version-1 artifacts are not accepted by the new KAIROS path.
+- Use one unversioned clean-break durable contract for UUID-only addressing and migrated source metadata. Remove `manifest_version` and `dataset_version`; the loader accepts only the exact current shape and retains no legacy branch.
 - Existing `outputs/corpora/` directories are not deleted by migration. Deletion requires separate approval after all new datasets and KAIROS consumers pass acceptance.
 
 ## Architecture consequences
@@ -57,7 +57,7 @@
 ### Scope
 
 - Replace chain/date/UUID directory naming with `ROOT/<uuid>/` and enforce agreement between directory UUID and manifest UUID.
-- Version the clean-break manifest and dataset contract.
+- Replace the old manifest with the one exact unversioned clean-break shape and remove artifact-version tags.
 - Promote a small public immutable dataset value/loader from the existing strict local loader.
 - Keep `download` and `verify` behavior source-independent and update documentation.
 - Consolidate tests as needed to remain within five implementation modules, five runtime dependencies including extras, and 900 test lines.
