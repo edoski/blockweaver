@@ -104,7 +104,7 @@ Every newly downloaded dataset has one durable UUID address independent of chain
 
 ## Slice 1A: trusted request and deep source acquisition
 
-- Status: correction committed at `7e3e009058ffda0cad58ee320b0d199c0614a5ec`; focused re-review pending.
+- Status: first correction closed every Spec finding but retained one Standards finding; second focused correction pending.
 - Repository: Blockweaver.
 - Baseline: `c4c8da1ee8c95d76ea6444f6ffab6e2b2b1dacc7`.
 - Dependencies: completed Slice 1.
@@ -314,5 +314,6 @@ GitHub issue [#2](https://github.com/edoski/blockweaver/issues/2) records the au
 - User correction during Slice 1A: the numeric test-line cap was false/stale. Remove every explicit cap from repository standards, historical specs, this ledger, and issue #3; keep tests lean by behavior and seam quality rather than line count.
 - Slice 1A reviewer: `/root/consolidation_1a_review`, with parallel Standards and Spec lanes over fixed range `c4c8da1ee8c95d76ea6444f6ffab6e2b2b1dacc7...b1c2c67de472cdb7c7d1fa9f131a8b572af746e8`. Initial result: rejected. Standards found one P2 stale “below the repository limit” phrase. Spec found four issues: P1 retry IDs lost order through a set; P1 new paired provider calls lacked sibling cancellation; P2 header-only rows still allocated empty fee dictionaries; P2 the same stale limit phrase contradicted the user correction.
 - Slice 1A correction: `7e3e009058ffda0cad58ee320b0d199c0614a5ec` (`fix(source): preserve acquisition invariants`). It removes the remaining implicit test limit, preserves pending/request order across retries, restores cancellation-and-await for paired provider work, and keeps header-only fee state absent. Worker reported 53 passing tests and every static, lock, import, residue, module, and dependency gate green. Re-review range is `b1c2c67de472cdb7c7d1fa9f131a8b572af746e8...7e3e009058ffda0cad58ee320b0d199c0614a5ec`.
+- Slice 1A first correction review: Spec 0, Standards 1. All original functional findings closed. The remaining P2 finding is a correction-introduced private `Header`/`Header.row` monkeypatch and sentinel assertion in `tests/test_cli.py`; replace it with observable CLI/artifact and no-fee-history evidence rather than testing an internal transition.
 
 No consolidation implementation, provider call, migration script, output mutation, KAIROS slice, cleanup, or deployment exists yet. The completed Servatus work and active HPO are external protected state, not work owned by this run.
