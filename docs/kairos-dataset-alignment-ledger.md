@@ -104,7 +104,7 @@ Every newly downloaded dataset has one durable UUID address independent of chain
 
 ## Slice 1A: trusted request and deep source acquisition
 
-- Status: implementation committed at `b1c2c67de472cdb7c7d1fa9f131a8b572af746e8`; awaiting independent review.
+- Status: initial implementation `b1c2c67de472cdb7c7d1fa9f131a8b572af746e8` rejected by independent review; focused correction round pending.
 - Repository: Blockweaver.
 - Baseline: `c4c8da1ee8c95d76ea6444f6ffab6e2b2b1dacc7`.
 - Dependencies: completed Slice 1.
@@ -310,7 +310,8 @@ GitHub issue [#2](https://github.com/edoski/blockweaver/issues/2) records the au
 - The architecture report was generated outside the repository as an ephemeral research artifact. No product, provider, output, KAIROS, job, campaign, release, push, or PyPI mutation occurred during research.
 - Consolidation execution issue: [#3](https://github.com/edoski/blockweaver/issues/3). Pre-run checkout: clean `main` at `edea482ef777a4a5005928e5483fd170d28cdf69`, nine commits ahead of `origin/main`, with only the normal `/Users/edo/dev/python/blockweaver` worktree and no run-owned branches.
 - Slice 1A baseline: `c4c8da1ee8c95d76ea6444f6ffab6e2b2b1dacc7`. Implementer: `/root/consolidation_1a_impl`; worktree `/Users/edo/dev/python/blockweaver-slice-1a`; branch `codex/consolidation-slice-1a`.
-- Slice 1A implementation head: `b1c2c67de472cdb7c7d1fa9f131a8b572af746e8` (`refactor(source): consolidate acquisition boundary`). Worker reported 51 passing tests plus green Ruff lint/format, Pyright, Vulture, lock, diff, CLI, lazy/optional-import, residue, module, and dependency checks. Orchestrator verified the clean head and nonempty fixed diff; independent review is pending.
+- Slice 1A implementation head: `b1c2c67de472cdb7c7d1fa9f131a8b572af746e8` (`refactor(source): consolidate acquisition boundary`). Worker reported 51 passing tests plus green Ruff lint/format, Pyright, Vulture, lock, diff, CLI, lazy/optional-import, residue, module, and dependency checks. Orchestrator verified the clean head and nonempty fixed diff before review.
 - User correction during Slice 1A: the numeric test-line cap was false/stale. Remove every explicit cap from repository standards, historical specs, this ledger, and issue #3; keep tests lean by behavior and seam quality rather than line count.
+- Slice 1A reviewer: `/root/consolidation_1a_review`, with parallel Standards and Spec lanes over fixed range `c4c8da1ee8c95d76ea6444f6ffab6e2b2b1dacc7...b1c2c67de472cdb7c7d1fa9f131a8b572af746e8`. Initial result: rejected. Standards found one P2 stale “below the repository limit” phrase. Spec found four issues: P1 retry IDs lost order through a set; P1 new paired provider calls lacked sibling cancellation; P2 header-only rows still allocated empty fee dictionaries; P2 the same stale limit phrase contradicted the user correction.
 
 No consolidation implementation, provider call, migration script, output mutation, KAIROS slice, cleanup, or deployment exists yet. The completed Servatus work and active HPO are external protected state, not work owned by this run.
