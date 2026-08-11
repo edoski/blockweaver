@@ -2,21 +2,22 @@
 
 ## Run
 
-- Status: plan complete; implementation and output migration are not authorized in this phase.
+- Status: realigned to current repositories on 2026-08-11; Blockweaver Slice 1 is ready after its issue-rule gate, while KAIROS integration and all data/deployment work remain blocked.
 - Authoritative spec: this ledger plus the user-approved decisions below.
-- Blockweaver planning baseline: `c8ecdd17c79633903b79c782c378fd10dc4e1fef`, clean `main`, equal to `origin/main`.
-- KAIROS pre-run planning baseline: `f7fcac53069a67b27caee8bb6ee8319fb8c6caa6`, `main` sixteen commits ahead of `origin/main`.
-- KAIROS plan-close head: concurrent user-owned work advanced `main` to `3c8af509070ab4fa2c67ac1ebc6cacad7d99e368`, seventeen commits ahead of `origin/main`. This run owns neither commit.
-- Protected KAIROS dirt: modified `app/package.json`; untracked `docs/research/thesis-epigraph-candidates.md`, `docs/research/thesis-epigraph-canonical-epics-pass.md`, `docs/research/thesis-epigraph-finalists.md`, and `docs/research/thesis-epigraph-fresh-pass.md`.
+- Blockweaver current baseline: `35847591ea934a253bac3ec27083a022086ac114`, clean `main`, two plan commits ahead of `origin/main`.
+- KAIROS current baseline: `e96c9f4d0917c35c58f23b3cd43accd61e005d61`, clean committed `main` equal to GitHub and research remotes before protected working-tree dirt.
+- Servatus state: execution/lifecycle extraction is complete, independently green, and synchronized at `2ccf749e2a4c3f5ad7ca572ee34fe78e5b1bb78f` (`v0.4.1`). This plan requires no Servatus code, API, release, or data change.
+- Protected KAIROS dirt: modified `app/package.json`, `docs/KAIROS.md`, `experiments/figure_hpo.py`, and `tests/experiments/test_figures.py`; untracked `experiments/figure_k_study.py` plus four `docs/research/thesis-epigraph-*.md` files.
 - Pre-run worktrees: one normal worktree per repository; no run-owned branch or worktree exists.
 - Execution checkout policy: use isolated `codex/` branches and worktrees, one writer at a time. Integrate only after each repository slice is green. Never include protected dirt.
-- Planning authorization: this ledger only. Do not change product code, either repository's `outputs/`, external providers, GitHub, releases, or PyPI.
+- Current authority: this realignment ledger only. Do not change product code, either repository's outputs, remote storage, providers, jobs, GitHub, releases, or PyPI until the corresponding gate is explicitly opened.
 
 ## Confirmed decisions
 
 - Make a clean break. Do not add legacy readers, dual paths, compatibility shims, or transition tests.
 - Blockweaver owns blockchain dataset acquisition, materialization provenance, verification, hashing, schema declaration, and immutable publication.
 - KAIROS owns scientific interpretation through `CorpusDefinition` and `BlockFrame`, but not a second corpus manifest.
+- Servatus continues to own only generic work/submission/publication mechanics. It treats destinations as opaque paths and remains independent of Blockweaver datasets.
 - Blockweaver publishes under the KAIROS storage root at exactly `outputs/datasets/<dataset_id>/manifest.json` plus `blocks.parquet`. Its generic address is `ROOT/<dataset_id>/`; KAIROS supplies `outputs/datasets` as `ROOT`.
 - A Blockweaver dataset UUID remains the KAIROS `corpus_id`. Existing Study, artifact, evaluation, and experiment associations remain UUID-based and unchanged.
 - KAIROS accepts Parquet only and requires its exact ordered eight-column projection: `block_number`, `timestamp`, `base_fee_per_gas`, `gas_used`, `gas_limit`, `tx_count`, `effective_priority_fee_per_gas_p50`, and `effective_priority_fee_per_gas_p90`.
@@ -30,10 +31,11 @@
 - Record Ethereum and Polygon acquisition as PublicNode RPC and Avalanche acquisition as BigQuery through `bigquery-public-data.goog_blockchain_avalanche_contract_chain_us`. Do not add an evidence-status distinction. No endpoint URL, credential, billing project, or secret enters the manifest.
 - Use one unversioned clean-break durable contract for UUID-only addressing and migrated source metadata. Remove `manifest_version` and `dataset_version`; the loader accepts only the exact current shape and retains no legacy branch.
 - Existing `outputs/corpora/` directories are not deleted by migration. Deletion requires separate approval after all new datasets and KAIROS consumers pass acceptance.
+- The same additive dataset conversion is required under the research storage root before any new KAIROS image uses the Blockweaver loader. Old local and research `corpora/` directories remain available to the active legacy image.
 
 ## Architecture consequences
 
-- KAIROS ADR 0006 must be superseded: Corpus authority moves from `corpora/<uuid>/corpus.json` to the Blockweaver manifest at `datasets/<uuid>/manifest.json`; all other durable object addresses and authority remain unchanged.
+- Add a new Blockweaver dataset-authority ADR that supersedes only ADR 0006's Corpus clause. ADR 0006 remains authoritative for Study, artifact, and evaluation objects; ADR 0008 and the completed Servatus boundary remain unchanged.
 - `BlockFrame` becomes an eight-column value. `CorpusDefinition` remains because chain identity and range affect scientific feature construction.
 - `STORAGE_ROOT` remains KAIROS's single root. Corpus loading resolves `STORAGE_ROOT/datasets/<corpus_id>`; no second environment variable or repository-specific absolute path is introduced.
 - KAIROS takes a runtime dependency on the compatible Blockweaver release and uses only its public artifact API.
@@ -43,6 +45,8 @@
 ## Gates before implementation
 
 - Blockweaver `CONTRIBUTING.md` requires a GitHub issue before broadening the CLI, durable format, or provider model. Issue creation is not authorized in this planning phase. Implementation remains blocked until the user authorizes the issue or explicitly waives that repository rule.
+- Active HPO `dfd33e91-702e-46c5-8cb1-3c510af4c048` remains under the old image and `jobs.tsv` lifecycle. Never touch its jobs, local/remote bundle, corpora, logs, scratch, image, or automation authority. It must close normally before the KAIROS loader cutover or first Servatus K-study launch.
+- Do not integrate the KAIROS slice while protected working-tree files remain unresolved, especially `docs/KAIROS.md`, which the slice must also update.
 - Pin fresh baselines and status immediately before every slice.
 - Do not begin a later slice until the current implementation has a committed head and a distinct reviewer returns zero Standards and zero Spec findings.
 - No public RPC, BigQuery, output, GitHub, release, push, or PyPI action is implied by implementation authorization.
@@ -51,7 +55,7 @@
 
 - Status: pending and externally gated by the repository issue requirement.
 - Repository: Blockweaver.
-- Planned baseline: the ledger commit; repin before execution.
+- Planned baseline: the realignment ledger commit; repin before execution.
 - Dependencies: none.
 
 ### Scope
@@ -82,10 +86,10 @@ Every newly downloaded dataset has one durable UUID address independent of chain
 
 ## Slice 2: KAIROS direct dataset consumption
 
-- Status: pending.
+- Status: pending; blocked by active legacy HPO closure, protected KAIROS dirt, Slice 1 release/pin, and additive local/research dataset preparation.
 - Repository: KAIROS.
-- Planned baseline: `3c8af509070ab4fa2c67ac1ebc6cacad7d99e368`; repin before execution and preserve recorded dirt and later user-owned commits.
-- Dependencies: Blockweaver Slice 1 green with a released or otherwise reproducibly pinned package artifact.
+- Planned baseline: `e96c9f4d0917c35c58f23b3cd43accd61e005d61`; repin after the active scientific work settles and preserve every later user-owned commit.
+- Dependencies: Blockweaver Slice 1 green with a released or otherwise reproducibly pinned package artifact; Servatus remains pinned at its accepted version and requires no change.
 
 ### Scope
 
@@ -94,7 +98,7 @@ Every newly downloaded dataset has one durable UUID address independent of chain
 - Derive `CorpusDefinition` from dataset ID, chain ID, and resolved range.
 - Require Parquet and the exact KAIROS feature order; create the eight-column `BlockFrame`.
 - Delete `CorpusRequest`, `corpus.json` parsing, corpus address helpers, and row `chain_id`.
-- Update callers, focused tests, glossary, KAIROS documentation, and supersede ADR 0006 without changing other durable object contracts.
+- Update callers, focused tests, glossary, KAIROS documentation, and add the narrow dataset-authority ADR without changing other durable object contracts or ADR 0008.
 
 ### Non-goals
 
@@ -115,17 +119,27 @@ KAIROS consumes one verified Blockweaver dataset directly from its own `outputs/
 - Prove no production code reads `outputs/corpora`, `corpus.json`, `CorpusRequest`, or row-level `chain_id`.
 - Explicitly not run: real outputs, remote/Slurm, GPU, app device, push, release.
 
-## Externally authorized migration gate
+## Externally authorized dataset preparation gate
 
 - Status: blocked; not part of this planning phase or any implementation slice.
-- Preconditions: both slices green; compatible Blockweaver artifact available; KAIROS integration checks green; exact source and destination paths resolved read-only; sufficient disk space; explicit user authorization to modify `outputs/` and contact PublicNode and BigQuery for verification.
+- Timing: after Blockweaver Slice 1 is green and before KAIROS Slice 2 is integrated or deployed. The active legacy HPO may continue only because this gate is additive and leaves every old corpus path untouched; nevertheless no local or remote write occurs without separate approval and a noninterference check.
+- Preconditions: compatible Blockweaver artifact available; exact local and research source/destination paths resolved read-only; sufficient space on both filesystems; current HPO state checked; explicit user authorization to modify local/research storage and contact PublicNode and BigQuery for verification.
 - Migration implementation: a temporary script in a temporary git repository. Exercise it against synthetic fixtures and copies, commit it only in that temporary repository, review its fixed diff through the same independent Standards/Spec gate, record its commit and SHA-256, then delete the repository and script after successful migration. Do not commit migration code to Blockweaver or KAIROS and do not rely on conversational memory for destructive logic.
-- Inputs: the three existing `outputs/corpora/<uuid>/blocks.parquet` files. The old directories remain untouched.
-- Destinations: matching `outputs/datasets/<uuid>/` directories, published without replacement.
+- Local inputs: the three existing `outputs/corpora/<uuid>/blocks.parquet` files. Research inputs: the matching canonical corpora under the configured research storage root. All old directories remain untouched.
+- Destinations: matching local and research `datasets/<uuid>/` directories, published without replacement. Prefer one verified conversion plus checksum-proven transfer when source files agree; never perform two uncorrelated conversions under one UUID.
 - Source metadata: PublicNode RPC for Ethereum and Polygon; Google Blockchain Analytics dataset for Avalanche. Generate source/output digests and current verification metadata during migration without a claimed/proven distinction.
-- Acceptance: UUID/chain/range agreement; exact eight-column row equality after removing constant `chain_id`; canonical manifest; byte/hash/schema/domain checks; provider verification sufficient for the normal source contract; KAIROS load smoke for all three; no changes outside the three new dataset directories.
-- Not authorized: deleting `outputs/corpora`, rewriting any of the 213 downstream JSON records, regenerating datasets, modifying other outputs, pushing, or publishing packages. Provider verification may read existing source facts but must not rebuild dataset rows.
+- Acceptance: UUID/chain/range agreement; exact eight-column row equality after removing constant `chain_id`; canonical unversioned manifest; byte/hash/schema/domain checks; provider verification sufficient for the normal source contract; matching local/research checksums; isolated new-loader smoke for all three; no changes outside the six new dataset directories.
+- Not authorized: deleting old `corpora`, rewriting any of the 213 downstream JSON records, regenerating datasets, modifying other outputs, changing jobs, or publishing packages. Provider verification may read existing source facts but must not rebuild dataset rows.
+
+## Deployment and clean-break gate
+
+- Status: blocked; follows green KAIROS Slice 2 and accepted local/research datasets.
+- Integrate the reviewed KAIROS head only after protected dirt is resolved and all three datasets strict-load locally.
+- Build a new immutable KAIROS image from the exact integrated SHA through the documented `sbuild` procedure; run `apptainer test` and a bounded GPU smoke before changing future campaign configuration.
+- Preserve the old image and old `corpora/` paths for the completed legacy HPO record. The first new campaign using the aligned code must use Servatus, the new image, and `datasets/<uuid>` exclusively.
+- Do not mix loaders, images, campaign ledgers, or corpus paths within one campaign. No compatibility branch is added.
+- Pushes, research configuration changes, image deployment, and the first new campaign each require their declared external authority.
 
 ## Execution ledger
 
-No slice worker, reviewer, branch, worktree, implementation commit, review range, finding, correction, provider call, migration script, or output mutation exists yet.
+No alignment slice worker, reviewer, branch, worktree, implementation commit, review range, finding, correction, provider call, migration script, output mutation, or deployment exists yet. The completed Servatus work and active HPO are external protected state, not work owned by this run.
