@@ -46,7 +46,7 @@
 - `STORAGE_ROOT` remains KAIROS's single root. Corpus loading resolves `STORAGE_ROOT/datasets/<corpus_id>`; no second environment variable or repository-specific absolute path is introduced.
 - KAIROS takes a runtime dependency on the compatible Blockweaver release and uses only its public artifact interface.
 - KAIROS should lose roughly 15–30 production lines by deleting `CorpusRequest`, three corpus address helpers, JSON parsing, and row `chain_id`, net of the thin dataset-to-`BlockFrame` mapping. The main simplification is one metadata authority, not a large LOC reduction.
-- Slice 1 remained near LOC-neutral. The consolidation should remove caller knowledge and repeated work, with a directional production-code deletion target of 100–220 lines. Tests should consolidate around public and fake-service behavior without an arbitrary line-count cap. Architecture and preserved behavior decide acceptance.
+- Slice 1 remained near LOC-neutral. The consolidation should remove caller knowledge and repeated work, with a directional production-code deletion target of 100–220 lines. Tests should consolidate around public and fake-service behavior. Architecture and preserved behavior decide acceptance.
 
 ## Consolidation design
 
@@ -104,7 +104,7 @@ Every newly downloaded dataset has one durable UUID address independent of chain
 
 ## Slice 1A: trusted request and deep source acquisition
 
-- Status: second correction committed at `f30e90737e5250ede10087688f5f3421fe8e596f`; focused re-review pending.
+- Status: green and integrated on `main` at `78893379edfc0d7750104ee810bddd99cc52e695`; Standards 0 and Spec 0.
 - Repository: Blockweaver.
 - Baseline: `c4c8da1ee8c95d76ea6444f6ffab6e2b2b1dacc7`.
 - Dependencies: completed Slice 1.
@@ -311,10 +311,11 @@ GitHub issue [#2](https://github.com/edoski/blockweaver/issues/2) records the au
 - Consolidation execution issue: [#3](https://github.com/edoski/blockweaver/issues/3). Pre-run checkout: clean `main` at `edea482ef777a4a5005928e5483fd170d28cdf69`, nine commits ahead of `origin/main`, with only the normal `/Users/edo/dev/python/blockweaver` worktree and no run-owned branches.
 - Slice 1A baseline: `c4c8da1ee8c95d76ea6444f6ffab6e2b2b1dacc7`. Implementer: `/root/consolidation_1a_impl`; worktree `/Users/edo/dev/python/blockweaver-slice-1a`; branch `codex/consolidation-slice-1a`.
 - Slice 1A implementation head: `b1c2c67de472cdb7c7d1fa9f131a8b572af746e8` (`refactor(source): consolidate acquisition boundary`). Worker reported 51 passing tests plus green Ruff lint/format, Pyright, Vulture, lock, diff, CLI, lazy/optional-import, residue, module, and dependency checks. Orchestrator verified the clean head and nonempty fixed diff before review.
-- User correction during Slice 1A: the numeric test-line cap was false/stale. Remove every explicit cap from repository standards, historical specs, this ledger, and issue #3; keep tests lean by behavior and seam quality rather than line count.
-- Slice 1A reviewer: `/root/consolidation_1a_review`, with parallel Standards and Spec lanes over fixed range `c4c8da1ee8c95d76ea6444f6ffab6e2b2b1dacc7...b1c2c67de472cdb7c7d1fa9f131a8b572af746e8`. Initial result: rejected. Standards found one P2 stale “below the repository limit” phrase. Spec found four issues: P1 retry IDs lost order through a set; P1 new paired provider calls lacked sibling cancellation; P2 header-only rows still allocated empty fee dictionaries; P2 the same stale limit phrase contradicted the user correction.
+- User correction during Slice 1A: tests are judged by behavior and seam quality. All conflicting source-size language was deleted from repository standards, historical specs, this ledger, and issue #3.
+- Slice 1A reviewer: `/root/consolidation_1a_review`, with parallel Standards and Spec lanes over fixed range `c4c8da1ee8c95d76ea6444f6ffab6e2b2b1dacc7...b1c2c67de472cdb7c7d1fa9f131a8b572af746e8`. Initial result: rejected. Standards found one P2 stale testing-size phrase. Spec found four issues: P1 retry IDs lost order through a set; P1 new paired provider calls lacked sibling cancellation; P2 header-only rows still allocated empty fee dictionaries; P2 the same stale phrase contradicted the user correction.
 - Slice 1A correction: `7e3e009058ffda0cad58ee320b0d199c0614a5ec` (`fix(source): preserve acquisition invariants`). It removes the remaining implicit test limit, preserves pending/request order across retries, restores cancellation-and-await for paired provider work, and keeps header-only fee state absent. Worker reported 53 passing tests and every static, lock, import, residue, module, and dependency gate green. Re-review range is `b1c2c67de472cdb7c7d1fa9f131a8b572af746e8...7e3e009058ffda0cad58ee320b0d199c0614a5ec`.
 - Slice 1A first correction review: Spec 0, Standards 1. All original functional findings closed. The remaining P2 finding is a correction-introduced private `Header`/`Header.row` monkeypatch and sentinel assertion in `tests/test_cli.py`; replace it with observable CLI/artifact and no-fee-history evidence rather than testing an internal transition.
 - Slice 1A second correction: `f30e90737e5250ede10087688f5f3421fe8e596f` (`test(source): keep header proof at boundary`). It removes 19 private-oracle test lines while retaining CLI/artifact output and fake-RPC no-fee-history evidence. No product code changed; worker reported 53 passing tests and all gates green. Re-review range is `7e3e009058ffda0cad58ee320b0d199c0614a5ec...f30e90737e5250ede10087688f5f3421fe8e596f`.
+- Slice 1A final re-review: Standards 0, Spec 0, overall green. The last fixed range contained only the 19 test deletions. Integration merge: `78893379edfc0d7750104ee810bddd99cc52e695` (`merge(source): integrate consolidation slice 1a`). Main integration passed 53 tests, Ruff lint/format, Pyright, Vulture, lock, CLI, core/optional imports, diff, residue, module, dependency, and clean-status checks. No provider, output, KAIROS, job, campaign, GPU/image, push, release, or PyPI action occurred.
 
 No consolidation implementation, provider call, migration script, output mutation, KAIROS slice, cleanup, or deployment exists yet. The completed Servatus work and active HPO are external protected state, not work owned by this run.
