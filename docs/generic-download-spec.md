@@ -43,7 +43,7 @@ blockweaver download
 blockweaver verify
 ```
 
-`download` and `verify` are the external deep-module interface. The other commands create or inspect configuration and the feature catalog. Remove `acquire`, `acquire-bigquery`, and `extend` completely.
+`download` and `verify` are the CLI acquisition and validation interface. The other commands create or inspect configuration and the feature catalog. Python consumers use the separate read-only `Dataset` value and `open_dataset` loader; acquisition internals remain private. Remove `acquire`, `acquire-bigquery`, and `extend` completely.
 
 Blockweaver is generic across EVM-compatible chains, not arbitrary blockchain protocols. Chain and provider profiles are data. Source, feature, range, verification, recovery, and publication mechanics stay hidden.
 

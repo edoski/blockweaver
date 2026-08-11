@@ -26,6 +26,7 @@ from ._contract import (
     Anchor,
     BlockweaverError,
     Header,
+    OutputFormat,
     Plan,
     Value,
     plan_features,
@@ -82,7 +83,7 @@ class Dataset:
     first_timestamp: int
     last_timestamp: int
     schema: tuple[str, ...]
-    output_format: str
+    output_format: OutputFormat
     row_count: int
     data_path: Path
     _manifest_json: bytes = field(repr=False, compare=False)

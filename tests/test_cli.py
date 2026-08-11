@@ -228,11 +228,13 @@ def test_parquet_download_selects_and_coalesces_features(tmp_path: Path, chains:
     block_calls = [call for batch in primary.requests for call in batch if call["method"] == "eth_getBlockByNumber"]
     acquired = [call for call in block_calls if call["params"][0] in {hex(number) for number in range(10, 15)}]
     assert all(call["params"][1] is False for call in acquired)
-
     manifest_text = (artifact / "manifest.json").read_text()
     manifest = json.loads(manifest_text)
     assert manifest_text.endswith("\n")
-    assert set(manifest) == _corpus._MANIFEST_KEYS
+    identity_keys = {"tool_version", "dataset_id", "completed_at", "chain", "source", "requested_range", "resolved_range"}
+    artifact_keys = {"schema", "acquisition_plan", "row_count", "output", "target_hash", "finalized_anchor", "verification"}
+    assert set(manifest) == identity_keys | artifact_keys
+    assert {"manifest_version", "dataset_version"}.isdisjoint(manifest)
     assert manifest["schema"] == [
         {"name": "block_number", "type": "Int64", "unit": "block"},
         {"name": "timestamp", "type": "Int64", "unit": "unix_second"},
