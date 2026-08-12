@@ -753,7 +753,7 @@ def test_resume_reuses_only_complete_chunks_and_rejects_rebinding(
     assert primary.request_counts[11] == 1
 
 
-@pytest.mark.parametrize("corruption", ["digest", "duplicate"])
+@pytest.mark.parametrize("corruption", ["digest", "duplicate", "domain"])
 def test_resume_integrity_binds_checkpoint_bytes_and_exported_proofs(
     tmp_path: Path,
     chains: tuple[ChainServer, ChainServer],
@@ -777,9 +777,12 @@ def test_resume_integrity_binds_checkpoint_bytes_and_exported_proofs(
     chunks = tmp_path / "out" / f".blockweaver-{DATASET_ID}" / "chunks"
     checkpoint = next(chunks.iterdir())
     frame = pl.read_parquet(checkpoint)
-    column = "base_fee_per_gas" if corruption == "digest" else "timestamp"
-    frame.with_columns((pl.col(column) + 1).alias(column)).write_parquet(checkpoint)
-    if corruption == "duplicate":
+    if corruption == "domain":
+        frame.with_columns(pl.lit(0).alias("base_fee_per_gas")).write_parquet(checkpoint)
+    else:
+        column = "base_fee_per_gas" if corruption == "digest" else "timestamp"
+        frame.with_columns((pl.col(column) + 1).alias(column)).write_parquet(checkpoint)
+    if corruption != "digest":
         first, last, _digest = checkpoint.stem.split("-")
         digest = hashlib.sha256(checkpoint.read_bytes()).hexdigest()
         checkpoint.rename(checkpoint.with_name(f"{first}-{last}-{digest}.parquet"))
