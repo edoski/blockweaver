@@ -338,7 +338,7 @@ Feature requirements have one owner and range/finality work performs no duplicat
 
 ## Proposed Slice 3C: delete durable receipt shadow state
 
-- Status: approved; ready after green Slice 3B and a clean fresh hidden-work inventory.
+- Status: green and integrated on `main` at `e05cae16719bf71cb8d69a82d8b7378f51e77a5c`; Standards 0 and Spec 0.
 - Repository: Blockweaver.
 - Dependencies: green Slice 3B; fresh hidden-work inventory immediately before implementation.
 
@@ -370,7 +370,7 @@ The durable filesystem contains only state needed to resume or prove publication
 
 ## Proposed Slice 3D: proof pipeline deepening
 
-- Status: approved; blocked on green Slice 3C.
+- Status: approved; ready after green Slice 3C.
 - Repository: Blockweaver.
 - Dependencies: green Slice 3C.
 
@@ -562,6 +562,10 @@ GitHub issue [#4](https://github.com/edoski/blockweaver/issues/4) records approv
 - Slice 3B implementation: `027272e35f2a927024cee869ac9ec3a89a03681b` (`refactor(source): consolidate planning and ranges`). `Plan` owns the immutable typed BigQuery requirements projection; duplicate verifier and boundary calls are removed; target agreement is successful control flow; frozen `Header` equality replaces `_same_header` while `_same_core` remains. Reviewer `/root/consolidation_3b_review` returned Standards 0 and Spec 0. The reviewer explicitly challenged the net +34 production lines and accepted them as one deeper requirements owner rather than synchronized shadow state.
 - Slice 3B integration: merge `5b79246e5cc2571beacb5184763b16282d16653a` (`merge(source): integrate consolidation slice 3b`). Main passed all 97 tests, Ruff lint/format, Pyright, Vulture, lock and diff checks, five-command CLI help, lazy core import, and optional BigQuery import. No live RPC, ADC, BigQuery job, output, KAIROS, image, campaign, release, or publication occurred.
 - Pre-3C hidden-work inventory: the platform config `/Users/edo/Library/Application Support/blockweaver/config.toml` is absent; a bounded read-only scan under `/Users/edo/dev/python` found no `.blockweaver-<uuid>` directory; the process table contained no running Blockweaver process. No active private receipt state needs completion, compatibility, or abandonment before the clean break.
+- Slice 3C baseline: clean pushed `main` at `5b4d051241cdc6b29ea73207bd97d88473ebf722`. Implementer: `/root/consolidation_3c_impl`; worktree `/Users/edo/dev/python/blockweaver-slice-3c`; branch `codex/consolidation-slice-3c`.
+- Slice 3C implementation: `76d9574fad523993ab445f44953453d8502a79bd` (`refactor(artifact): delete durable receipt shadow state`). It deletes durable `receipt.json`, its schema/recovery/persistence branches, and the redundant publication preflight while preserving public invocation receipts, staged/committed recovery, and no-mutation failure before unsupported atomic rename. Initial review by `/root/consolidation_3c_review`: Standards 0; Spec rejected one test-only P2 because the fresh receipt test asserted keys but not exact fresh counts.
+- Slice 3C correction: `85dea4b87e9c3819f874bffc955128cae31386f3` (`test(artifact): assert fresh download counts`). The existing public receipt test now proves zero reused rows and all rows acquired. Re-review returned Standards 0 and Spec 0. Whole slice is net 70 deleted lines.
+- Slice 3C integration: merge `e05cae16719bf71cb8d69a82d8b7378f51e77a5c` (`merge(artifact): integrate consolidation slice 3c`). Main passed all 96 tests, Ruff lint/format, Pyright, Vulture, lock and diff checks, CLI/import smokes, and receipt/preflight residue checks. No live provider, output, KAIROS, image, campaign, release, or publication occurred.
 
 GitHub issue [#2](https://github.com/edoski/blockweaver/issues/2) records the authorized Blockweaver contract change.
 
