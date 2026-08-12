@@ -401,7 +401,7 @@ Each fresh download proves sampled rows once against the exact candidate bytes t
 
 ## Proposed Slice 3E: checkpoint and row-domain pass consolidation
 
-- Status: approved; ready after green Slice 3D.
+- Status: green and integrated on `main` at `776f20226751b71720134aa33b69bfecd8a0fbee`; Standards 0 and Spec 0.
 - Repository: Blockweaver.
 - Dependencies: green Slice 3D.
 
@@ -432,7 +432,7 @@ Fresh trusted data is not treated as recovered untrusted bytes immediately after
 
 ## Proposed Slice 3F: remove shallow build orchestration
 
-- Status: approved; blocked on green Slice 3E.
+- Status: approved; ready after green Slice 3E.
 - Repository: Blockweaver.
 - Dependencies: green Slice 3E.
 
@@ -569,6 +569,10 @@ GitHub issue [#4](https://github.com/edoski/blockweaver/issues/4) records approv
 - Slice 3D baseline: clean pushed `main` at `4036f5e37ae07fc013a434caf1a5ebb47742e179`. Implementer: `/root/consolidation_3d_impl`; worktree `/Users/edo/dev/python/blockweaver-slice-3d`; branch `codex/consolidation-slice-3d`.
 - Slice 3D implementation: `522a903a3932c7a375c3ceec770debad2e81f1ae` (`refactor(proof): verify candidate samples once`). It deletes retained checkpoint sample facts and the early sample provider pass; final strict-candidate revalidation is the sole sampled-row comparison while early target/finality/ancestry and deterministic sample-number facts remain. Reviewer `/root/consolidation_3d_review` returned Standards 0 and Spec 0. The slice deletes a net 19 lines.
 - Slice 3D integration: merge `5f4fd8967f484d3702bd3f329a6bbbb08bab56c3` (`merge(proof): integrate consolidation slice 3d`). Main passed all 96 tests, Ruff lint/format, Pyright, Vulture, lock and diff checks, CLI/import smokes, and deleted-symbol residue checks. No live provider, output, KAIROS, image, campaign, release, or publication occurred.
+- Slice 3E baseline: clean pushed `main` at `97f2855d637c40881d1f3bf04f781c90aed42daa`. Implementer: `/root/consolidation_3e_impl`; worktree `/Users/edo/dev/python/blockweaver-slice-3e`; branch `codex/consolidation-slice-3e`.
+- Slice 3E implementation: `2afd178a5619179ebac2c1d6fca1ac8926f7f49d` (`refactor(artifact): consolidate checkpoint validation passes`). Fresh checkpoints retain trusted metadata after durable write and digest instead of immediately entering recovered-byte admission; recovered checkpoints remain strict and every checkpoint keeps preassembly resealing. Reviewer `/root/consolidation_3e_review` returned Standards 0 and Spec 0.
+- Slice 3E measurement: five blocks across three checkpoints. Baseline fresh/resume semantic checkpoint reads were `3/3`; head fresh/resume reads are `0/1`. Baseline and head both perform six digest passes: three durable-write hashes and three preassembly reseals. All temporary instrumentation and detached worktrees were removed.
+- Slice 3E integration: merge `776f20226751b71720134aa33b69bfecd8a0fbee` (`merge(artifact): integrate consolidation slice 3e`). Main passed all 96 tests, Ruff lint/format, Pyright, Vulture, lock and diff checks, CLI/import smokes, and instrumentation-residue checks. No live provider, output, KAIROS, image, campaign, release, or publication occurred.
 
 GitHub issue [#2](https://github.com/edoski/blockweaver/issues/2) records the authorized Blockweaver contract change.
 
