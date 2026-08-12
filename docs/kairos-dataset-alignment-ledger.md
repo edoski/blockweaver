@@ -307,7 +307,7 @@ Every raw value is validated once at its owning trust seam, trusted internal val
 
 ## Proposed Slice 3B: source planning and range efficiency
 
-- Status: approved; ready after green Slice 3A.
+- Status: green and integrated on `main` at `5b79246e5cc2571beacb5184763b16282d16653a`; Standards 0 and Spec 0.
 - Repository: Blockweaver.
 - Dependencies: green Slice 3A.
 
@@ -338,7 +338,7 @@ Feature requirements have one owner and range/finality work performs no duplicat
 
 ## Proposed Slice 3C: delete durable receipt shadow state
 
-- Status: approved; blocked on green Slice 3B and the fresh hidden-work inventory.
+- Status: approved; ready after green Slice 3B and a clean fresh hidden-work inventory.
 - Repository: Blockweaver.
 - Dependencies: green Slice 3B; fresh hidden-work inventory immediately before implementation.
 
@@ -558,6 +558,10 @@ GitHub issue [#4](https://github.com/edoski/blockweaver/issues/4) records approv
 - First correction: `6dda4b938bf6dc36857f9f8bbd3d3e7aa44d735e` (`fix(config): validate provider domains once`). Re-review closed the original P2 and found one correction-edge P2: a huge TOML timeout overflowed during raw float coercion instead of producing `CONFIG_INVALID`.
 - Second correction: `d9fc95fdc5380490ed72e0633b87c66d2a65df84` (`fix(config): bound timeout normalization`). Raw numeric parsing is type-only; resolved `Provider` alone normalizes and validates timeout, including huge integers. Final re-review returned Standards 0 and Spec 0.
 - Integration: merge `293d738fd0b81af2d506c1c940691575fa7aaea8` (`merge(config): integrate consolidation slice 3a`). Main passed all 96 tests, Ruff lint/format, Pyright, Vulture, lock and diff checks, five-command CLI help, lazy core import, and optional BigQuery import. No provider, output, KAIROS, image, campaign, release, or package publication occurred.
+- Slice 3B baseline: clean pushed `main` at `d9611b773d7e2cd878ddc673c980f6fe9f001c07`. Implementer: `/root/consolidation_3b_impl`; worktree `/Users/edo/dev/python/blockweaver-slice-3b`; branch `codex/consolidation-slice-3b`.
+- Slice 3B implementation: `027272e35f2a927024cee869ac9ec3a89a03681b` (`refactor(source): consolidate planning and ranges`). `Plan` owns the immutable typed BigQuery requirements projection; duplicate verifier and boundary calls are removed; target agreement is successful control flow; frozen `Header` equality replaces `_same_header` while `_same_core` remains. Reviewer `/root/consolidation_3b_review` returned Standards 0 and Spec 0. The reviewer explicitly challenged the net +34 production lines and accepted them as one deeper requirements owner rather than synchronized shadow state.
+- Slice 3B integration: merge `5b79246e5cc2571beacb5184763b16282d16653a` (`merge(source): integrate consolidation slice 3b`). Main passed all 97 tests, Ruff lint/format, Pyright, Vulture, lock and diff checks, five-command CLI help, lazy core import, and optional BigQuery import. No live RPC, ADC, BigQuery job, output, KAIROS, image, campaign, release, or publication occurred.
+- Pre-3C hidden-work inventory: the platform config `/Users/edo/Library/Application Support/blockweaver/config.toml` is absent; a bounded read-only scan under `/Users/edo/dev/python` found no `.blockweaver-<uuid>` directory; the process table contained no running Blockweaver process. No active private receipt state needs completion, compatibility, or abandonment before the clean break.
 
 GitHub issue [#2](https://github.com/edoski/blockweaver/issues/2) records the authorized Blockweaver contract change.
 
