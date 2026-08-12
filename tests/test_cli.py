@@ -341,6 +341,8 @@ def test_parquet_download_selects_and_coalesces_features(tmp_path: Path, chains:
         "artifact_sha256",
     }
     assert receipt["operation"] == "download"
+    assert receipt["reused_rows"] == 0
+    assert receipt["acquired_rows"] == receipt["rows"] == 5
     dataset = open_dataset(str(artifact))
     assert isinstance(dataset, Dataset) and artifact == tmp_path / "out" / DATASET_ID == dataset.path
     with pytest.raises(TypeError, match="open_dataset"):
