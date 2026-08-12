@@ -70,10 +70,22 @@ def error(result: Any) -> dict[str, Any]:
     return json.loads(lines[-1])
 
 
+@pytest.mark.parametrize("arguments", [["--help"], *[[command, "--help"] for command in ("init", "chains", "features", "download", "verify")]])
+def test_cli_help_paths(arguments: list[str]) -> None:
+    help_result = invoke(arguments)
+    assert help_result.exit_code == 0
+    assert "Usage:" in help_result.stdout
+
+
 def test_cli_commands_and_machine_usage_errors() -> None:
     help_result = invoke(["--help"])
-    assert help_result.exit_code == 0
     assert all(command in help_result.stdout for command in ("init", "chains", "features", "download", "verify"))
+    usage_failure = invoke(["download", "--source", "unknown"])
+    assert usage_failure.exit_code == 2
+    assert usage_failure.stdout == ""
+    assert usage_failure.stderr == (
+        '{"code":"CLI_USAGE","event":"error","message":"Invalid value for \'--source\': \'unknown\' is not one of \'rpc\', \'bigquery\'."}\n'
+    )
     failure = error(invoke(["download"]))
     assert failure["event"] == "error"
     assert failure["code"] == "CONFIG_NOT_FOUND"

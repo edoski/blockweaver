@@ -12,7 +12,6 @@ from typing import Annotated, Any, Literal, Never
 from uuid import UUID, uuid4
 
 import typer
-from typer._click.exceptions import ClickException
 from typer.core import TyperGroup
 
 from ._contract import (
@@ -66,10 +65,14 @@ class MachineGroup(TyperGroup):
         kwargs["standalone_mode"] = False
         try:
             result = super().main(*args, **kwargs)
-        except ClickException as error:
-            _progress({"event": "error", "code": "CLI_USAGE", "message": error.format_message()})
+        except Exception as error:
+            format_message = getattr(error, "format_message", None)
+            exit_code = getattr(error, "exit_code", None)
+            if not callable(format_message) or not isinstance(exit_code, int):
+                raise
+            _progress({"event": "error", "code": "CLI_USAGE", "message": format_message()})
             if standalone_mode:
-                raise SystemExit(error.exit_code) from None
+                raise SystemExit(exit_code) from None
             raise
         if standalone_mode and isinstance(result, int) and result:
             raise SystemExit(result)
