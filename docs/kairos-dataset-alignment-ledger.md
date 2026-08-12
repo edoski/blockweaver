@@ -370,7 +370,7 @@ The durable filesystem contains only state needed to resume or prove publication
 
 ## Proposed Slice 3D: proof pipeline deepening
 
-- Status: approved; ready after green Slice 3C.
+- Status: green and integrated on `main` at `5f4fd8967f484d3702bd3f329a6bbbb08bab56c3`; Standards 0 and Spec 0.
 - Repository: Blockweaver.
 - Dependencies: green Slice 3C.
 
@@ -401,7 +401,7 @@ Each fresh download proves sampled rows once against the exact candidate bytes t
 
 ## Proposed Slice 3E: checkpoint and row-domain pass consolidation
 
-- Status: approved; blocked on green Slice 3D.
+- Status: approved; ready after green Slice 3D.
 - Repository: Blockweaver.
 - Dependencies: green Slice 3D.
 
@@ -566,6 +566,9 @@ GitHub issue [#4](https://github.com/edoski/blockweaver/issues/4) records approv
 - Slice 3C implementation: `76d9574fad523993ab445f44953453d8502a79bd` (`refactor(artifact): delete durable receipt shadow state`). It deletes durable `receipt.json`, its schema/recovery/persistence branches, and the redundant publication preflight while preserving public invocation receipts, staged/committed recovery, and no-mutation failure before unsupported atomic rename. Initial review by `/root/consolidation_3c_review`: Standards 0; Spec rejected one test-only P2 because the fresh receipt test asserted keys but not exact fresh counts.
 - Slice 3C correction: `85dea4b87e9c3819f874bffc955128cae31386f3` (`test(artifact): assert fresh download counts`). The existing public receipt test now proves zero reused rows and all rows acquired. Re-review returned Standards 0 and Spec 0. Whole slice is net 70 deleted lines.
 - Slice 3C integration: merge `e05cae16719bf71cb8d69a82d8b7378f51e77a5c` (`merge(artifact): integrate consolidation slice 3c`). Main passed all 96 tests, Ruff lint/format, Pyright, Vulture, lock and diff checks, CLI/import smokes, and receipt/preflight residue checks. No live provider, output, KAIROS, image, campaign, release, or publication occurred.
+- Slice 3D baseline: clean pushed `main` at `4036f5e37ae07fc013a434caf1a5ebb47742e179`. Implementer: `/root/consolidation_3d_impl`; worktree `/Users/edo/dev/python/blockweaver-slice-3d`; branch `codex/consolidation-slice-3d`.
+- Slice 3D implementation: `522a903a3932c7a375c3ceec770debad2e81f1ae` (`refactor(proof): verify candidate samples once`). It deletes retained checkpoint sample facts and the early sample provider pass; final strict-candidate revalidation is the sole sampled-row comparison while early target/finality/ancestry and deterministic sample-number facts remain. Reviewer `/root/consolidation_3d_review` returned Standards 0 and Spec 0. The slice deletes a net 19 lines.
+- Slice 3D integration: merge `5f4fd8967f484d3702bd3f329a6bbbb08bab56c3` (`merge(proof): integrate consolidation slice 3d`). Main passed all 96 tests, Ruff lint/format, Pyright, Vulture, lock and diff checks, CLI/import smokes, and deleted-symbol residue checks. No live provider, output, KAIROS, image, campaign, release, or publication occurred.
 
 GitHub issue [#2](https://github.com/edoski/blockweaver/issues/2) records the authorized Blockweaver contract change.
 
