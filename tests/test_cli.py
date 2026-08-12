@@ -15,6 +15,7 @@ from uuid import UUID
 
 import polars as pl
 import pytest
+import typer
 from conftest import ChainServer, FakeBigQuery, block_hash
 from typer.testing import CliRunner
 
@@ -30,7 +31,7 @@ from blockweaver._contract import (
     plan_features,
     requested_range,
 )
-from blockweaver.cli import app
+from blockweaver.cli import MachineGroup, app
 
 DATASET_ID = "11111111-1111-4111-8111-111111111111"
 BQ_DATASET = "bigquery-public-data.goog_blockchain_test_us"
@@ -70,13 +71,45 @@ def error(result: Any) -> dict[str, Any]:
     return json.loads(lines[-1])
 
 
+@pytest.mark.parametrize("arguments", [["--help"], *[[command, "--help"] for command in ("init", "chains", "features", "download", "verify")]])
+def test_cli_help_paths(arguments: list[str]) -> None:
+    help_result = invoke(arguments)
+    assert help_result.exit_code == 0
+    assert "Usage:" in help_result.stdout
+
+
 def test_cli_commands_and_machine_usage_errors() -> None:
     help_result = invoke(["--help"])
-    assert help_result.exit_code == 0
     assert all(command in help_result.stdout for command in ("init", "chains", "features", "download", "verify"))
+    usage_failure = invoke(["download", "--source", "unknown"])
+    assert usage_failure.exit_code == 2
+    assert usage_failure.stdout == ""
+    assert usage_failure.stderr == (
+        '{"code":"CLI_USAGE","event":"error","message":"Invalid value for \'--source\': \'unknown\' is not one of \'rpc\', \'bigquery\'."}\n'
+    )
     failure = error(invoke(["download"]))
     assert failure["event"] == "error"
     assert failure["code"] == "CONFIG_NOT_FOUND"
+
+
+def test_machine_usage_boundary_propagates_unrelated_lookalike() -> None:
+    class LookalikeError(RuntimeError):
+        exit_code = 2
+
+        def format_message(self) -> str:
+            return "not a usage error"
+
+    failure = LookalikeError("failure")
+    local_app = typer.Typer(cls=MachineGroup, invoke_without_command=True)
+
+    @local_app.callback()
+    def fail() -> None:
+        raise failure
+
+    result = CliRunner().invoke(local_app, [])
+
+    assert result.exception is failure
+    assert result.stdout == result.stderr == ""
 
 
 def test_init_precedence_permissions_and_no_overwrite(tmp_path: Path) -> None:

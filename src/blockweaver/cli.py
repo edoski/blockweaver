@@ -8,11 +8,10 @@ import os
 import signal
 from collections.abc import Callable, Coroutine
 from pathlib import Path
-from typing import Annotated, Any, Literal, Never
+from typing import Annotated, Any, Literal, Never, Protocol, cast
 from uuid import UUID, uuid4
 
 import typer
-from typer._click.exceptions import ClickException
 from typer.core import TyperGroup
 
 from ._contract import (
@@ -28,6 +27,14 @@ from ._corpus import Publication
 from ._sources import download as download_dataset
 from ._sources import verify_dataset
 
+
+class _UsageFailure(Protocol):
+    exit_code: int
+
+    def format_message(self) -> str: ...
+
+
+_USAGE_ERROR = cast(type[Exception], typer.BadParameter.__base__)
 _EXAMPLE_CONFIG = """[defaults]
 chain = "local"
 source = "rpc"
@@ -66,10 +73,11 @@ class MachineGroup(TyperGroup):
         kwargs["standalone_mode"] = False
         try:
             result = super().main(*args, **kwargs)
-        except ClickException as error:
-            _progress({"event": "error", "code": "CLI_USAGE", "message": error.format_message()})
+        except _USAGE_ERROR as error:
+            failure = cast(_UsageFailure, error)
+            _progress({"event": "error", "code": "CLI_USAGE", "message": failure.format_message()})
             if standalone_mode:
-                raise SystemExit(error.exit_code) from None
+                raise SystemExit(failure.exit_code) from None
             raise
         if standalone_mode and isinstance(result, int) and result:
             raise SystemExit(result)
