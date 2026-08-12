@@ -53,6 +53,12 @@ class BigQueryPlan:
     result_schema: dict[str, str]
 
 
+@dataclass(frozen=True, slots=True)
+class _RangeResolution:
+    value: ResolvedRange
+    headers: tuple[Header, ...]
+
+
 async def _paired(left: Awaitable[_Left], right: Awaitable[_Right]) -> tuple[_Left, _Right]:
     left_task = asyncio.ensure_future(left)
     right_task = asyncio.ensure_future(right)
@@ -120,28 +126,16 @@ def open_bigquery(project: str) -> BigQueryClient:
 
 
 def compile_bigquery(dataset: str, plan: Plan) -> BigQueryPlan:
-    block_fields = {
-        "block_number": "INTEGER",
-        "block_timestamp": "TIMESTAMP",
-        "block_hash": "STRING",
-        "parent_hash": "STRING",
-    }
+    requirements = plan._bigquery_requirements
+    block_fields = dict(requirements.block_fields)
+    gas_domain_proof = "gas_limit" in block_fields
     result_schema = {
         "block_number": "INTEGER",
         "_proof_timestamp": "INTEGER",
         "_proof_hash": "STRING",
         "_proof_parent_hash": "STRING",
     }
-    for feature in plan.features:
-        if feature.bigquery_field is not None:
-            block_fields[feature.bigquery_field] = (
-                "TIMESTAMP" if feature.bigquery_field == "block_timestamp" else "STRING" if feature.dtype == "UTF-8" else "INTEGER"
-            )
-        block_fields.update({dependency: "INTEGER" for dependency in feature.bigquery_dependencies})
-    if plan.percentiles:
-        block_fields.update({"base_fee_per_gas": "INTEGER", "gas_used": "INTEGER"})
-    gas_proof = any(feature.bigquery_dependencies for feature in plan.features)
-    if gas_proof:
+    if gas_domain_proof:
         block_fields.update({"gas_used": "INTEGER", "gas_limit": "INTEGER"})
     tables = {"blocks": block_fields}
     ctes = [
@@ -159,11 +153,11 @@ def compile_bigquery(dataset: str, plan: Plan) -> BigQueryPlan:
         "b.block_hash AS _proof_hash",
         "b.parent_hash AS _proof_parent_hash",
     ]
-    if gas_proof:
+    if gas_domain_proof:
         projections.extend(["b.gas_used AS _proof_gas_used", "b.gas_limit AS _proof_gas_limit"])
         result_schema.update({"_proof_gas_used": "INTEGER", "_proof_gas_limit": "INTEGER"})
-    if any(feature.bigquery_family == "transactions" for feature in plan.features):
-        tables["transactions"] = {"block_hash": "STRING", "block_timestamp": "TIMESTAMP"}
+    if requirements.transaction_fields:
+        tables["transactions"] = dict(requirements.transaction_fields)
         ctes.append(
             "tx_counts AS (\n"
             "  SELECT block_hash, COUNT(*) AS tx_count\n"
@@ -173,14 +167,8 @@ def compile_bigquery(dataset: str, plan: Plan) -> BigQueryPlan:
             ")"
         )
         joins.append("LEFT JOIN tx_counts AS t USING (block_hash)")
-    if plan.percentiles:
-        tables["receipts"] = {
-            "block_hash": "STRING",
-            "block_timestamp": "TIMESTAMP",
-            "transaction_index": "INTEGER",
-            "gas_used": "INTEGER",
-            "effective_gas_price": "INTEGER",
-        }
+    if requirements.receipt_fields:
+        tables["receipts"] = dict(requirements.receipt_fields)
         ctes.extend(
             [
                 "requested_receipts AS (\n"
@@ -202,13 +190,13 @@ def compile_bigquery(dataset: str, plan: Plan) -> BigQueryPlan:
                 + ",\n    ".join(
                     f"MIN(IF(cumulative_gas >= CAST(CEIL(CAST(block_gas_used AS BIGNUMERIC) * {percentile} / 100) AS INT64), "
                     f"priority_fee, NULL)) AS effective_priority_fee_per_gas_p{percentile}"
-                    for percentile in plan.percentiles
+                    for percentile in requirements.percentiles
                 )
                 + "\n  FROM weighted_receipts GROUP BY block_number\n)",
             ]
         )
         joins.append("LEFT JOIN receipt_stats AS r USING (block_number)")
-        if not gas_proof:
+        if not gas_domain_proof:
             projections.append("b.gas_used AS _proof_gas_used")
             result_schema["_proof_gas_used"] = "INTEGER"
         projections.append("COALESCE(r.receipt_gas_used, 0) AS _receipt_gas_used")
@@ -460,16 +448,16 @@ class RpcSource:
             first = end + 1
 
     async def prove(self, target: Header, read_facts: FactReader) -> VerifiedProof:
-        anchor, verifier_target = await _prove_finality(target, self.verifier, self.request)
+        anchor = await _prove_finality(target, self.verifier, self.request)
         samples = sample_numbers(self.request.dataset_id, self.resolved.first_block, self.resolved.last_block)
         facts = read_facts(samples)
         await _check_rows(facts, samples, self.request.plan, self.verifier)
-        return VerifiedProof(anchor, {**self._verification, "target_agreement": target == verifier_target, "sampled_blocks": samples}, facts)
+        return VerifiedProof(anchor, {**self._verification, "target_agreement": True, "sampled_blocks": samples}, facts)
 
     async def revalidate(self, dataset: Dataset) -> None:
         verifier_target = await _candidate_target(dataset, self.verifier)
         target = await self.primary.header(dataset.last_block, dataset._plan)
-        if not _same_header(target, verifier_target):
+        if target != verifier_target:
             raise BlockweaverError("RPC_MISMATCH", "RPC endpoints disagree on the ready candidate target")
         await _finish_candidate_validation(dataset, verifier_target, self.verifier)
 
@@ -526,7 +514,7 @@ class BigQuerySource:
             yield chunk
 
     async def prove(self, target: Header, read_facts: FactReader) -> VerifiedProof:
-        anchor, verifier_target = await _prove_finality(target, self.verifier, self.request)
+        anchor = await _prove_finality(target, self.verifier, self.request)
         samples = sample_numbers(self.request.dataset_id, self.resolved.first_block, self.resolved.last_block)
         facts = read_facts(samples)
         await _check_rows(facts, samples, self.request.plan, self.verifier)
@@ -535,7 +523,7 @@ class BigQuerySource:
             {
                 "verifier_chain_id": self.verifier_chain_id,
                 "dry_run_bytes": self.dry_run_bytes,
-                "target_agreement": target == verifier_target,
+                "target_agreement": True,
                 "sampled_blocks": samples,
             },
             facts,
@@ -562,10 +550,16 @@ async def _acquire_rpc(request: RpcDownloadRequest, operation: SourceOperation) 
                 primary.tagged_header(request.chain.finality_tag, _INTEGRITY_PLAN),
                 verifier.tagged_header(request.chain.finality_tag, _INTEGRITY_PLAN),
             )
-            resolved = await _resolve_range(request.requested_range, primary, min(primary_tag.block_number, verifier_tag.block_number))
+            resolution = await _resolve_range(request.requested_range, primary, min(primary_tag.block_number, verifier_tag.block_number))
             if request.requested_range.kind == "time":
-                await _verify_time_boundaries(request.requested_range, resolved, primary, verifier, verifier_tag.block_number)
-            return await operation(RpcSource(request, primary, verifier, resolved, primary_chain_id, verifier_chain_id))
+                await _verify_time_boundaries(
+                    request.requested_range,
+                    resolution,
+                    verifier,
+                    verifier_tag.block_number,
+                    independent=True,
+                )
+            return await operation(RpcSource(request, primary, verifier, resolution.value, primary_chain_id, verifier_chain_id))
     except BlockweaverError:
         raise
     except ValueError as error:
@@ -584,10 +578,16 @@ async def _acquire_bigquery(request: BigQueryDownloadRequest, progress: Progress
             if verifier_chain_id != request.chain.chain_id:
                 raise BlockweaverError("RPC_CHAIN_MISMATCH", "Verifier RPC chain ID does not match the configured chain")
             tagged = await verifier.tagged_header(request.chain.finality_tag, _INTEGRITY_PLAN)
-            resolved = await _resolve_range(request.requested_range, verifier, tagged.block_number)
+            resolution = await _resolve_range(request.requested_range, verifier, tagged.block_number)
             if request.requested_range.kind == "time":
-                await _verify_time_boundaries(request.requested_range, resolved, verifier, verifier, tagged.block_number)
-            return await operation(BigQuerySource(request, verifier, warehouse, resolved, verifier_chain_id, progress))
+                await _verify_time_boundaries(
+                    request.requested_range,
+                    resolution,
+                    verifier,
+                    tagged.block_number,
+                    independent=False,
+                )
+            return await operation(BigQuerySource(request, verifier, warehouse, resolution.value, verifier_chain_id, progress))
     except BlockweaverError:
         raise
     except ValueError as error:
@@ -637,12 +637,16 @@ def _rpc(provider: Provider) -> Rpc:
 _INTEGRITY_PLAN = plan_features([])
 
 
-async def _resolve_range(request: RequestedRange, rpc: Rpc, finalized: int) -> ResolvedRange:
+async def _resolve_range(request: RequestedRange, rpc: Rpc, finalized: int) -> _RangeResolution:
     if request.kind == "block":
         if request.end > finalized:
             raise BlockweaverError("RANGE_UNFINALIZED", "Requested block range is not fully finalized")
-        first, last = await rpc.headers([request.start, request.end], _INTEGRITY_PLAN)
-        return ResolvedRange(request.start, request.end, first.timestamp, last.timestamp)
+        numbers = sorted({request.start, request.end})
+        boundaries = await rpc.headers(numbers, _INTEGRITY_PLAN)
+        return _RangeResolution(
+            ResolvedRange(request.start, request.end, boundaries[0].timestamp, boundaries[-1].timestamp),
+            tuple(boundaries),
+        )
     cache: dict[int, Header] = {}
 
     async def header(number: int) -> Header:
@@ -661,7 +665,7 @@ async def _resolve_range(request: RequestedRange, rpc: Rpc, finalized: int) -> R
     first_header, last_header = await header(first), await header(last)
     if first > last or first_header.timestamp > request.end:
         raise BlockweaverError("RANGE_EMPTY", "Requested time range contains no blocks")
-    return ResolvedRange(first, last, first_header.timestamp, last_header.timestamp)
+    return _RangeResolution(ResolvedRange(first, last, first_header.timestamp, last_header.timestamp), tuple(cache.values()))
 
 
 async def _lower_bound_timestamp(target: int, high: int, header: Callable[[int], Awaitable[Header]]) -> int:
@@ -677,55 +681,50 @@ async def _lower_bound_timestamp(target: int, high: int, header: Callable[[int],
 
 async def _verify_time_boundaries(
     request: RequestedRange,
-    resolved: ResolvedRange,
-    primary: Rpc,
+    resolution: _RangeResolution,
     verifier: Rpc,
     verifier_finalized: int,
+    *,
+    independent: bool,
 ) -> None:
+    resolved = resolution.value
     boundary_numbers = sorted({resolved.first_block, resolved.last_block})
-    primary_boundaries, verifier_boundaries = await _paired(
-        primary.headers(boundary_numbers, _INTEGRITY_PLAN),
-        verifier.headers(boundary_numbers, _INTEGRITY_PLAN),
-    )
-    if any(not _same_core(left, right) for left, right in zip(primary_boundaries, verifier_boundaries, strict=True)):
-        raise BlockweaverError("RPC_MISMATCH", "RPC endpoints disagree on a resolved time boundary")
+    known = {header.block_number: header for header in resolution.headers}
+    if independent:
+        verifier_boundaries = await verifier.headers(boundary_numbers, _INTEGRITY_PLAN)
+        primary_boundaries = [known[number] for number in boundary_numbers]
+        if any(not _same_core(left, right) for left, right in zip(primary_boundaries, verifier_boundaries, strict=True)):
+            raise BlockweaverError("RPC_MISMATCH", "RPC endpoints disagree on a resolved time boundary")
+        known = {header.block_number: header for header in verifier_boundaries}
     adjacent_numbers = []
     if resolved.first_block > 0:
         adjacent_numbers.append(resolved.first_block - 1)
     if resolved.last_block < verifier_finalized:
         adjacent_numbers.append(resolved.last_block + 1)
-    adjacent = {header.block_number: header for header in await verifier.headers(adjacent_numbers, _INTEGRITY_PLAN)}
-    first, last = verifier_boundaries[0], verifier_boundaries[-1]
+    missing = [number for number in adjacent_numbers if number not in known]
+    if missing:
+        known.update((header.block_number, header) for header in await verifier.headers(missing, _INTEGRITY_PLAN))
+    first, last = known[resolved.first_block], known[resolved.last_block]
     if (
         first.timestamp != resolved.first_timestamp
         or last.timestamp != resolved.last_timestamp
         or first.timestamp < request.start
         or last.timestamp > request.end
-        or (resolved.first_block > 0 and adjacent[resolved.first_block - 1].timestamp >= request.start)
-        or (resolved.last_block < verifier_finalized and adjacent[resolved.last_block + 1].timestamp <= request.end)
+        or (resolved.first_block > 0 and known[resolved.first_block - 1].timestamp >= request.start)
+        or (resolved.last_block < verifier_finalized and known[resolved.last_block + 1].timestamp <= request.end)
     ):
         raise BlockweaverError("RPC_MISMATCH", "Verifier RPC does not prove the resolved time-range edges")
 
 
-async def _prove_finality(target: Header, verifier: Rpc, request: DownloadRequest) -> tuple[Anchor, Header]:
+async def _prove_finality(target: Header, verifier: Rpc, request: DownloadRequest) -> Anchor:
     verifier_target = await verifier.header(target.block_number, plan_features(list(target.values)))
-    if not _same_header(target, verifier_target):
+    if target != verifier_target:
         raise BlockweaverError("RPC_MISMATCH", "RPC endpoints disagree on the target block")
     tagged = await verifier.tagged_header(request.chain.finality_tag, _INTEGRITY_PLAN)
     if tagged.block_number < target.block_number:
         raise BlockweaverError("RANGE_UNFINALIZED", "Verifier finality head does not cover the target")
     await _connect_ancestry(verifier_target, tagged, verifier)
-    return Anchor(tagged.block_number, tagged.block_hash, request.chain.finality_tag), verifier_target
-
-
-def _same_header(left: Header, right: Header) -> bool:
-    return (left.block_number, left.block_hash, left.parent_hash, left.timestamp, left.values) == (
-        right.block_number,
-        right.block_hash,
-        right.parent_hash,
-        right.timestamp,
-        right.values,
-    )
+    return Anchor(tagged.block_number, tagged.block_hash, request.chain.finality_tag)
 
 
 async def _refresh_finality(target: Header, anchor: Anchor, rpc: Rpc) -> Anchor:
@@ -752,7 +751,7 @@ async def _connect_ancestry(previous: Header, tagged: Header, rpc: Rpc) -> None:
         previous = segment[-1]
         cursor = last + 1
     reread = await rpc.header(tagged.block_number, _INTEGRITY_PLAN)
-    if not _same_header(tagged, reread) or not _same_core(previous, tagged):
+    if tagged != reread or not _same_core(previous, tagged):
         raise BlockweaverError("RPC_MISMATCH", "Finality tag did not survive numbered reread")
 
 
