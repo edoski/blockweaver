@@ -2,7 +2,7 @@
 
 ## Run
 
-- Status: Blockweaver consolidation Slices 1A–1C are independently green and integrated. Release `v0.3.2` at `9572ad743b56c17e11a313a7ec5ecfc75991f2cd` is published on GitHub and PyPI, and all three additive local/research datasets are prepared and verified. KAIROS integration remains paused until the active legacy HPO closes.
+- Status: Blockweaver consolidation Slices 1A–1C are independently green and integrated. Release `v0.3.2` at `9572ad743b56c17e11a313a7ec5ecfc75991f2cd` is published on GitHub and PyPI, and all three additive local/research datasets are prepared and verified. Legacy KAIROS HPO `dfd33e91-702e-46c5-8cb1-3c510af4c048` is closed at 216/216; the KAIROS clean-break loader slice is authorized and active.
 - Authoritative spec: this ledger plus the user-approved decisions below.
 - Blockweaver clean execution baseline before this authorization update: `39116c8e65090da6dc181ebbd17f69237167c842`, clean `main`, four plan commits ahead of `origin/main`.
 - KAIROS dataset-preparation pin: `bfaf9f662b24e9680e60e090e110dac9da51525d`, clean `main`, 17 user-owned commits ahead of `origin/main`; no KAIROS code commit was created by preparation.
@@ -10,7 +10,7 @@
 - KAIROS working tree is clean. The approved `fsevents` allowance is committed at `7cca6fcb`; coherent K-study/HPO figure work is committed at `c0021cb9`; the four discarded epigraph notes are absent.
 - Pre-run worktrees: one normal worktree per repository. Slice 1 used `/Users/edo/dev/python/blockweaver-dataset-contract` on `codex/dataset-contract-clean-break`; both the worktree and its integrated branch were removed after the execution record was committed.
 - Execution checkout policy: use isolated `codex/` branches and worktrees, one writer at a time. Integrate only after each repository slice is green. Never include protected dirt.
-- Current authority: consolidation, publication, and additive dataset preparation are complete. No further KAIROS code, corpus cleanup, image, scheduler, or campaign action is authorized before the active legacy HPO closes and the next gate is freshly pinned.
+- Current authority: consolidation, publication, and additive dataset preparation are complete. KAIROS code integration, exact legacy-corpus cleanup after its acceptance gate, research image build, `apptainer test`, configuration handoff, and repository push are authorized. Campaign creation, configuration, submission, and GPU smoke remain excluded.
 
 ## Confirmed decisions
 
@@ -63,11 +63,11 @@
 
 - Blockweaver `CONTRIBUTING.md` requires a GitHub issue before broadening the CLI or durable format. The user authorized issue creation, and [issue #2](https://github.com/edoski/blockweaver/issues/2) is the execution issue for Slice 1.
 - Gate satisfied by [issue #3](https://github.com/edoski/blockweaver/issues/3), opened before implementation. Issue #2 remains the completed UUID/unversioned-artifact issue; it does not silently expand to cover this refactor and its deliberate machine-interface changes.
-- Active HPO `dfd33e91-702e-46c5-8cb1-3c510af4c048` remains under the old image and `jobs.tsv` lifecycle. Never touch its jobs, local/remote bundle, corpora, logs, scratch, image, or automation authority. It must close normally before the KAIROS loader cutover or first Servatus K-study launch.
+- Legacy HPO `dfd33e91-702e-46c5-8cb1-3c510af4c048` closed normally at 62/62 allocations and 216/216 methods. Its 24 Studies and 456 files were checksum-equal and strict-loaded; manifest-only closure and hidden-scratch removal were verified. It no longer requires the old corpus layout.
 - Pin fresh baselines and status immediately before every slice.
 - Do not begin a later slice until the current implementation has a committed head and a distinct reviewer returns zero Standards and zero Spec findings.
 - Before Slice 1B, inventory local work roots read-only for active `.blockweaver-<uuid>` state. Finish active work on the current binary or obtain explicit abandonment authority; the clean break adds no private-work compatibility reader.
-- Public RPC and BigQuery reads are authorized only for the declared migration verification after Slice 1 is green. Output writes are authorized only for the six additive dataset destinations after the preparation gate passes. Releases, pushes, PyPI, scheduler changes, and campaign actions remain unauthorized.
+- Public RPC and BigQuery reads were authorized only for the completed migration verification. Repository pushes, exact corpus cleanup, and the documented image build are authorized for the post-HPO handoff. Campaign actions remain unauthorized.
 
 ## Slice 1: Blockweaver dataset contract
 
@@ -228,9 +228,9 @@ The client-facing interface says exactly what Blockweaver supports: no inert ver
 
 ## Slice 2: KAIROS direct dataset consumption
 
-- Status: pending; blocked only by active legacy HPO closure. The final Blockweaver release/pin and additive local/research dataset preparation are complete.
+- Status: active. The final Blockweaver release/pin, additive local/research dataset preparation, and legacy-HPO closure gates are complete.
 - Repository: KAIROS.
-- Planned baseline: `c0021cb99fa1c28295059a1cc827d6d68afca633`; repin after the active scientific work settles and preserve every later user-owned commit.
+- Baseline: `bfaf9f662b24e9680e60e090e110dac9da51525d`; KAIROS `main` was clean and 17 user-owned commits ahead of `origin/main` when this slice began.
 - Dependencies: Blockweaver Slices 1 and 1A–1C green with a released or otherwise reproducibly pinned package artifact; Servatus remains pinned at its accepted version and requires no change.
 
 ### Scope
@@ -275,14 +275,14 @@ KAIROS consumes one verified Blockweaver dataset directly from its own `outputs/
 
 ## Legacy corpus cleanup gate
 
-- Status: conditionally authorized, not yet eligible.
+- Status: conditionally authorized. HPO closure and dataset acceptance are satisfied; KAIROS loader acceptance and the final consumer inventory remain.
 - Preconditions: the active legacy HPO is fully closed; no queued/running job, old image, draft, scratch bundle, or automation still resolves an old corpus path; all local and research datasets pass strict acceptance; KAIROS's new loader has passed its full gate; exact cleanup targets are inventoried immediately before deletion.
 - Action: delete only the three superseded `outputs/corpora/<uuid>/` directories locally and their three matching canonical research directories. Do not touch any Study, trial, artifact, evaluation, experiment, figure, job, log, scratch, or unrelated output.
 - If any precondition is unproven, leave every old corpus directory untouched and report the remaining dependency.
 
 ## Deployment and clean-break gate
 
-- Status: blocked; follows green KAIROS Slice 2 and accepted local/research datasets.
+- Status: authorized after green KAIROS Slice 2 and the final legacy-corpus inventory.
 - Integrate the reviewed KAIROS head only after all three datasets strict-load locally and any later user-owned work is resolved.
 - Build a new immutable KAIROS image from the exact integrated SHA through the documented `sbuild` procedure and run `apptainer test` if image work is separately authorized. Do not run a GPU smoke.
 - Preserve the old image and old `corpora/` paths until the legacy cleanup gate passes. Any later campaign using the aligned code must use Servatus, the new image, and `datasets/<uuid>` exclusively, but this run does not start or configure that campaign.
@@ -343,4 +343,8 @@ GitHub issue [#2](https://github.com/edoski/blockweaver/issues/2) records the au
 - Research transfer staged under hidden sibling directories, verified all six hashes, and published through exclusive empty-directory reservations plus same-filesystem atomic rename because the research filesystem returned `EINVAL` for Linux `RENAME_NOREPLACE`. The reservation pattern cannot replace a pre-existing or nonempty destination. Public Blockweaver `0.3.2` strict-opened all three remote datasets in a temporary Python environment using Polars `rtcompat`; the environment and all hidden transfer paths were removed.
 - Final preparation audit: local and research dataset copies are byte-identical and contain exactly six files; KAIROS remains clean at `bfaf9f662b24e9680e60e090e110dac9da51525d`; Blockweaver `main` and `origin/main` match the final release head before this ledger-only record; all six old corpus directories and their original hashes remain; the scheduler still reported three running and 28 pending legacy jobs. No KAIROS code, downstream JSON, job, campaign, image, GPU, Servatus, or legacy corpus was changed.
 
-Verified handoff reached. Stop here until the active legacy HPO closes. The next authorized work is the KAIROS clean-break loader slice; corpus deletion, image build, and Servatus K-study remain later gates.
+- Post-HPO continuation: source task `019fb1c5-42ec-72c1-ac17-33a8ebe9c8e8` reported legacy HPO `dfd33e91-702e-46c5-8cb1-3c510af4c048` closed at 62/62 allocations and 216/216 methods, with canonical evidence, checksum equality, strict loading, manifest-only closure, and hidden-scratch removal. A fresh local check found only the 24-entry closure manifest; the research scheduler and bounded HPO scratch search were empty.
+- Continuation pins: Blockweaver clean `main` and `origin/main` at `19abdfc175682950b9824f786488978f593ab7da`; KAIROS clean `main` at `bfaf9f662b24e9680e60e090e110dac9da51525d`, 17 user-owned commits ahead of `origin/main` at `e96c9f4d0917c35c58f23b3cd43accd61e005d61`. The pre-existing KAIROS branch `codex/compact-cuda-execution` is unrelated and protected.
+- KAIROS Slice 2 will use an isolated run-owned `codex/` branch and worktree from the pinned KAIROS baseline. A distinct reviewer must return zero Standards and zero Spec findings before integration.
+
+Post-HPO continuation is active. The next work is the KAIROS clean-break loader slice, followed by its consumer inventory, exact legacy-corpus cleanup, immutable image build, `apptainer test`, and verified runner handoff. No campaign is created or launched here.
