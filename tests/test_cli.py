@@ -126,12 +126,15 @@ def test_strict_config_discovery_has_no_secrets(tmp_path: Path, chains: tuple[Ch
         'url = "http://bad host"',
         'url = "http://user:password@"',
         'url = "http://-bad.example"',
+        "batch_size = 0",
+        "concurrency = -1",
         "timeout = nan",
         "timeout = inf",
         "timeout = 3601",
+        "timeout = " + "9" * 400,
     ],
 )
-def test_config_rejects_malformed_urls_and_unbounded_timeouts(
+def test_provider_resolution_rejects_invalid_domains_before_network(
     tmp_path: Path,
     chains: tuple[ChainServer, ChainServer],
     make_config: Any,
@@ -140,18 +143,35 @@ def test_config_rejects_malformed_urls_and_unbounded_timeouts(
     primary, verifier = chains
     config = make_config(tmp_path / "config.toml", primary, verifier, output_root=tmp_path / "out")
     text = config.read_text()
-    text = text.replace(f'url = "{primary.url}"', replacement, 1) if replacement.startswith("url") else text.replace("timeout = 2", replacement, 1)
+    if replacement.startswith("url"):
+        text = text.replace(f'url = "{primary.url}"', replacement, 1)
+    else:
+        setting = replacement.partition(" = ")[0]
+        configured = {"batch_size": 3, "concurrency": 2, "timeout": 2}[setting]
+        text = text.replace(f"{setting} = {configured}", replacement, 1)
     config.write_text(text)
-    assert error(invoke(["chains", "--config", str(config)]))["code"] == "CONFIG_INVALID"
+    assert error(invoke(download_args(config)))["code"] == "CONFIG_INVALID"
+    assert primary.requests == verifier.requests == []
 
 
-def test_unknown_default_source_is_a_configuration_failure(
+@pytest.mark.parametrize(
+    ("source", "features"),
+    [
+        ("unknown", ("timestamp",)),
+        ("rpc", ("unknown",)),
+        ("rpc", ("block_number",)),
+        ("rpc", ("timestamp", "timestamp")),
+    ],
+)
+def test_invalid_configured_defaults_are_configuration_failures(
     tmp_path: Path,
     chains: tuple[ChainServer, ChainServer],
     make_config: Any,
+    source: str,
+    features: tuple[str, ...],
 ) -> None:
     primary, verifier = chains
-    config = make_config(tmp_path / "config.toml", primary, verifier, output_root=tmp_path / "out", source="unknown")
+    config = make_config(tmp_path / "config.toml", primary, verifier, output_root=tmp_path / "out", source=source, features=features)
 
     failure = error(invoke(["chains", "--config", str(config)]))
 
@@ -227,6 +247,12 @@ def test_request_resolution_rejects_missing_environment_and_dependent_providers_
     assert error(invoke(download_args(config)))["code"] == "CONFIG_ENV_MISSING"
     assert error(invoke([*download_args(config), "--feature", "unknown"]))["code"] == "FEATURE_INVALID"
     assert primary.requests == verifier.requests == []
+
+    configured = make_config(tmp_path / "configured.toml", primary, verifier, output_root=tmp_path / "out")
+    for index, option in enumerate(("--chain", "--provider", "--verifier", "--rpc-url", "--verify-rpc-url"), 1):
+        dataset_id = str(UUID(int=index, version=4))
+        assert error(invoke([*download_args(configured, dataset_id=dataset_id), option, ""]))["code"] == "CONFIG_INVALID"
+        assert primary.requests == verifier.requests == []
 
     independent = make_config(tmp_path / "independent.toml", primary, verifier, output_root=tmp_path / "out")
     assert error(invoke([*download_args(independent), "--provider", "verifier"]))["code"] == "PROVIDER_INVALID"

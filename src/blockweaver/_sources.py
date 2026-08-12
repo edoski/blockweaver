@@ -467,7 +467,7 @@ class RpcSource:
         return VerifiedProof(anchor, {**self._verification, "target_agreement": target == verifier_target, "sampled_blocks": samples}, facts)
 
     async def revalidate(self, dataset: Dataset) -> None:
-        verifier_target = await _candidate_target(dataset, self.verifier, self.request)
+        verifier_target = await _candidate_target(dataset, self.verifier)
         target = await self.primary.header(dataset.last_block, dataset._plan)
         if not _same_header(target, verifier_target):
             raise BlockweaverError("RPC_MISMATCH", "RPC endpoints disagree on the ready candidate target")
@@ -542,7 +542,7 @@ class BigQuerySource:
         )
 
     async def revalidate(self, dataset: Dataset) -> None:
-        verifier_target = await _candidate_target(dataset, self.verifier, self.request)
+        verifier_target = await _candidate_target(dataset, self.verifier)
         await _finish_candidate_validation(dataset, verifier_target, self.verifier)
 
 
@@ -805,9 +805,7 @@ async def _check_full_dataset(dataset: Dataset, rpc: Rpc) -> None:
         raise BlockweaverError("ARTIFACT_INVALID", "Dataset streaming coverage changed during verification")
 
 
-async def _candidate_target(dataset: Dataset, verifier: Rpc, request: DownloadRequest) -> Header:
-    if dataset.chain_id != request.chain.chain_id:
-        raise BlockweaverError("RESUME_MISMATCH", "Ready candidate chain does not match the request")
+async def _candidate_target(dataset: Dataset, verifier: Rpc) -> Header:
     target = await verifier.header(dataset.last_block, dataset._plan)
     if target.block_hash != dataset._target_hash:
         raise BlockweaverError("RPC_MISMATCH", "Ready candidate target hash does not match verifier RPC")

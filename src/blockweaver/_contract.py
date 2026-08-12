@@ -171,7 +171,7 @@ def parse_source(value: object) -> Source:
         return "rpc"
     if value == "bigquery":
         return "bigquery"
-    raise BlockweaverError("SOURCE_UNAVAILABLE", f"Unknown source: {value}")
+    raise ValueError(f"Unknown source: {value}")
 
 
 def available_sources(config: Config, chain: Chain) -> tuple[Source, ...]:
@@ -223,12 +223,12 @@ def validate_verification(value: object, chain_id: int, source: Source) -> dict[
 
 def plan_features(names: list[str] | tuple[str, ...]) -> Plan:
     if len(names) != len(set(names)):
-        raise BlockweaverError("FEATURE_INVALID", "Features must not contain duplicates")
+        raise ValueError("Features must not contain duplicates")
     if "block_number" in names:
-        raise BlockweaverError("FEATURE_INVALID", "block_number is always included and must not be selected")
+        raise ValueError("block_number is always included and must not be selected")
     unknown = sorted(set(names) - FEATURE_BY_NAME.keys())
     if unknown:
-        raise BlockweaverError("FEATURE_INVALID", f"Unknown feature: {unknown[0]}")
+        raise ValueError(f"Unknown feature: {unknown[0]}")
     selected = tuple(feature for feature in FEATURES if feature.name in names)
     fields = {feature.rpc_field for feature in selected if feature.rpc_field is not None}
     for feature in selected:
@@ -244,12 +244,11 @@ def plan_features(names: list[str] | tuple[str, ...]) -> Plan:
 
 @dataclass(frozen=True, slots=True)
 class ProviderSpec:
-    name: str
     url: str | None
     url_env: str | None
     batch_size: int
     concurrency: int
-    timeout: float
+    timeout: int | float
 
 
 @dataclass(frozen=True, slots=True)
@@ -266,7 +265,7 @@ class Provider:
             _validate_url(self.url)
             _positive_int(self.batch_size, "batch_size")
             _positive_int(self.concurrency, "concurrency")
-            _positive_number(self.timeout, "timeout")
+            object.__setattr__(self, "timeout", _positive_number(self.timeout, "timeout"))
         except ValueError as error:
             raise BlockweaverError("CONFIG_INVALID", str(error)) from None
 
@@ -289,7 +288,7 @@ class Defaults:
     verifier: str
     output_root: Path
     output_format: OutputFormat
-    features: tuple[str, ...]
+    plan: Plan
 
 
 @dataclass(frozen=True, slots=True)
@@ -320,14 +319,13 @@ class BigQuerySettings:
 
 @dataclass(frozen=True, slots=True)
 class Config:
-    path: Path
     defaults: Defaults
     chains: dict[str, Chain]
     providers: dict[str, ProviderSpec]
     bigquery: BigQuerySpec | None
 
     def chain(self, name: str | None) -> Chain:
-        selected = name or self.defaults.chain
+        selected = name if name is not None else self.defaults.chain
         try:
             return self.chains[selected]
         except KeyError:
@@ -346,19 +344,18 @@ class Config:
             spec = self.providers[name]
         except KeyError:
             raise BlockweaverError("CONFIG_INVALID", f"Unknown RPC provider profile: {name}") from None
-        resolved_url = url or spec.url
+        resolved_url = url if url is not None else spec.url
         if resolved_url is None:
             assert spec.url_env is not None
             resolved_url = os.environ.get(spec.url_env)
             if resolved_url is None:
                 raise BlockweaverError("CONFIG_ENV_MISSING", f"RPC provider environment variable is not set: {spec.url_env}")
-        _validate_url(resolved_url)
         return Provider(
             name,
             resolved_url,
-            _positive_int(batch_size if batch_size is not None else spec.batch_size, "batch_size"),
-            _positive_int(concurrency if concurrency is not None else spec.concurrency, "concurrency"),
-            _positive_number(timeout if timeout is not None else spec.timeout, "timeout"),
+            batch_size if batch_size is not None else spec.batch_size,
+            concurrency if concurrency is not None else spec.concurrency,
+            timeout if timeout is not None else spec.timeout,
         )
 
     def bigquery_settings(self) -> BigQuerySettings:
@@ -398,17 +395,14 @@ def load_config(path: Path) -> Config:
             "defaults",
             required={"chain", "source", "verifier", "output_root", "format", "features"},
         )
-        try:
-            source = parse_source(_string(defaults_raw["source"], "defaults.source"))
-        except BlockweaverError as error:
-            raise ValueError(str(error)) from error
+        source = parse_source(_string(defaults_raw["source"], "defaults.source"))
         output_format = _string(defaults_raw["format"], "defaults.format")
         if output_format not in {"parquet", "csv"}:
             raise ValueError("defaults.format must be parquet or csv")
         feature_values = defaults_raw["features"]
         if not isinstance(feature_values, list) or any(not isinstance(item, str) for item in feature_values):
             raise ValueError("defaults.features must be an array of strings")
-        plan_features(feature_values)
+        plan = plan_features(feature_values)
         defaults = Defaults(
             _name(defaults_raw["chain"], "defaults.chain"),
             source,  # type: ignore[arg-type]
@@ -416,7 +410,7 @@ def load_config(path: Path) -> Config:
             _name(defaults_raw["verifier"], "defaults.verifier"),
             Path(_string(defaults_raw["output_root"], "defaults.output_root")).expanduser(),
             output_format,  # type: ignore[arg-type]
-            tuple(feature_values),
+            plan,
         )
         chains = _parse_chains(document["chains"])
         providers = _parse_providers(document["providers"])
@@ -431,12 +425,10 @@ def load_config(path: Path) -> Config:
             raise ValueError("defaults.provider must name a configured provider")
         if defaults.verifier not in providers:
             raise ValueError("defaults.verifier must name a configured provider")
-        config = Config(path, defaults, chains, providers, bigquery)
+        config = Config(defaults, chains, providers, bigquery)
         if defaults.source not in available_sources(config, chains[defaults.chain]):
             raise ValueError(f"default {defaults.source} source is not fully configured")
         return config
-    except BlockweaverError:
-        raise
     except (KeyError, TypeError, ValueError) as error:
         raise BlockweaverError("CONFIG_INVALID", str(error)) from None
 
@@ -481,18 +473,15 @@ def _parse_providers(value: object) -> dict[str, ProviderSpec]:
         if ("url" in item) == ("url_env" in item):
             raise ValueError(f"providers.{name} must define exactly one of url or url_env")
         url = _string(item["url"], f"providers.{name}.url") if "url" in item else None
-        if url is not None:
-            _validate_url(url)
         url_env = _string(item["url_env"], f"providers.{name}.url_env") if "url_env" in item else None
         if url_env is not None and _ENV.fullmatch(url_env) is None:
             raise ValueError(f"providers.{name}.url_env is not a valid environment name")
         providers[name] = ProviderSpec(
-            name,
             url,
             url_env,
-            _positive_int(item.get("batch_size", 20), f"providers.{name}.batch_size"),
-            _positive_int(item.get("concurrency", 6), f"providers.{name}.concurrency"),
-            _positive_number(item.get("timeout", 30), f"providers.{name}.timeout"),
+            _integer(item.get("batch_size", 20), f"providers.{name}.batch_size"),
+            _integer(item.get("concurrency", 6), f"providers.{name}.concurrency"),
+            _number(item.get("timeout", 30), f"providers.{name}.timeout"),
         )
     return providers
 
@@ -661,14 +650,26 @@ def resolve_download_request(
     timeout: float | None,
 ) -> DownloadRequest:
     selected_chain = config.chain(chain)
-    selected_source = parse_source(source or config.defaults.source)
+    if source is None:
+        selected_source = config.defaults.source
+    else:
+        try:
+            selected_source = parse_source(source)
+        except ValueError as error:
+            raise BlockweaverError("SOURCE_UNAVAILABLE", str(error)) from None
     if selected_source not in available_sources(config, selected_chain):
         raise BlockweaverError("SOURCE_UNAVAILABLE", f"Chain {selected_chain.name} does not configure source={selected_source}")
-    plan = plan_features(features if features is not None else config.defaults.features)
+    if features is None:
+        plan = config.defaults.plan
+    else:
+        try:
+            plan = plan_features(features)
+        except ValueError as error:
+            raise BlockweaverError("FEATURE_INVALID", str(error)) from None
     bounds = requested_range(from_block, to_block, from_time, to_time)
-    root = (output_root or config.defaults.output_root).expanduser()
-    selected_format = output_format or config.defaults.output_format
-    verifier_name = verifier or selected_chain.verifier or config.defaults.verifier
+    root = (output_root if output_root is not None else config.defaults.output_root).expanduser()
+    selected_format = output_format if output_format is not None else config.defaults.output_format
+    verifier_name = verifier if verifier is not None else selected_chain.verifier if selected_chain.verifier is not None else config.defaults.verifier
     if selected_source == "bigquery":
         if provider is not None or rpc_url is not None:
             raise BlockweaverError("SOURCE_OPTION_INVALID", "--provider and --rpc-url do not apply to source=bigquery")
@@ -692,7 +693,7 @@ def resolve_download_request(
             bigquery=config.bigquery_settings(),
             verifier=verifying,
         )
-    primary_name = provider or selected_chain.provider or config.defaults.provider
+    primary_name = provider if provider is not None else selected_chain.provider if selected_chain.provider is not None else config.defaults.provider
     if primary_name is None:
         raise BlockweaverError("SOURCE_UNAVAILABLE", "rpc source requires a primary provider")
     return RpcDownloadRequest(
@@ -836,7 +837,7 @@ def validate_links(headers: list[Header], previous: Header | None = None) -> Non
 
 
 def validate_uuid(value: UUID) -> None:
-    if value.version != 4 or str(value) != str(value).lower():
+    if value.version != 4:
         raise BlockweaverError("REQUEST_INVALID", "Dataset ID must be a canonical UUID4")
 
 
@@ -880,10 +881,28 @@ def _positive_int(value: object, label: str) -> int:
     return value
 
 
+def _integer(value: object, label: str) -> int:
+    if type(value) is not int:
+        raise ValueError(f"{label} must be an integer")
+    return value
+
+
+def _number(value: object, label: str) -> int | float:
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        raise ValueError(f"{label} must be a number")
+    return value
+
+
 def _positive_number(value: object, label: str) -> float:
-    if not isinstance(value, (int, float)) or isinstance(value, bool) or not isfinite(value) or value <= 0 or value > 3600:
-        raise BlockweaverError("CONFIG_INVALID", f"{label} must be finite and between 0 and 3600 seconds")
-    return float(value)
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        raise ValueError(f"{label} must be finite and between 0 and 3600 seconds")
+    try:
+        parsed = float(value)
+    except OverflowError:
+        raise ValueError(f"{label} must be finite and between 0 and 3600 seconds") from None
+    if not isfinite(parsed) or not 0 < parsed <= 3600:
+        raise ValueError(f"{label} must be finite and between 0 and 3600 seconds")
+    return parsed
 
 
 def _validate_url(value: str) -> None:
@@ -892,7 +911,7 @@ def _validate_url(value: str) -> None:
         hostname = parsed.hostname
         port = parsed.port
     except ValueError:
-        raise BlockweaverError("CONFIG_INVALID", "RPC provider URL is malformed") from None
+        raise ValueError("RPC provider URL is malformed") from None
     if (
         any(character.isspace() for character in value)
         or parsed.scheme not in {"http", "https"}
@@ -902,16 +921,16 @@ def _validate_url(value: str) -> None:
         or parsed.netloc.endswith(":")
         or (port is not None and not 1 <= port <= 65535)
     ):
-        raise BlockweaverError("CONFIG_INVALID", "RPC provider URL must be an absolute HTTP or HTTPS URL")
+        raise ValueError("RPC provider URL must be an absolute HTTP or HTTPS URL")
     try:
         ip_address(hostname)
     except ValueError:
         try:
             encoded = hostname.encode("idna").decode("ascii")
         except UnicodeError:
-            raise BlockweaverError("CONFIG_INVALID", "RPC provider URL has an invalid hostname") from None
+            raise ValueError("RPC provider URL has an invalid hostname") from None
         labels = encoded.removesuffix(".").split(".")
         if len(encoded) > 253 or any(
             not label or len(label) > 63 or re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?", label) is None for label in labels
         ):
-            raise BlockweaverError("CONFIG_INVALID", "RPC provider URL has an invalid hostname") from None
+            raise ValueError("RPC provider URL has an invalid hostname") from None

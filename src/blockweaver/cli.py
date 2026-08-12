@@ -227,7 +227,13 @@ def verify(
             settings = load_config(selected_config_path(config))
             selected_provider = settings.provider(provider, url=rpc_url, batch_size=batch_size, concurrency=concurrency, timeout=timeout)
         elif rpc_url is not None:
-            selected_provider = Provider("cli", rpc_url, batch_size or 20, concurrency or 6, timeout or 30)
+            selected_provider = Provider(
+                "cli",
+                rpc_url,
+                batch_size if batch_size is not None else 20,
+                concurrency if concurrency is not None else 6,
+                timeout if timeout is not None else 30,
+            )
         if selected_provider is not None:
             secrets.append(selected_provider.url)
     except BlockweaverError as error:
