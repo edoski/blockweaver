@@ -248,7 +248,7 @@ class ProviderSpec:
     url_env: str | None
     batch_size: int
     concurrency: int
-    timeout: float
+    timeout: int | float
 
 
 @dataclass(frozen=True, slots=True)
@@ -265,7 +265,7 @@ class Provider:
             _validate_url(self.url)
             _positive_int(self.batch_size, "batch_size")
             _positive_int(self.concurrency, "concurrency")
-            _positive_number(self.timeout, "timeout")
+            object.__setattr__(self, "timeout", _positive_number(self.timeout, "timeout"))
         except ValueError as error:
             raise BlockweaverError("CONFIG_INVALID", str(error)) from None
 
@@ -887,16 +887,22 @@ def _integer(value: object, label: str) -> int:
     return value
 
 
-def _number(value: object, label: str) -> float:
+def _number(value: object, label: str) -> int | float:
     if not isinstance(value, (int, float)) or isinstance(value, bool):
         raise ValueError(f"{label} must be a number")
-    return float(value)
+    return value
 
 
 def _positive_number(value: object, label: str) -> float:
-    if not isinstance(value, (int, float)) or isinstance(value, bool) or not isfinite(value) or value <= 0 or value > 3600:
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
         raise ValueError(f"{label} must be finite and between 0 and 3600 seconds")
-    return float(value)
+    try:
+        parsed = float(value)
+    except OverflowError:
+        raise ValueError(f"{label} must be finite and between 0 and 3600 seconds") from None
+    if not isfinite(parsed) or not 0 < parsed <= 3600:
+        raise ValueError(f"{label} must be finite and between 0 and 3600 seconds")
+    return parsed
 
 
 def _validate_url(value: str) -> None:

@@ -131,6 +131,7 @@ def test_strict_config_discovery_has_no_secrets(tmp_path: Path, chains: tuple[Ch
         "timeout = nan",
         "timeout = inf",
         "timeout = 3601",
+        "timeout = " + "9" * 400,
     ],
 )
 def test_provider_resolution_rejects_invalid_domains_before_network(
