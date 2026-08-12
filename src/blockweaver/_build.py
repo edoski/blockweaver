@@ -8,7 +8,6 @@ from typing import Literal
 
 from . import __version__, _sources
 from ._contract import (
-    BlockweaverError,
     DownloadRequest,
     Provider,
 )
@@ -34,8 +33,6 @@ async def verify_dataset(
     full_rpc: bool,
     progress: Progress,
 ) -> dict[str, object]:
-    if provider is None and full_rpc:
-        raise BlockweaverError("VERIFY_INVALID", "--full-rpc requires a configured provider or --rpc-url")
     dataset = open_dataset(path)
     progress({"event": "local_valid", "rows": dataset.row_count})
     verification: dict[str, object] = {"mode": "local"}

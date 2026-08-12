@@ -145,13 +145,24 @@ def test_config_rejects_malformed_urls_and_unbounded_timeouts(
     assert error(invoke(["chains", "--config", str(config)]))["code"] == "CONFIG_INVALID"
 
 
-def test_unknown_default_source_is_a_configuration_failure(
+@pytest.mark.parametrize(
+    ("source", "features"),
+    [
+        ("unknown", ("timestamp",)),
+        ("rpc", ("unknown",)),
+        ("rpc", ("block_number",)),
+        ("rpc", ("timestamp", "timestamp")),
+    ],
+)
+def test_invalid_configured_defaults_are_configuration_failures(
     tmp_path: Path,
     chains: tuple[ChainServer, ChainServer],
     make_config: Any,
+    source: str,
+    features: tuple[str, ...],
 ) -> None:
     primary, verifier = chains
-    config = make_config(tmp_path / "config.toml", primary, verifier, output_root=tmp_path / "out", source="unknown")
+    config = make_config(tmp_path / "config.toml", primary, verifier, output_root=tmp_path / "out", source=source, features=features)
 
     failure = error(invoke(["chains", "--config", str(config)]))
 
@@ -227,6 +238,12 @@ def test_request_resolution_rejects_missing_environment_and_dependent_providers_
     assert error(invoke(download_args(config)))["code"] == "CONFIG_ENV_MISSING"
     assert error(invoke([*download_args(config), "--feature", "unknown"]))["code"] == "FEATURE_INVALID"
     assert primary.requests == verifier.requests == []
+
+    configured = make_config(tmp_path / "configured.toml", primary, verifier, output_root=tmp_path / "out")
+    for index, option in enumerate(("--chain", "--provider", "--verifier", "--rpc-url", "--verify-rpc-url"), 1):
+        dataset_id = str(UUID(int=index, version=4))
+        assert error(invoke([*download_args(configured, dataset_id=dataset_id), option, ""]))["code"] == "CONFIG_INVALID"
+        assert primary.requests == verifier.requests == []
 
     independent = make_config(tmp_path / "independent.toml", primary, verifier, output_root=tmp_path / "out")
     assert error(invoke([*download_args(independent), "--provider", "verifier"]))["code"] == "PROVIDER_INVALID"

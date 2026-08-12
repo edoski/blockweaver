@@ -703,8 +703,6 @@ def _read_dataset(path: Path, *, work: bool) -> Dataset:
     if not isinstance(chain["name"], str) or _NAME.fullmatch(chain["name"]) is None or type(chain["chain_id"]) is not int or chain["chain_id"] <= 0:
         raise ValueError("Invalid manifest chain")
     source_value = manifest["source"]
-    if not isinstance(source_value, dict):
-        raise ValueError("Invalid manifest source")
     source = validate_manifest_source(source_value)
     requested = manifest["requested_range"]
     if not isinstance(requested, dict) or requested.get("kind") not in {"block", "time"}:
