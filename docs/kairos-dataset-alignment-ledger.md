@@ -284,7 +284,9 @@ KAIROS consumes one verified Blockweaver dataset directly from its own `outputs/
 
 - Status: authorized after green KAIROS Slice 2 and the final legacy-corpus inventory.
 - Integrate the reviewed KAIROS head only after all three datasets strict-load locally and any later user-owned work is resolved.
-- Build a new immutable KAIROS image from the exact integrated SHA through the documented `sbuild` procedure and run `apptainer test` if image work is separately authorized. Do not run a GPU smoke.
+- Synchronize the accepted KAIROS main change into the existing compact-CUDA branch without altering its reviewed CUDA-only behavior, then independently review that merge before image work.
+- Build a new immutable KAIROS image from the exact accepted compact-CUDA SHA through the documented `sbuild` procedure and run `apptainer test`. Do not run a GPU smoke.
+- Keep `REMOTE.toml` on the old image until the replacement passes `apptainer test`; then review and publish the one-line image cutover before deleting legacy corpora.
 - Preserve the old image and old `corpora/` paths until the legacy cleanup gate passes. Any later campaign using the aligned code must use Servatus, the new image, and `datasets/<uuid>` exclusively, but this run does not start or configure that campaign.
 - Do not mix loaders, images, campaign ledgers, or corpus paths within one campaign. No compatibility branch is added.
 - Pushes, research configuration changes, and image deployment each require their declared external authority. Campaign creation and launch are excluded from this run.
@@ -346,5 +348,6 @@ GitHub issue [#2](https://github.com/edoski/blockweaver/issues/2) records the au
 - Post-HPO continuation: source task `019fb1c5-42ec-72c1-ac17-33a8ebe9c8e8` reported legacy HPO `dfd33e91-702e-46c5-8cb1-3c510af4c048` closed at 62/62 allocations and 216/216 methods, with canonical evidence, checksum equality, strict loading, manifest-only closure, and hidden-scratch removal. A fresh local check found only the 24-entry closure manifest; the research scheduler and bounded HPO scratch search were empty.
 - Continuation pins: Blockweaver clean `main` and `origin/main` at `19abdfc175682950b9824f786488978f593ab7da`; KAIROS clean `main` at `bfaf9f662b24e9680e60e090e110dac9da51525d`, 17 user-owned commits ahead of `origin/main` at `e96c9f4d0917c35c58f23b3cd43accd61e005d61`. The pre-existing KAIROS branch `codex/compact-cuda-execution` is unrelated and protected.
 - KAIROS Slice 2 will use an isolated run-owned `codex/` branch and worktree from the pinned KAIROS baseline. A distinct reviewer must return zero Standards and zero Spec findings before integration.
+- Deployment preflight found `REMOTE.toml` still names `/scratch.hpc/edoardo.galli3/deployments/kairos-cuda-f49db0b.sif`, while `codex/compact-cuda-execution` retains the accepted CUDA delta. The safe order is main loader integration, reviewed compact synchronization, exact-SHA image build and `apptainer test`, reviewed configuration cutover, then legacy-corpus deletion.
 
 Post-HPO continuation is active. The next work is the KAIROS clean-break loader slice, followed by its consumer inventory, exact legacy-corpus cleanup, immutable image build, `apptainer test`, and verified runner handoff. No campaign is created or launched here.
