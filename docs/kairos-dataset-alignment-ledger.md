@@ -2,7 +2,7 @@
 
 ## Run
 
-- Status: Blockweaver consolidation Slices 1A–1C and KAIROS Slice 2 are independently green and integrated. Release `v0.3.2` at `9572ad743b56c17e11a313a7ec5ecfc75991f2cd` is published on GitHub and PyPI, all three additive local/research datasets are prepared and verified, and legacy HPO `dfd33e91-702e-46c5-8cb1-3c510af4c048` is closed at 216/216. The user approved consolidation Slices 3A–3F, the Blockweaver patch release, and K1; ordered execution is active.
+- Status: Blockweaver consolidation Slices 3A–3F are independently green and integrated. Release `v0.3.3` at `e69c02c2d72cc5250834233d3eee9a525e386eb0` is published on GitHub and PyPI. All three additive local/research datasets remain prepared and verified, and legacy HPO `dfd33e91-702e-46c5-8cb1-3c510af4c048` is closed at 216/216. K1 and deployment remain gated on the exact accepted Servatus 0.6.0 KAIROS handoff.
 - Authoritative spec: this ledger plus the user-approved decisions below.
 - Blockweaver clean execution baseline before this authorization update: `39116c8e65090da6dc181ebbd17f69237167c842`, clean `main`, four plan commits ahead of `origin/main`.
 - KAIROS dataset-preparation pin: `bfaf9f662b24e9680e60e090e110dac9da51525d`, clean `main`, 17 user-owned commits ahead of `origin/main`; no KAIROS code commit was created by preparation.
@@ -464,7 +464,7 @@ Blockweaver has four deep implementation modules rather than five modules with a
 
 ## Proposed Blockweaver release gate
 
-- Status: approved; ready after green Slices 3A–3F.
+- Status: complete. Release `v0.3.3` at `e69c02c2d72cc5250834233d3eee9a525e386eb0` is published and publicly verified.
 - Independently verify the integrated Blockweaver head, choose the next compatible patch release, update package metadata/changelog only as required, push/tag/release through trusted publishing, verify GitHub/PyPI artifacts and hashes, and install from the public index in an isolated environment.
 - The release must retain the same public Python and five-command interface. Private hidden-work compatibility is not added; the fresh pre-3C inventory must prove no active work was abandoned.
 - KAIROS K1 and the final image must pin the new published patch if the Blockweaver consolidation is intended to ship. Do not build an image that still installs `blockweaver==0.3.2` after Slices 3A–3F are accepted.
@@ -576,6 +576,9 @@ GitHub issue [#4](https://github.com/edoski/blockweaver/issues/4) records approv
 - Slice 3F baseline: clean pushed `main` at `9a8ad767acb12b878ce22c72eb3f24c2441d1f93`. Implementer: `/root/consolidation_3f_impl`; worktree `/Users/edo/dev/python/blockweaver-slice-3f`; branch `codex/consolidation-slice-3f`.
 - Slice 3F implementation: `85ffd3adee6f0ba16bb7b3654c7e716bba66cbf8` (`refactor(sources): remove shallow build module`). `_build.py` is deleted; source acquisition/materialization and local plus optional-RPC verification compose in `_sources`, while CLI remains translation-only. Reviewer `/root/consolidation_3f_review` returned Standards 0 and Spec 0. Production drops 14 lines and implementation modules drop from five to four; tests and public interfaces are unchanged.
 - Slice 3F integration: merge `95fd7e122c01fc608d0e02d1431a47c620a27a4d` (`merge(sources): integrate consolidation slice 3f`). Main passed all 97 tests, Ruff lint/format, Pyright, Vulture, lock and diff checks, exact public/CLI inventory, optional-import, deleted-module, and adapter-presence checks. No live provider, output, KAIROS, image, campaign, release, or publication occurred.
+- Release preparation: `e69c02c2d72cc5250834233d3eee9a525e386eb0` (`chore(release): prepare version 0.3.3`) changes only `pyproject.toml` and `uv.lock`. Final cumulative reviewer `/root/blockweaver_033_release_review` audited `66f2f119...e69c02c` and returned Standards 0 and Spec 0. All 97 tests and local/static/archive/install gates passed.
+- Release `v0.3.3`: reviewed head pushed to `main`; branch CI run `31592998520` and tag CI run `31593176767` passed on Ubuntu and macOS. The [GitHub Release](https://github.com/edoski/blockweaver/releases/tag/v0.3.3) triggered Trusted Publishing run `31593360467`; release-commit/tag checks, full gates, build, and PyPI publication passed.
+- Public artifact verification: PyPI reports wheel SHA-256 `42f368fb94daab2fdf12f8d4763be82917f4f0b37255a16be98d735c3443ec0b` and sdist SHA-256 `a5f8c55f6310e8766c23b2adb6a5000159a36bf9adb26de24027eb816b8dd9c1`, exactly matching both independent local builds. A fresh public-index core install reported package/runtime `0.3.3`, loaded no Google module, and passed all five command helps; a fresh `blockweaver[bigquery]==0.3.3` install imported the optional adapter. Initial `uv` resolution saw a seconds-old index cache; explicit package refresh succeeded without product change.
 
 GitHub issue [#2](https://github.com/edoski/blockweaver/issues/2) records the authorized Blockweaver contract change.
 
