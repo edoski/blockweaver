@@ -2,7 +2,7 @@
 
 ## Run
 
-- Status: Blockweaver consolidation Slices 3A–3F are independently green and integrated. Release `v0.3.3` at `e69c02c2d72cc5250834233d3eee9a525e386eb0` is published on GitHub and PyPI. All three additive local/research datasets remain prepared and verified, legacy HPO `dfd33e91-702e-46c5-8cb1-3c510af4c048` is closed at 216/216, and the accepted Servatus 0.6.0 KAIROS handoff is complete. K1 is unblocked; deployment follows its green integration.
+- Status: Blockweaver consolidation Slices 3A–3F are independently green and integrated. Release `v0.3.3` at `e69c02c2d72cc5250834233d3eee9a525e386eb0` is published on GitHub and PyPI. All three additive local/research datasets remain prepared and verified, legacy HPO `dfd33e91-702e-46c5-8cb1-3c510af4c048` is closed at 216/216, and the accepted Servatus 0.6.0 KAIROS handoff is complete. K1 implementation is active, but final acceptance is gated on the Blockweaver CLI hotfix below.
 - Authoritative spec: this ledger plus the user-approved decisions below.
 - Blockweaver clean execution baseline before this authorization update: `39116c8e65090da6dc181ebbd17f69237167c842`, clean `main`, four plan commits ahead of `origin/main`.
 - KAIROS dataset-preparation pin: `bfaf9f662b24e9680e60e090e110dac9da51525d`, clean `main`, 17 user-owned commits ahead of `origin/main`; no KAIROS code commit was created by preparation.
@@ -468,6 +468,13 @@ Blockweaver has four deep implementation modules rather than five modules with a
 - Independently verify the integrated Blockweaver head, choose the next compatible patch release, update package metadata/changelog only as required, push/tag/release through trusted publishing, verify GitHub/PyPI artifacts and hashes, and install from the public index in an isolated environment.
 - The release must retain the same public Python and five-command interface. Private hidden-work compatibility is not added; the fresh pre-3C inventory must prove no active work was abandoned.
 - KAIROS K1 and the final image must pin the new published patch if the Blockweaver consolidation is intended to ship. Do not build an image that still installs `blockweaver==0.3.2` after Slices 3A–3F are accepted.
+
+### Blockweaver CLI compatibility hotfix
+
+- Status: required. K1 integration found that public `blockweaver==0.3.3` imports `ClickException` from Typer's private `typer._click` module. KAIROS's locked public Typer 0.24.1 removes that module, so `blockweaver --help` fails before command registration.
+- Scope: replace the private Typer import with the supported public exception boundary, prove all five command helps and stable JSONL usage failures against the supported Typer range including 0.24.1, and publish the next patch through the same independent implementation/review and trusted-publishing gate.
+- Non-goals: no KAIROS workaround, compatibility shim, CLI redesign, dependency widening, or unrelated Blockweaver change.
+- Expected outcome: Blockweaver's documented five-command CLI imports and behaves correctly in KAIROS's locked environment without relying on Typer internals. K1 pins the reviewed public hotfix before acceptance.
 
 ## Proposed Slice K1: remove duplicated corpus metadata and layered fixtures
 
