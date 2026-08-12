@@ -473,17 +473,15 @@ def _parse_providers(value: object) -> dict[str, ProviderSpec]:
         if ("url" in item) == ("url_env" in item):
             raise ValueError(f"providers.{name} must define exactly one of url or url_env")
         url = _string(item["url"], f"providers.{name}.url") if "url" in item else None
-        if url is not None:
-            _validate_url(url)
         url_env = _string(item["url_env"], f"providers.{name}.url_env") if "url_env" in item else None
         if url_env is not None and _ENV.fullmatch(url_env) is None:
             raise ValueError(f"providers.{name}.url_env is not a valid environment name")
         providers[name] = ProviderSpec(
             url,
             url_env,
-            _positive_int(item.get("batch_size", 20), f"providers.{name}.batch_size"),
-            _positive_int(item.get("concurrency", 6), f"providers.{name}.concurrency"),
-            _positive_number(item.get("timeout", 30), f"providers.{name}.timeout"),
+            _integer(item.get("batch_size", 20), f"providers.{name}.batch_size"),
+            _integer(item.get("concurrency", 6), f"providers.{name}.concurrency"),
+            _number(item.get("timeout", 30), f"providers.{name}.timeout"),
         )
     return providers
 
@@ -881,6 +879,18 @@ def _positive_int(value: object, label: str) -> int:
     if type(value) is not int or value <= 0 or value > _INT64_MAX:
         raise ValueError(f"{label} must be a positive signed Int64 integer")
     return value
+
+
+def _integer(value: object, label: str) -> int:
+    if type(value) is not int:
+        raise ValueError(f"{label} must be an integer")
+    return value
+
+
+def _number(value: object, label: str) -> float:
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        raise ValueError(f"{label} must be a number")
+    return float(value)
 
 
 def _positive_number(value: object, label: str) -> float:

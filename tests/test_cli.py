@@ -126,12 +126,14 @@ def test_strict_config_discovery_has_no_secrets(tmp_path: Path, chains: tuple[Ch
         'url = "http://bad host"',
         'url = "http://user:password@"',
         'url = "http://-bad.example"',
+        "batch_size = 0",
+        "concurrency = -1",
         "timeout = nan",
         "timeout = inf",
         "timeout = 3601",
     ],
 )
-def test_config_rejects_malformed_urls_and_unbounded_timeouts(
+def test_provider_resolution_rejects_invalid_domains_before_network(
     tmp_path: Path,
     chains: tuple[ChainServer, ChainServer],
     make_config: Any,
@@ -140,9 +142,15 @@ def test_config_rejects_malformed_urls_and_unbounded_timeouts(
     primary, verifier = chains
     config = make_config(tmp_path / "config.toml", primary, verifier, output_root=tmp_path / "out")
     text = config.read_text()
-    text = text.replace(f'url = "{primary.url}"', replacement, 1) if replacement.startswith("url") else text.replace("timeout = 2", replacement, 1)
+    if replacement.startswith("url"):
+        text = text.replace(f'url = "{primary.url}"', replacement, 1)
+    else:
+        setting = replacement.partition(" = ")[0]
+        configured = {"batch_size": 3, "concurrency": 2, "timeout": 2}[setting]
+        text = text.replace(f"{setting} = {configured}", replacement, 1)
     config.write_text(text)
-    assert error(invoke(["chains", "--config", str(config)]))["code"] == "CONFIG_INVALID"
+    assert error(invoke(download_args(config)))["code"] == "CONFIG_INVALID"
+    assert primary.requests == verifier.requests == []
 
 
 @pytest.mark.parametrize(
