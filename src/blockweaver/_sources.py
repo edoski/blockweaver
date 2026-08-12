@@ -11,11 +11,13 @@ from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from importlib import import_module
 from math import isfinite
+from pathlib import Path
 from typing import Any, TypeVar
 from uuid import UUID
 
 import aiohttp
 
+from . import __version__
 from ._contract import (
     Anchor,
     BigQueryDownloadRequest,
@@ -34,7 +36,7 @@ from ._contract import (
     quantity,
     validate_links,
 )
-from ._corpus import ArtifactSource, Dataset, VerifiedProof
+from ._corpus import ArtifactSource, Dataset, Publication, VerifiedProof, materialize_artifact, open_dataset
 
 _TRANSIENT_HTTP = {408, 425, 429, *range(500, 600)}
 _FATAL_RPC = {-32700, -32600, -32601, -32602, -32000, -32001, -32003, -32004, -32006}
@@ -529,6 +531,15 @@ class BigQuerySource:
         await _finish_candidate_validation(dataset, verifier_target, self.verifier)
 
 
+async def download(request: DownloadRequest, *, progress: Progress, publication: Publication) -> dict[str, object]:
+    progress({"event": "request", "dataset_id": str(request.dataset_id)})
+    return await acquire(
+        request,
+        progress,
+        lambda source: materialize_artifact(request, source, tool_version=__version__, progress=progress, publication=publication),
+    )
+
+
 async def acquire(request: DownloadRequest, progress: Progress, operation: SourceOperation) -> dict[str, object]:
     if isinstance(request, RpcDownloadRequest):
         return await _acquire_rpc(request, operation)
@@ -623,6 +634,29 @@ async def verify_rpc(dataset: Dataset, provider: Provider, full: bool) -> dict[s
         raise BlockweaverError("RPC_INVALID", str(error)) from None
     except RuntimeError as error:
         raise BlockweaverError("RPC_FAILED", str(error)) from None
+
+
+async def verify_dataset(
+    path: Path,
+    *,
+    provider: Provider | None,
+    full_rpc: bool,
+    progress: Progress,
+) -> dict[str, object]:
+    dataset = open_dataset(path)
+    progress({"event": "local_valid", "rows": dataset.row_count})
+    verification: dict[str, object] = {"mode": "local"}
+    if provider is not None:
+        verification = await verify_rpc(dataset, provider, full_rpc)
+        dataset._assert_unchanged()
+    return {
+        "operation": "verify",
+        "dataset_id": str(dataset.dataset_id),
+        "path": str(dataset.path),
+        "rows": dataset.row_count,
+        "artifact_sha256": dataset._pair_hashes,
+        "verification": verification,
+    }
 
 
 def _rpc(provider: Provider) -> Rpc:
