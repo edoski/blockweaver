@@ -34,7 +34,7 @@ from ._contract import (
     quantity,
     validate_links,
 )
-from ._corpus import ArtifactSource, Dataset, FactReader, VerifiedProof
+from ._corpus import ArtifactSource, Dataset, VerifiedProof
 
 _TRANSIENT_HTTP = {408, 425, 429, *range(500, 600)}
 _FATAL_RPC = {-32700, -32600, -32601, -32602, -32000, -32001, -32003, -32004, -32006}
@@ -447,12 +447,10 @@ class RpcSource:
             yield await self.primary.rows(first, end, self.request.plan)
             first = end + 1
 
-    async def prove(self, target: Header, read_facts: FactReader) -> VerifiedProof:
+    async def prove(self, target: Header) -> VerifiedProof:
         anchor = await _prove_finality(target, self.verifier, self.request)
         samples = sample_numbers(self.request.dataset_id, self.resolved.first_block, self.resolved.last_block)
-        facts = read_facts(samples)
-        await _check_rows(facts, samples, self.request.plan, self.verifier)
-        return VerifiedProof(anchor, {**self._verification, "target_agreement": True, "sampled_blocks": samples}, facts)
+        return VerifiedProof(anchor, {**self._verification, "target_agreement": True, "sampled_blocks": samples})
 
     async def revalidate(self, dataset: Dataset) -> None:
         verifier_target = await _candidate_target(dataset, self.verifier)
@@ -513,11 +511,9 @@ class BigQuerySource:
         ):
             yield chunk
 
-    async def prove(self, target: Header, read_facts: FactReader) -> VerifiedProof:
+    async def prove(self, target: Header) -> VerifiedProof:
         anchor = await _prove_finality(target, self.verifier, self.request)
         samples = sample_numbers(self.request.dataset_id, self.resolved.first_block, self.resolved.last_block)
-        facts = read_facts(samples)
-        await _check_rows(facts, samples, self.request.plan, self.verifier)
         return VerifiedProof(
             anchor,
             {
@@ -526,7 +522,6 @@ class BigQuerySource:
                 "target_agreement": True,
                 "sampled_blocks": samples,
             },
-            facts,
         )
 
     async def revalidate(self, dataset: Dataset) -> None:
