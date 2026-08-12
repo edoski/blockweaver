@@ -271,7 +271,7 @@ KAIROS consumes one verified Blockweaver dataset directly from its own `outputs/
 
 ## Proposed Slice 3A: trusted configuration and validation ownership
 
-- Status: approved; ready after the execution issue and fresh baseline are pinned.
+- Status: green and integrated on `main` at `293d738fd0b81af2d506c1c940691575fa7aaea8`; Standards 0 and Spec 0.
 - Repository: Blockweaver.
 - Planned baseline: repin clean Blockweaver `main`; audit evidence was gathered at `4fd70dcebcc8c29a0c9a5c168eccb35704948b06`.
 - Dependencies: completed Slices 1A–1C. No external provider or output gate.
@@ -307,7 +307,7 @@ Every raw value is validated once at its owning trust seam, trusted internal val
 
 ## Proposed Slice 3B: source planning and range efficiency
 
-- Status: approved; blocked on green Slice 3A.
+- Status: approved; ready after green Slice 3A.
 - Repository: Blockweaver.
 - Dependencies: green Slice 3A.
 
@@ -473,8 +473,9 @@ Blockweaver has four deep implementation modules rather than five modules with a
 
 - Status: approved; blocked on the separate Servatus KAIROS task, green Slice 3F, and the published Blockweaver patch.
 - Repository: KAIROS.
-- Planned baseline: repin accepted `main` and compact-CUDA only after task `019fea73-abd5-7a51-9681-f0443f647884` finishes its reviewed Servatus 0.5.0 adoption and pushes both refs.
+- Planned baseline: repin accepted `main` and compact-CUDA only after task `019fea73-abd5-7a51-9681-f0443f647884` finishes its reviewed Servatus 0.6.0 adoption and pushes both refs.
 - Dependencies: green Blockweaver Slice 3F, a reproducibly published compatible Blockweaver patch, and the separate Servatus KAIROS task. K1 updates the exact Blockweaver pin so the final image contains the accepted consolidation.
+- Coordination update: the separate task is now preparing approved Servatus S1/S2, a reviewed 0.6.0 candidate, its separately authorized release, and a KAIROS repin. K1, KAIROS refs, image, configuration, and corpus work remain paused until that task sends exact accepted `main` and compact-CUDA heads.
 
 ### Scope
 
@@ -549,6 +550,14 @@ Generic chain and range facts come directly from Blockweaver at the artifact sea
 - Pushes, research configuration changes, and image deployment each require their declared external authority. Campaign creation and launch are excluded from this run.
 
 ## Execution ledger
+
+GitHub issue [#4](https://github.com/edoski/blockweaver/issues/4) records approved consolidation Slices 3A–3F and the compatible release gate.
+
+- Slice 3A baseline: clean pushed `main` at `66f2f119ed15e7d5f1a6d067b07a0579f7b8d693`. Implementer: `/root/consolidation_3a_impl`; worktree `/Users/edo/dev/python/blockweaver-slice-3a`; branch `codex/consolidation-slice-3a`.
+- Initial implementation: `b431c0e3262a0bac4849ce3fddfb4ab5669810d4` (`refactor(config): consolidate validation ownership`). Initial review by `/root/consolidation_3a_review`: Standards 0; Spec rejected one P2 because raw provider parsing and resolved `Provider` still duplicated URL/tuning domain validation.
+- First correction: `6dda4b938bf6dc36857f9f8bbd3d3e7aa44d735e` (`fix(config): validate provider domains once`). Re-review closed the original P2 and found one correction-edge P2: a huge TOML timeout overflowed during raw float coercion instead of producing `CONFIG_INVALID`.
+- Second correction: `d9fc95fdc5380490ed72e0633b87c66d2a65df84` (`fix(config): bound timeout normalization`). Raw numeric parsing is type-only; resolved `Provider` alone normalizes and validates timeout, including huge integers. Final re-review returned Standards 0 and Spec 0.
+- Integration: merge `293d738fd0b81af2d506c1c940691575fa7aaea8` (`merge(config): integrate consolidation slice 3a`). Main passed all 96 tests, Ruff lint/format, Pyright, Vulture, lock and diff checks, five-command CLI help, lazy core import, and optional BigQuery import. No provider, output, KAIROS, image, campaign, release, or package publication occurred.
 
 GitHub issue [#2](https://github.com/edoski/blockweaver/issues/2) records the authorized Blockweaver contract change.
 
