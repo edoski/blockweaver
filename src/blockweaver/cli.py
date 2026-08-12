@@ -15,8 +15,6 @@ import typer
 from typer._click.exceptions import ClickException
 from typer.core import TyperGroup
 
-from ._build import Publication, verify_dataset
-from ._build import download as download_dataset
 from ._contract import (
     FEATURES,
     BlockweaverError,
@@ -26,6 +24,9 @@ from ._contract import (
     resolve_download_request,
     selected_config_path,
 )
+from ._corpus import Publication
+from ._sources import download as download_dataset
+from ._sources import verify_dataset
 
 _EXAMPLE_CONFIG = """[defaults]
 chain = "local"
