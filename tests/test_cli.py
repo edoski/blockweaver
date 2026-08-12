@@ -811,6 +811,7 @@ def test_publication_failure_recovers_ready_candidate(
     assert error(invoke(download_args(config)))["code"] == "INTERRUPTED"
     hidden = tmp_path / "out" / f".blockweaver-{DATASET_ID}"
     assert {path.name for path in (hidden / "ready").iterdir()} == {"manifest.json", "blocks.parquet"}
+    assert {path.name for path in hidden.iterdir()} == {"binding.json", "chunks", "ready"}
 
     requests = len(primary.requests) + len(verifier.requests)
     monkeypatch.setattr(_corpus, "_rename_no_replace", real_rename)
@@ -847,10 +848,6 @@ def test_recovery_rejects_artifacts_outside_the_immutable_binding(
     manifest = json.loads(manifest_path.read_text())
     manifest["source"]["provider"] = "other"
     manifest_path.write_text(json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n")
-    receipt_path = hidden / "receipt.json"
-    receipt = json.loads(receipt_path.read_text())
-    receipt["artifact_sha256"] = {path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in sorted(artifact.iterdir()) if path.is_file()}
-    receipt_path.write_text(json.dumps(receipt, sort_keys=True, separators=(",", ":")) + "\n")
 
     assert error(invoke(download_args(config)))["code"] == "RESUME_MISMATCH"
 
@@ -923,7 +920,7 @@ def test_same_uuid_concurrent_cli_has_one_publication_and_stable_loser(
     assert not (output_root / f".blockweaver-{dataset_id}").exists()
 
 
-@pytest.mark.parametrize("state", ["incomplete", "receipt_only", "provisional"])
+@pytest.mark.parametrize("state", ["incomplete", "provisional"])
 def test_incomplete_work_states_restart_cleanly(
     tmp_path: Path,
     chains: tuple[ChainServer, ChainServer],
@@ -936,8 +933,6 @@ def test_incomplete_work_states_restart_cleanly(
     hidden.mkdir(parents=True)
     if state == "incomplete":
         (hidden / "orphan").write_text("incomplete")
-    elif state == "receipt_only":
-        (hidden / "receipt.json").write_text("{}\n")
     else:
         (hidden / "ready.tmp").mkdir()
         (hidden / "ready.tmp" / "partial").write_text("partial")
@@ -948,7 +943,7 @@ def test_incomplete_work_states_restart_cleanly(
     assert artifact.is_dir() and not hidden.exists()
 
 
-def test_staged_recovery_ignores_obsolete_checkpoints_and_regenerates_a_corrupt_receipt(
+def test_staged_recovery_ignores_obsolete_checkpoints_and_revalidates(
     tmp_path: Path,
     chains: tuple[ChainServer, ChainServer],
     make_config: Any,
@@ -961,7 +956,6 @@ def test_staged_recovery_ignores_obsolete_checkpoints_and_regenerates_a_corrupt_
     assert error(invoke(download_args(config)))["code"] == "INTERRUPTED"
     hidden = tmp_path / "out" / f".blockweaver-{DATASET_ID}"
     assert "version" not in json.loads((hidden / "binding.json").read_text())
-    assert "version" not in json.loads((hidden / "receipt.json").read_text())
     with next((hidden / "chunks").iterdir()).open("ab") as stream:
         stream.write(b"obsolete checkpoint corruption")
 
@@ -969,7 +963,6 @@ def test_staged_recovery_ignores_obsolete_checkpoints_and_regenerates_a_corrupt_
     verifier.changes[14] = {"hash": block_hash(999)}
     assert error(invoke(download_args(config)))["code"] == "RPC_MISMATCH"
     verifier.changes.clear()
-    (hidden / "receipt.json").write_text("{broken\n")
 
     receipt = json.loads(invoke(download_args(config)).stdout)
 
@@ -991,7 +984,6 @@ def test_committed_recovery_survives_partial_hidden_cleanup(
     hidden = tmp_path / "out" / f".blockweaver-{DATASET_ID}"
     (hidden / "binding.json").unlink()
     shutil.rmtree(hidden / "chunks")
-    (hidden / "receipt.json").write_text("{}\n")
     monkeypatch.setattr(_corpus, "_discard_work", real_discard)
 
     receipt = json.loads(invoke(download_args(config)).stdout)
@@ -1083,7 +1075,7 @@ def test_publication_syncs_both_rename_parents_then_root_after_cleanup(
     assert set(final_files) == {"manifest.json", "blocks.parquet"}
 
 
-def test_unsupported_publication_capability_fails_before_destination_mutation(
+def test_unavailable_atomic_publication_keeps_staged_candidate(
     tmp_path: Path,
     chains: tuple[ChainServer, ChainServer],
     make_config: Any,
@@ -1094,7 +1086,7 @@ def test_unsupported_publication_capability_fails_before_destination_mutation(
     config = make_config(tmp_path / "config.toml", primary, verifier, output_root=output_root)
     monkeypatch.setattr(
         _corpus,
-        "_ensure_publication_supported",
+        "_rename_no_replace",
         Mock(side_effect=OSError(errno.ENOTSUP, "Atomic no-replace publication is unavailable")),
     )
 

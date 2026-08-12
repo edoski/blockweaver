@@ -59,19 +59,6 @@ _MANIFEST_KEYS = {
     "finalized_anchor",
     "verification",
 }
-_RECEIPT_KEYS = {
-    "operation",
-    "dataset_id",
-    "path",
-    "chain",
-    "resolved_range",
-    "rows",
-    "reused_rows",
-    "acquired_rows",
-    "finalized_anchor",
-    "artifact_sha256",
-}
-
 Progress = Callable[[dict[str, object]], None]
 Publication = Callable[[Literal["publishing", "committed"]], None]
 FactReader = Callable[[list[int]], dict[int, dict[str, Value]]]
@@ -347,7 +334,6 @@ class Recovery:
     kind: Literal["checkpointing", "staged", "committed"]
     checkpoints: CheckpointSet | None = None
     dataset: Dataset | None = None
-    receipt: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -400,7 +386,6 @@ def _prepare_work(hidden: Path, identity: ArtifactIdentity, size: int, *, recove
     binding_path = hidden / "binding.json"
     chunks = hidden / "chunks"
     ready = hidden / "ready"
-    receipt_path = hidden / "receipt.json"
     expected_binding = identity.binding()
     if binding_path.exists():
         try:
@@ -414,7 +399,7 @@ def _prepare_work(hidden: Path, identity: ArtifactIdentity, size: int, *, recove
             raise BlockweaverError("DESTINATION_EXISTS", f"Destination already exists: {identity.destination}")
         dataset = open_dataset(identity.destination)
         identity.validate_dataset(dataset)
-        return Recovery("committed", dataset=dataset, receipt=_recover_receipt(receipt_path, dataset, identity.destination))
+        return Recovery("committed", dataset=dataset)
     for path in hidden.rglob("*.tmp"):
         shutil.rmtree(path) if path.is_dir() else path.unlink()
     if binding_path.is_file():
@@ -423,13 +408,11 @@ def _prepare_work(hidden: Path, identity: ArtifactIdentity, size: int, *, recove
                 dataset = _open_dataset(ready, work=True)
             except BlockweaverError:
                 shutil.rmtree(ready) if ready.is_dir() else ready.unlink()
-                receipt_path.unlink(missing_ok=True)
             else:
                 identity.validate_dataset(dataset)
-                return Recovery("staged", dataset=dataset, receipt=_recover_receipt(receipt_path, dataset, identity.destination))
+                return Recovery("staged", dataset=dataset)
         if chunks.is_dir():
             checkpoints = CheckpointSet.recover(chunks, identity, size)
-            receipt_path.unlink(missing_ok=True)
             return Recovery("checkpointing", checkpoints)
     for path in hidden.iterdir():
         shutil.rmtree(path) if path.is_dir() else path.unlink()
@@ -437,38 +420,6 @@ def _prepare_work(hidden: Path, identity: ArtifactIdentity, size: int, *, recove
     _write_json(binding_path, expected_binding)
     _fsync_directory(hidden)
     return Recovery("checkpointing", CheckpointSet(chunks, identity, size))
-
-
-def _recover_receipt(path: Path, dataset: Dataset, destination: Path) -> dict[str, Any] | None:
-    if not path.is_file():
-        if path.exists():
-            shutil.rmtree(path) if path.is_dir() else path.unlink()
-        return None
-    try:
-        receipt = _read_json(path)
-    except ValueError:
-        return None
-    return receipt if _receipt_matches(receipt, dataset, destination) else None
-
-
-def _receipt_matches(receipt: dict[str, Any], dataset: Dataset, destination: Path) -> bool:
-    state = dataset._state
-    return (
-        set(receipt) == _RECEIPT_KEYS
-        and receipt.get("operation") == "download"
-        and receipt.get("dataset_id") == str(dataset.dataset_id)
-        and receipt.get("path") == str(destination)
-        and receipt.get("chain") == state.document["chain"]
-        and receipt.get("resolved_range") == state.resolved_range
-        and receipt.get("rows") == dataset.row_count
-        and receipt.get("finalized_anchor") == state.anchor.document()
-        and receipt.get("artifact_sha256") == dataset._pair_hashes
-        and type(receipt.get("reused_rows")) is int
-        and type(receipt.get("acquired_rows")) is int
-        and receipt["reused_rows"] >= 0
-        and receipt["acquired_rows"] >= 0
-        and receipt["reused_rows"] + receipt["acquired_rows"] == dataset.row_count
-    )
 
 
 def checkpoint_schema(plan: Plan):
@@ -583,13 +534,11 @@ async def materialize_artifact(
         recovered = recovery.kind != "checkpointing" or bool(recovery.checkpoints and recovery.checkpoints.items)
         if recovery.kind == "committed":
             assert recovery.dataset is not None
-            receipt = recovery.receipt or _download_receipt(recovery.dataset, identity.destination, recovery.dataset.row_count, 0)
+            receipt = _download_receipt(recovery.dataset, identity.destination, recovery.dataset.row_count, 0)
             publication("committed")
         else:
             candidate = recovery.dataset
-            receipt = recovery.receipt
             reused = 0
-            acquired = 0
             if recovery.kind == "checkpointing":
                 checkpoints = recovery.checkpoints
                 assert checkpoints is not None
@@ -617,17 +566,14 @@ async def materialize_artifact(
                 )
                 _validate_verified_samples(candidate, proof)
                 acquired = candidate.row_count - reused
-            assert candidate is not None
+            else:
+                assert candidate is not None
+                reused = candidate.row_count
+                acquired = 0
             await source.revalidate(candidate)
             candidate._assert_unchanged()
-            if receipt is None:
-                receipt = _download_receipt(
-                    candidate,
-                    identity.destination,
-                    candidate.row_count if recovery.kind == "staged" else reused,
-                    0 if recovery.kind == "staged" else acquired,
-                )
-            _stage_candidate(hidden, candidate.path, receipt)
+            receipt = _download_receipt(candidate, identity.destination, reused, acquired)
+            _stage_candidate(hidden, candidate.path)
             publication("publishing")
             _publish(hidden, identity.destination)
             publication("committed")
@@ -927,9 +873,8 @@ def _polars_schema(plan: Plan):
     return {name: pl.Int64 if dtype == "Int64" else pl.String for name, dtype in plan.schema.items()}
 
 
-def _stage_candidate(hidden: Path, candidate: Path, receipt: dict[str, object]) -> None:
+def _stage_candidate(hidden: Path, candidate: Path) -> None:
     ready = hidden / "ready"
-    _write_json(hidden / "receipt.json", receipt)
     if candidate != ready:
         os.rename(candidate, ready)
     _fsync_directory(hidden)
@@ -940,7 +885,6 @@ def _publish(hidden: Path, destination: Path) -> None:
     files = list(ready.iterdir())
     if len(files) != 2 or not all(path.is_file() for path in files) or not (ready / "manifest.json").is_file():
         raise BlockweaverError("PUBLICATION_FAILED", "Candidate does not contain exactly the canonical artifact pair")
-    _ensure_publication_supported()
     for path in files:
         _sync_final_file(path)
     _fsync_directory(ready)
@@ -1063,7 +1007,10 @@ def _fsync_directory(path: Path) -> None:
 def _rename_no_replace(source: Path, destination: Path) -> None:
     if sys.platform == "darwin":
         library = ctypes.CDLL(None, use_errno=True)
-        rename = library.renamex_np
+        try:
+            rename = library.renamex_np
+        except AttributeError as error:
+            raise OSError(errno.ENOTSUP, "Atomic no-replace publication is unavailable") from error
         rename.argtypes = (ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint)
         rename.restype = ctypes.c_int
         result = rename(os.fsencode(source), os.fsencode(destination), 0x00000004)
@@ -1084,14 +1031,3 @@ def _rename_no_replace(source: Path, destination: Path) -> None:
     if code in {errno.EEXIST, errno.ENOTEMPTY}:
         raise BlockweaverError("DESTINATION_EXISTS", f"Destination already exists: {destination}")
     raise OSError(code, os.strerror(code), destination)
-
-
-def _ensure_publication_supported() -> None:
-    library = ctypes.CDLL(None, use_errno=True)
-    if sys.platform == "darwin":
-        if not hasattr(library, "renamex_np"):
-            raise OSError(errno.ENOTSUP, "Atomic no-replace publication is unavailable")
-        return
-    if sys.platform.startswith("linux") and hasattr(library, "renameat2"):
-        return
-    raise OSError(errno.ENOTSUP, "Atomic no-replace publication is unavailable")
