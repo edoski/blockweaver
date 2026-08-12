@@ -471,7 +471,7 @@ Blockweaver has four deep implementation modules rather than five modules with a
 
 ### Blockweaver CLI compatibility hotfix
 
-- Status: implementation and independent review complete; integrated on Blockweaver `main` at `935db72e453a7bcccd99d09544926fa4c37a6ba1`. Publication of patch `0.3.4` remains before K1's final pin and review.
+- Status: complete. Blockweaver `v0.3.4` is published from exact reviewed head `045ff7dc8dcfce01bd7b472d0c1c618cc71a1b74`; K1 may take its final public pin and proceed to review.
 - K1 integration found that public `blockweaver==0.3.3` imports `ClickException` from Typer's private `typer._click` module. KAIROS's locked public Typer 0.24.1 removes that module, so `blockweaver --help` fails before command registration.
 - Scope: replace the private Typer import with the supported public exception boundary, prove all five command helps and stable JSONL usage failures against the supported Typer range including 0.24.1, and publish the next patch through the same independent implementation/review and trusted-publishing gate.
 - Non-goals: no KAIROS workaround, compatibility shim, CLI redesign, dependency widening, or unrelated Blockweaver change.
@@ -567,6 +567,9 @@ GitHub issue [#4](https://github.com/edoski/blockweaver/issues/4) records approv
 - First correction `10341053f413e65fab0de937dc9038b6bce54d5b` restricted recognition to exact exit code 2. Re-review rejected Standards 2 and accepted Spec 0 because an unrelated callback could still imitate that shape.
 - Final correction `7a10dffade4e2826b4f59293043a00ff60bb281c` catches only the nominal usage-error superclass of public `typer.BadParameter`; static protocol typing performs no runtime classification. An exact-code-2 lookalike propagates unchanged. Final review: Standards 0, Spec 0.
 - Integration merge `935db72e453a7bcccd99d09544926fa4c37a6ba1` passed 104 tests, Ruff lint/format, Pyright, Vulture, lock, and diff checks. Focused help and usage envelopes pass Typer 0.24.1 and 0.27.0. No provider, output, KAIROS data, image, GPU, campaign, or corpus action occurred.
+- Release 0.3.4 baseline `d30316463560aa4e2b8131a0760dd2cd90a6347c`; implementer `/root/blockweaver_034_release_impl`; candidate `045ff7dc8dcfce01bd7b472d0c1c618cc71a1b74`; reviewer `/root/blockweaver_034_release_review`. The release-only two-line version bump was Standards 0 and Spec 0, and independent builds matched byte-for-byte.
+- Branch CI run `31607853394` and tag CI run `31608107732` passed on Ubuntu and macOS. Trusted-publishing run `31608325047` passed. GitHub Release: `https://github.com/edoski/blockweaver/releases/tag/v0.3.4`.
+- Public PyPI hashes match both independent candidate builds: wheel `21b0e29f4d7ce495fba26fb5cede0288155525231ab58b647f7c2704f3781842`; sdist `a39bd4973ff10c7422063bc156e9a845b5d8e163edd606cb91814929c21cb47c`. Fresh public CPython 3.11 installs passed the exact API, lazy core, Typer 0.24.1 root/five-command help and JSONL usage boundary, and BigQuery-extra import. The first seconds-old index lookup missed 0.3.4; an explicit package refresh resolved it and proved the public files. Temporary environments were moved to Trash.
 
 - Slice 3A baseline: clean pushed `main` at `66f2f119ed15e7d5f1a6d067b07a0579f7b8d693`. Implementer: `/root/consolidation_3a_impl`; worktree `/Users/edo/dev/python/blockweaver-slice-3a`; branch `codex/consolidation-slice-3a`.
 - Initial implementation: `b431c0e3262a0bac4849ce3fddfb4ab5669810d4` (`refactor(config): consolidate validation ownership`). Initial review by `/root/consolidation_3a_review`: Standards 0; Spec rejected one P2 because raw provider parsing and resolved `Provider` still duplicated URL/tuning domain validation.
