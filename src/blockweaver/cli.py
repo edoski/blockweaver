@@ -68,7 +68,7 @@ class MachineGroup(TyperGroup):
         except Exception as error:
             format_message = getattr(error, "format_message", None)
             exit_code = getattr(error, "exit_code", None)
-            if not callable(format_message) or not isinstance(exit_code, int):
+            if not callable(format_message) or type(exit_code) is not int or exit_code != 2:
                 raise
             _progress({"event": "error", "code": "CLI_USAGE", "message": format_message()})
             if standalone_mode:
