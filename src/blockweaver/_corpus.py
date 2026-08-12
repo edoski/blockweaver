@@ -440,22 +440,24 @@ def _write_checkpoint(chunks: Path, first: int, last: int, plan: Plan, headers: 
         path = chunks / f"{first:020d}-{last:020d}-{digest}.parquet"
         os.replace(temporary, path)
         _fsync_directory(chunks)
-        return _read_checkpoint(path, plan, digest, digest_verified=True)
+        return Checkpoint(path, first, last, digest, headers[0], headers[-1])
     finally:
         temporary.unlink(missing_ok=True)
 
 
-def _read_checkpoint(path: Path, plan: Plan, digest: str, *, digest_verified: bool = False) -> Checkpoint:
+def _read_checkpoint(path: Path, plan: Plan, digest: str) -> Checkpoint:
     try:
         match = _CHUNK.fullmatch(path.name)
         if match is None or match.group(3) != digest:
             raise ValueError
-        if not digest_verified and file_hash(path) != digest:
+        if file_hash(path) != digest:
             raise ValueError
         frame = pl.read_parquet(path)
-        if frame.schema != checkpoint_schema(plan) or frame.is_empty() or frame.null_count().row(0) != (0,) * len(frame.columns):
+        proof_columns = ["_proof_hash", "_proof_parent_hash", "_proof_timestamp"]
+        if frame.schema != checkpoint_schema(plan) or frame.is_empty() or frame.select(proof_columns).null_count().row(0) != (0,) * len(proof_columns):
             raise ValueError
-        _validate_eager_frame(frame.select(plan.columns), plan)
+        first, last = int(match.group(1)), int(match.group(2))
+        _validate_rows(frame.select(plan.columns).lazy(), plan, first=first, last=last)
         for row in frame.iter_rows(named=True):
             if "timestamp" in plan.columns and row["timestamp"] != row["_proof_timestamp"]:
                 raise ValueError
@@ -466,10 +468,7 @@ def _read_checkpoint(path: Path, plan: Plan, digest: str, *, digest_verified: bo
         headers = [
             Header(row["block_number"], row["_proof_hash"], row["_proof_parent_hash"], row["_proof_timestamp"], {}) for row in frame.iter_rows(named=True)
         ]
-        first, last = int(match.group(1)), int(match.group(2))
-        if [header.block_number for header in headers] != list(range(first, last + 1)) or any(
-            _HASH.fullmatch(value) is None for header in headers for value in (header.block_hash, header.parent_hash)
-        ):
+        if any(_HASH.fullmatch(value) is None for header in headers for value in (header.block_hash, header.parent_hash)):
             raise ValueError
         validate_links(headers)
         return Checkpoint(path, first, last, digest, headers[0], headers[-1])
@@ -765,14 +764,31 @@ def _validate_data(path: Path, plan: Plan, output_format: str, resolved: dict[st
             raise ValueError("Parquet schema is not canonical")
     else:
         _validate_csv_tokens(path, plan)
-    frame = _scan_data(path, plan, output_format)
+    return _validate_rows(
+        _scan_data(path, plan, output_format),
+        plan,
+        first=resolved["from_block"],
+        last=resolved["to_block"],
+        first_timestamp=resolved["from_timestamp"],
+        last_timestamp=resolved["to_timestamp"],
+        target_hash=target_hash,
+    )
+
+
+def _validate_rows(
+    frame: pl.LazyFrame,
+    plan: Plan,
+    *,
+    first: int,
+    last: int,
+    first_timestamp: int | None = None,
+    last_timestamp: int | None = None,
+    target_hash: str | None = None,
+) -> int:
     invalid = pl.lit(False)
     for feature in plan.features:
         if feature.dtype == "Int64":
-            rule = pl.col(feature.name) < 0
-            if feature.name in {"base_fee_per_gas", "gas_limit"}:
-                rule = pl.col(feature.name) <= 0
-            invalid |= rule
+            invalid |= pl.col(feature.name) <= 0 if feature.name in {"base_fee_per_gas", "gas_limit"} else pl.col(feature.name) < 0
         elif feature.name in {"block_hash", "parent_hash"}:
             invalid |= ~pl.col(feature.name).str.contains(r"^0x[0-9a-f]{64}$")
     if {"gas_used", "gas_limit"} <= set(plan.columns):
@@ -796,40 +812,20 @@ def _validate_data(path: Path, plan: Plan, output_format: str, resolved: dict[st
     if "block_hash" in plan.columns:
         expressions.append(pl.col("block_hash").last().alias("target_hash"))
     summary = frame.select(*expressions).collect(engine="streaming").row(0, named=True)
-    expected_rows = resolved["to_block"] - resolved["from_block"] + 1
-    if summary["rows"] != expected_rows or summary["first"] != resolved["from_block"] or summary["last"] != resolved["to_block"] or summary["gaps"]:
+    expected_rows = last - first + 1
+    if summary["rows"] != expected_rows or summary["first"] != first or summary["last"] != last or summary["gaps"]:
         raise ValueError("Data rows are not the resolved contiguous range")
     if summary["invalid"] or summary["nulls"]:
         raise ValueError("Data contains invalid or null values")
     if "timestamp" in plan.columns and (
-        summary["time_decreases"] or summary["first_timestamp"] != resolved["from_timestamp"] or summary["last_timestamp"] != resolved["to_timestamp"]
+        summary["time_decreases"]
+        or (first_timestamp is not None and summary["first_timestamp"] != first_timestamp)
+        or (last_timestamp is not None and summary["last_timestamp"] != last_timestamp)
     ):
         raise ValueError("Data timestamps do not match the resolved range")
-    if "block_hash" in plan.columns and summary["target_hash"] != target_hash:
+    if "block_hash" in plan.columns and target_hash is not None and summary["target_hash"] != target_hash:
         raise ValueError("Data target hash does not match the manifest")
     return expected_rows
-
-
-def _validate_eager_frame(frame: pl.DataFrame, plan: Plan) -> None:
-    if frame.schema != _polars_schema(plan) or frame.null_count().row(0) != (0,) * len(frame.columns):
-        raise ValueError("Invalid checkpoint values")
-    if frame["block_number"].to_list() != list(range(int(frame[0, "block_number"]), int(frame[-1, "block_number"]) + 1)):
-        raise ValueError("Checkpoint block numbers are not contiguous")
-    previous_timestamp: int | None = None
-    for row in frame.iter_rows(named=True):
-        for feature in plan.features:
-            value = row[feature.name]
-            if feature.dtype == "Int64" and (value < 0 or (feature.name in {"base_fee_per_gas", "gas_limit"} and value == 0)):
-                raise ValueError("Checkpoint contains an invalid feature value")
-            if feature.name in {"block_hash", "parent_hash"} and _HASH.fullmatch(value) is None:
-                raise ValueError("Checkpoint contains an invalid hash")
-        if {"gas_used", "gas_limit"} <= set(plan.columns) and row["gas_used"] > row["gas_limit"]:
-            raise ValueError("Checkpoint contains invalid gas values")
-        if "timestamp" in plan.columns:
-            timestamp = row["timestamp"]
-            if previous_timestamp is not None and timestamp < previous_timestamp:
-                raise ValueError("Checkpoint timestamps decrease")
-            previous_timestamp = timestamp
 
 
 def _validate_csv_tokens(path: Path, plan: Plan) -> None:
