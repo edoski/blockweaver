@@ -2,7 +2,7 @@
 
 ## Run
 
-- Status: Blockweaver consolidation Slices 1A–1C and KAIROS Slice 2 are independently green and integrated. Release `v0.3.2` at `9572ad743b56c17e11a313a7ec5ecfc75991f2cd` is published on GitHub and PyPI, all three additive local/research datasets are prepared and verified, and legacy HPO `dfd33e91-702e-46c5-8cb1-3c510af4c048` is closed at 216/216. A read-only post-integration consolidation audit has produced proposed Slices 3A–3F and K1; their implementation remains paused for user alignment.
+- Status: Blockweaver consolidation Slices 1A–1C and KAIROS Slice 2 are independently green and integrated. Release `v0.3.2` at `9572ad743b56c17e11a313a7ec5ecfc75991f2cd` is published on GitHub and PyPI, all three additive local/research datasets are prepared and verified, and legacy HPO `dfd33e91-702e-46c5-8cb1-3c510af4c048` is closed at 216/216. The user approved consolidation Slices 3A–3F, the Blockweaver patch release, and K1; ordered execution is active.
 - Authoritative spec: this ledger plus the user-approved decisions below.
 - Blockweaver clean execution baseline before this authorization update: `39116c8e65090da6dc181ebbd17f69237167c842`, clean `main`, four plan commits ahead of `origin/main`.
 - KAIROS dataset-preparation pin: `bfaf9f662b24e9680e60e090e110dac9da51525d`, clean `main`, 17 user-owned commits ahead of `origin/main`; no KAIROS code commit was created by preparation.
@@ -10,7 +10,7 @@
 - KAIROS working tree is clean. The approved `fsevents` allowance is committed at `7cca6fcb`; coherent K-study/HPO figure work is committed at `c0021cb9`; the four discarded epigraph notes are absent.
 - Pre-run worktrees: one normal worktree per repository. Slice 1 used `/Users/edo/dev/python/blockweaver-dataset-contract` on `codex/dataset-contract-clean-break`; both the worktree and its integrated branch were removed after the execution record was committed.
 - Execution checkout policy: use isolated `codex/` branches and worktrees, one writer at a time. Integrate only after each repository slice is green. Never include protected dirt.
-- Current authority: completed reviewed code and dataset preparation may proceed through the already authorized combined-image, configuration, and exact cleanup gates after the Servatus handoff. Proposed audit Slices 3A–3E and K1 are ledgered for alignment only and are not yet authorized for implementation. Campaign creation, configuration, submission, and GPU smoke remain excluded.
+- Current authority: Slices 3A–3F, the compatible Blockweaver patch release, and K1 are authorized through independent implementation/review loops. Completed reviewed code and dataset preparation may then proceed through the authorized combined-image, configuration, and exact cleanup gates after the Servatus handoff. Campaign creation, configuration, submission, and GPU smoke remain excluded.
 
 ## Confirmed decisions
 
@@ -267,11 +267,11 @@ KAIROS consumes one verified Blockweaver dataset directly from its own `outputs/
 - Purpose: consolidate only demonstrated duplicate ownership, durable shadow state, repeated external work, and layered tests. Complexity does not qualify merely because it is low-level or large.
 - Lanes: `/root/bw_structure_audit`, `/root/bw_validation_audit`, `/root/bw_sources_audit`, `/root/bw_artifact_audit`, `/root/bw_cli_config_audit`, `/root/kairos_corpus_ownership_audit`, `/root/kairos_corpus_test_audit`, `/root/bw_kairos_interface_audit`, and `/root/bw_kairos_data_path_audit`. `/root/rejected_findings_adjudication` then challenged every rejection from first principles, confirmed K1, rescued `_build.py` deletion as 3F, kept two items measurement-gated, and upheld the remaining rejections.
 - Shared conclusion: keep the public five-command plus `BlockweaverError`/`Dataset`/`open_dataset` interface and the real RPC/BigQuery `ArtifactSource` seam. Proposed Slice 3F tests whether the shallow `_build.py` pass-through can disappear, reducing five implementation modules to four without creating the previously rejected source mega-module. The Blockweaver–KAIROS production seam is otherwise already narrow; no KAIROS feature profile, scientific frame, temporal logic, or model meaning moves into Blockweaver.
-- Execution gate: before any proposed Blockweaver slice, create a fresh GitHub execution issue or obtain an explicit repository waiver, repin clean `main`, inventory active hidden work, and use the implementation/review loop. Before K1, wait for the separate Servatus task to finish and repin both KAIROS branches. No proposed slice runs merely because it appears below.
+- Execution gate: [issue #4](https://github.com/edoski/blockweaver/issues/4) records Slices 3A–3F and the release gate. Repin clean `main`, inventory active hidden work before 3C, and use the implementation/review loop. Before K1, wait for the separate Servatus task to finish and repin both KAIROS branches. User approval for every proposed slice and release gate was recorded on 2026-08-12.
 
 ## Proposed Slice 3A: trusted configuration and validation ownership
 
-- Status: planned; awaiting alignment and execution authority.
+- Status: approved; ready after the execution issue and fresh baseline are pinned.
 - Repository: Blockweaver.
 - Planned baseline: repin clean Blockweaver `main`; audit evidence was gathered at `4fd70dcebcc8c29a0c9a5c168eccb35704948b06`.
 - Dependencies: completed Slices 1A–1C. No external provider or output gate.
@@ -307,7 +307,7 @@ Every raw value is validated once at its owning trust seam, trusted internal val
 
 ## Proposed Slice 3B: source planning and range efficiency
 
-- Status: planned; awaiting alignment and execution authority.
+- Status: approved; blocked on green Slice 3A.
 - Repository: Blockweaver.
 - Dependencies: green Slice 3A.
 
@@ -338,7 +338,7 @@ Feature requirements have one owner and range/finality work performs no duplicat
 
 ## Proposed Slice 3C: delete durable receipt shadow state
 
-- Status: planned; awaiting alignment and execution authority.
+- Status: approved; blocked on green Slice 3B and the fresh hidden-work inventory.
 - Repository: Blockweaver.
 - Dependencies: green Slice 3B; fresh hidden-work inventory immediately before implementation.
 
@@ -370,7 +370,7 @@ The durable filesystem contains only state needed to resume or prove publication
 
 ## Proposed Slice 3D: proof pipeline deepening
 
-- Status: planned; awaiting alignment and execution authority.
+- Status: approved; blocked on green Slice 3C.
 - Repository: Blockweaver.
 - Dependencies: green Slice 3C.
 
@@ -401,7 +401,7 @@ Each fresh download proves sampled rows once against the exact candidate bytes t
 
 ## Proposed Slice 3E: checkpoint and row-domain pass consolidation
 
-- Status: planned; awaiting alignment and execution authority.
+- Status: approved; blocked on green Slice 3D.
 - Repository: Blockweaver.
 - Dependencies: green Slice 3D.
 
@@ -432,7 +432,7 @@ Fresh trusted data is not treated as recovered untrusted bytes immediately after
 
 ## Proposed Slice 3F: remove shallow build orchestration
 
-- Status: planned; awaiting alignment and execution authority.
+- Status: approved; blocked on green Slice 3E.
 - Repository: Blockweaver.
 - Dependencies: green Slice 3E.
 
@@ -464,14 +464,14 @@ Blockweaver has four deep implementation modules rather than five modules with a
 
 ## Proposed Blockweaver release gate
 
-- Status: planned; blocked on green Slices 3A–3F and explicit publication authority at execution time.
+- Status: approved; blocked on green Slices 3A–3F.
 - Independently verify the integrated Blockweaver head, choose the next compatible patch release, update package metadata/changelog only as required, push/tag/release through trusted publishing, verify GitHub/PyPI artifacts and hashes, and install from the public index in an isolated environment.
 - The release must retain the same public Python and five-command interface. Private hidden-work compatibility is not added; the fresh pre-3C inventory must prove no active work was abandoned.
 - KAIROS K1 and the final image must pin the new published patch if the Blockweaver consolidation is intended to ship. Do not build an image that still installs `blockweaver==0.3.2` after Slices 3A–3F are accepted.
 
 ## Proposed Slice K1: remove duplicated corpus metadata and layered fixtures
 
-- Status: planned; blocked on the separate Servatus KAIROS task and user alignment.
+- Status: approved; blocked on the separate Servatus KAIROS task, green Slice 3F, and the published Blockweaver patch.
 - Repository: KAIROS.
 - Planned baseline: repin accepted `main` and compact-CUDA only after task `019fea73-abd5-7a51-9681-f0443f647884` finishes its reviewed Servatus 0.5.0 adoption and pushes both refs.
 - Dependencies: green Blockweaver Slice 3F, a reproducibly published compatible Blockweaver patch, and the separate Servatus KAIROS task. K1 updates the exact Blockweaver pin so the final image contains the accepted consolidation.
