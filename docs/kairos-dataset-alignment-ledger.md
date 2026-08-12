@@ -228,7 +228,7 @@ The client-facing interface says exactly what Blockweaver supports: no inert ver
 
 ## Slice 2: KAIROS direct dataset consumption
 
-- Status: active. The final Blockweaver release/pin, additive local/research dataset preparation, and legacy-HPO closure gates are complete.
+- Status: green and integrated on KAIROS `main` at `6a8f22c2e518b4bc6885b5cc6e3d807333e3053b`; Standards 0 and Spec 0.
 - Repository: KAIROS.
 - Baseline: `bfaf9f662b24e9680e60e090e110dac9da51525d`; KAIROS `main` was clean and 17 user-owned commits ahead of `origin/main` when this slice began.
 - Dependencies: Blockweaver Slices 1 and 1A–1C green with a released or otherwise reproducibly pinned package artifact; Servatus remains pinned at its accepted version and requires no change.
@@ -349,5 +349,9 @@ GitHub issue [#2](https://github.com/edoski/blockweaver/issues/2) records the au
 - Continuation pins: Blockweaver clean `main` and `origin/main` at `19abdfc175682950b9824f786488978f593ab7da`; KAIROS clean `main` at `bfaf9f662b24e9680e60e090e110dac9da51525d`, 17 user-owned commits ahead of `origin/main` at `e96c9f4d0917c35c58f23b3cd43accd61e005d61`. The pre-existing KAIROS branch `codex/compact-cuda-execution` is unrelated and protected.
 - KAIROS Slice 2 will use an isolated run-owned `codex/` branch and worktree from the pinned KAIROS baseline. A distinct reviewer must return zero Standards and zero Spec findings before integration.
 - Deployment preflight found `REMOTE.toml` still names `/scratch.hpc/edoardo.galli3/deployments/kairos-cuda-f49db0b.sif`, while `codex/compact-cuda-execution` retains the accepted CUDA delta. The safe order is main loader integration, reviewed compact synchronization, exact-SHA image build and `apptainer test`, reviewed configuration cutover, then legacy-corpus deletion.
+- KAIROS Slice 2 execution issue: [#149](https://github.com/edoski/kairos/issues/149). Baseline `bfaf9f662b24e9680e60e090e110dac9da51525d`; implementer `/root/kairos_dataset_loader_impl`; worktree `/Users/edo/dev/python/kairos-blockweaver-alignment`; branch `codex/blockweaver-dataset-alignment`.
+- Initial implementation `26ab63e52649e29751e2949db87dcbc88dace8df` (`feature(dataset): consume Blockweaver artifacts`) added the pinned public Blockweaver dependency and direct dataset boundary, removed the legacy manifest/address/row-chain path, updated callers and documentation, and added ADR 0009. Reviewer `/root/kairos_dataset_loader_review` rejected four Standards and three Spec findings: duplicate format/schema prechecks, repeated strict opens, generalized fixture/test machinery, and an out-of-scope ADR 0008 edit.
+- Correction `6a8f22c2e518b4bc6885b5cc6e3d807333e3053b` (`fix(dataset): deepen consumer boundary`) trusts `open_dataset`, lets `read_parquet` and `BlockFrame` express KAIROS applicability, opens each distinct corpus once per command, removes the generalized rejection tests, simplifies the fixture, and restores ADR 0008 byte-for-byte. Re-review returned Standards 0 and Spec 0.
+- KAIROS `main` fast-forward integration passed 109 root tests, 9 mobile-export tests, Ruff lint/format, Pyright, Vulture, both lock checks, and diff check. All three real local datasets opened through KAIROS with exact chain/range/row counts and the ordered eight-column frame: Polygon 6,826,453 rows; Avalanche 15,796,681; Ethereum 1,654,536. No output was changed.
 
 Post-HPO continuation is active. The next work is the KAIROS clean-break loader slice, followed by its consumer inventory, exact legacy-corpus cleanup, immutable image build, `apptainer test`, and verified runner handoff. No campaign is created or launched here.
