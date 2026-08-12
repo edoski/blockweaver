@@ -2,11 +2,11 @@
 
 ## Run
 
-- Status: Blockweaver consolidation Slices 3A–3F are independently green and integrated. Release `v0.3.3` at `e69c02c2d72cc5250834233d3eee9a525e386eb0` is published on GitHub and PyPI. All three additive local/research datasets remain prepared and verified, and legacy HPO `dfd33e91-702e-46c5-8cb1-3c510af4c048` is closed at 216/216. K1 and deployment remain gated on the exact accepted Servatus 0.6.0 KAIROS handoff.
+- Status: Blockweaver consolidation Slices 3A–3F are independently green and integrated. Release `v0.3.3` at `e69c02c2d72cc5250834233d3eee9a525e386eb0` is published on GitHub and PyPI. All three additive local/research datasets remain prepared and verified, legacy HPO `dfd33e91-702e-46c5-8cb1-3c510af4c048` is closed at 216/216, and the accepted Servatus 0.6.0 KAIROS handoff is complete. K1 is unblocked; deployment follows its green integration.
 - Authoritative spec: this ledger plus the user-approved decisions below.
 - Blockweaver clean execution baseline before this authorization update: `39116c8e65090da6dc181ebbd17f69237167c842`, clean `main`, four plan commits ahead of `origin/main`.
 - KAIROS dataset-preparation pin: `bfaf9f662b24e9680e60e090e110dac9da51525d`, clean `main`, 17 user-owned commits ahead of `origin/main`; no KAIROS code commit was created by preparation.
-- Servatus state: `v0.5.0` is published from independently accepted head `79ee407c431d1f9c0510e9462d5136fa7b58319d`. Task `019fea73-abd5-7a51-9681-f0443f647884` is separately integrating it into the accepted Blockweaver-aligned KAIROS heads. Proposed KAIROS Slice K1 must repin after that task finishes; no image is built before the combined head exists.
+- Servatus state: `v0.6.0` is published from independently accepted head `281c381548489c1dcf7a6ca8d045908d0b50ba3f`. Task `019fea73-abd5-7a51-9681-f0443f647884` completed the reviewed KAIROS adoption and pushed exact accepted refs to both `origin` and `research`: `main` at `56eb5498031239e50a6fd4a5f634c2777257e609` and compact CUDA at `75a36cccc3b04eb9026e3481c2362c2cb6fb1846`.
 - KAIROS working tree is clean. The approved `fsevents` allowance is committed at `7cca6fcb`; coherent K-study/HPO figure work is committed at `c0021cb9`; the four discarded epigraph notes are absent.
 - Pre-run worktrees: one normal worktree per repository. Slice 1 used `/Users/edo/dev/python/blockweaver-dataset-contract` on `codex/dataset-contract-clean-break`; both the worktree and its integrated branch were removed after the execution record was committed.
 - Execution checkout policy: use isolated `codex/` branches and worktrees, one writer at a time. Integrate only after each repository slice is green. Never include protected dirt.
@@ -471,11 +471,11 @@ Blockweaver has four deep implementation modules rather than five modules with a
 
 ## Proposed Slice K1: remove duplicated corpus metadata and layered fixtures
 
-- Status: approved; blocked on the separate Servatus KAIROS task, green Slice 3F, and the published Blockweaver patch.
+- Status: approved and unblocked. Implementation baseline is the exact accepted KAIROS `main` handoff below.
 - Repository: KAIROS.
-- Planned baseline: repin accepted `main` and compact-CUDA only after task `019fea73-abd5-7a51-9681-f0443f647884` finishes its reviewed Servatus 0.6.0 adoption and pushes both refs.
+- Baselines: KAIROS `main` `56eb5498031239e50a6fd4a5f634c2777257e609`; protected compact-CUDA `75a36cccc3b04eb9026e3481c2362c2cb6fb1846`.
 - Dependencies: green Blockweaver Slice 3F, a reproducibly published compatible Blockweaver patch, and the separate Servatus KAIROS task. K1 updates the exact Blockweaver pin so the final image contains the accepted consolidation.
-- Coordination update: the separate task is now preparing approved Servatus S1/S2, a reviewed 0.6.0 candidate, its separately authorized release, and a KAIROS repin. K1, KAIROS refs, image, configuration, and corpus work remain paused until that task sends exact accepted `main` and compact-CUDA heads.
+- Coordination update: the separate task delivered published Servatus 0.6.0 and exact accepted KAIROS refs on 2026-08-12. K1 may proceed. Image, configuration, and corpus cleanup remain sequenced after green K1 integration and compact synchronization.
 
 ### Scope
 
