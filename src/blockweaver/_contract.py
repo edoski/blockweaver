@@ -115,10 +115,40 @@ FEATURE_BY_NAME = {feature.name: feature for feature in FEATURES}
 
 
 @dataclass(frozen=True, slots=True)
+class _BigQueryRequirements:
+    block_fields: tuple[tuple[str, str], ...]
+    transaction_fields: tuple[tuple[str, str], ...]
+    receipt_fields: tuple[tuple[str, str], ...]
+    percentiles: tuple[int, ...]
+
+    def document(self) -> dict[str, object]:
+        families: list[dict[str, object]] = [{"family": "blocks", "table": "blocks", "fields": [field for field, _dtype in self.block_fields]}]
+        if self.transaction_fields:
+            families.append(
+                {
+                    "family": "transactions",
+                    "table": "transactions",
+                    "fields": [field for field, _dtype in self.transaction_fields],
+                }
+            )
+        if self.receipt_fields:
+            families.append(
+                {
+                    "family": "receipts",
+                    "table": "receipts",
+                    "fields": [field for field, _dtype in self.receipt_fields],
+                    "reward_percentiles": list(self.percentiles),
+                }
+            )
+        return {"families": families}
+
+
+@dataclass(frozen=True, slots=True)
 class Plan:
     features: tuple[Feature, ...]
     header_fields: tuple[str, ...]
     percentiles: tuple[int, ...]
+    _bigquery_requirements: _BigQueryRequirements
 
     @property
     def columns(self) -> tuple[str, ...]:
@@ -135,7 +165,7 @@ class Plan:
         ]
 
     def document(self, source: Source = "rpc") -> dict[str, object]:
-        return _rpc_plan_document(self) if source == "rpc" else _bigquery_plan_document(self)
+        return _rpc_plan_document(self) if source == "rpc" else self._bigquery_requirements.document()
 
 
 def _rpc_plan_document(plan: Plan) -> dict[str, object]:
@@ -145,25 +175,30 @@ def _rpc_plan_document(plan: Plan) -> dict[str, object]:
     return {"families": families}
 
 
-def _bigquery_plan_document(plan: Plan) -> dict[str, object]:
-    fields = {"block_number", "block_timestamp", "block_hash", "parent_hash"}
-    fields.update(feature.bigquery_field for feature in plan.features if feature.bigquery_field is not None)
-    fields.update(dependency for feature in plan.features for dependency in feature.bigquery_dependencies)
-    if plan.percentiles:
-        fields.update({"base_fee_per_gas", "gas_used"})
-    families: list[dict[str, object]] = [{"family": "blocks", "table": "blocks", "fields": sorted(fields)}]
-    if any(feature.bigquery_family == "transactions" for feature in plan.features):
-        families.append({"family": "transactions", "table": "transactions", "fields": ["block_hash", "block_timestamp"]})
-    if any(feature.bigquery_family == "receipts" for feature in plan.features):
-        families.append(
-            {
-                "family": "receipts",
-                "table": "receipts",
-                "fields": ["block_hash", "block_timestamp", "effective_gas_price", "gas_used", "transaction_index"],
-                "reward_percentiles": list(plan.percentiles),
-            }
-        )
-    return {"families": families}
+def _bigquery_requirements(features: tuple[Feature, ...], percentiles: tuple[int, ...]) -> _BigQueryRequirements:
+    fields = {"block_number": "INTEGER", "block_timestamp": "TIMESTAMP", "block_hash": "STRING", "parent_hash": "STRING"}
+    for feature in features:
+        if feature.bigquery_field is not None:
+            fields[feature.bigquery_field] = "TIMESTAMP" if feature.bigquery_field == "block_timestamp" else "STRING" if feature.dtype == "UTF-8" else "INTEGER"
+        fields.update({dependency: "INTEGER" for dependency in feature.bigquery_dependencies})
+    if percentiles:
+        fields.update({"base_fee_per_gas": "INTEGER", "gas_used": "INTEGER"})
+    return _BigQueryRequirements(
+        tuple(sorted(fields.items())),
+        (("block_hash", "STRING"), ("block_timestamp", "TIMESTAMP")) if any(feature.bigquery_family == "transactions" for feature in features) else (),
+        (
+            (
+                ("block_hash", "STRING"),
+                ("block_timestamp", "TIMESTAMP"),
+                ("effective_gas_price", "INTEGER"),
+                ("gas_used", "INTEGER"),
+                ("transaction_index", "INTEGER"),
+            )
+            if percentiles
+            else ()
+        ),
+        percentiles,
+    )
 
 
 def parse_source(value: object) -> Source:
@@ -239,7 +274,7 @@ def plan_features(names: list[str] | tuple[str, ...]) -> Plan:
         if field in {"number", "hash", "parentHash", "timestamp"} or field in fields
     )
     percentiles = tuple(feature.percentile for feature in selected if feature.percentile is not None)
-    return Plan(selected, ordered_fields, percentiles)
+    return Plan(selected, ordered_fields, percentiles, _bigquery_requirements(selected, percentiles))
 
 
 @dataclass(frozen=True, slots=True)

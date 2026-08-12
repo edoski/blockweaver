@@ -20,7 +20,16 @@ from typer.testing import CliRunner
 
 from blockweaver import BlockweaverError, Dataset, _corpus, _sources, open_dataset
 from blockweaver import cli as cli_module
-from blockweaver._contract import Chain, Provider, RpcDownloadRequest, parse_time, plan_features, requested_range
+from blockweaver._contract import (
+    BigQueryDownloadRequest,
+    BigQuerySettings,
+    Chain,
+    Provider,
+    RpcDownloadRequest,
+    parse_time,
+    plan_features,
+    requested_range,
+)
 from blockweaver.cli import app
 
 DATASET_ID = "11111111-1111-4111-8111-111111111111"
@@ -584,6 +593,50 @@ def test_paired_provider_failure_cancels_and_awaits_sibling(
         return cancelled_before_cleanup, len(pending)
 
     assert asyncio.run(exercise()) == (True, 0)
+
+
+def test_range_resolution_reads_unique_boundaries_once(
+    tmp_path: Path,
+    chains: tuple[ChainServer, ChainServer],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    primary, verifier = chains
+    chain = Chain("test", 1, "finalized", None, None, BQ_DATASET)
+    rpc_request = RpcDownloadRequest(
+        dataset_id=UUID(DATASET_ID),
+        chain=chain,
+        requested_range=requested_range(10, 10, None, None),
+        plan=plan_features(["timestamp"]),
+        output_root=tmp_path,
+        output_format="parquet",
+        primary=Provider("primary", primary.url, 3, 2, 2),
+        verifier=Provider("verifier", verifier.url, 3, 2, 2),
+    )
+
+    async def stop_after_resolution(_source: _corpus.ArtifactSource) -> dict[str, object]:
+        return {}
+
+    asyncio.run(_sources.acquire(rpc_request, lambda _event: None, stop_after_resolution))
+    assert primary.request_counts[10] == 1
+
+    verifier.request_counts.clear()
+    verifier.requests.clear()
+    start = datetime.fromtimestamp(verifier.timestamp_base + 10, UTC).isoformat().replace("+00:00", "Z")
+    end = datetime.fromtimestamp(verifier.timestamp_base + 14, UTC).isoformat().replace("+00:00", "Z")
+    bigquery_request = BigQueryDownloadRequest(
+        dataset_id=UUID(DATASET_ID),
+        chain=chain,
+        requested_range=requested_range(None, None, start, end),
+        plan=plan_features(["timestamp"]),
+        output_root=tmp_path,
+        output_format="parquet",
+        dataset=BQ_DATASET,
+        bigquery=BigQuerySettings("billing-project", 1000),
+        verifier=Provider("verifier", verifier.url, 3, 2, 2),
+    )
+    monkeypatch.setattr(_sources, "open_bigquery", lambda _project: FakeBigQuery(verifier))
+    asyncio.run(_sources.acquire(bigquery_request, lambda _event: None, stop_after_resolution))
+    assert {number: verifier.request_counts[number] for number in (10, 14)} == {10: 1, 14: 1}
 
 
 def test_time_range_csv_and_reduced_precision(tmp_path: Path, chains: tuple[ChainServer, ChainServer], make_config: Any) -> None:
