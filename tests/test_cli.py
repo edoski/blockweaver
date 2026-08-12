@@ -94,7 +94,7 @@ def test_cli_commands_and_machine_usage_errors() -> None:
 
 def test_machine_usage_boundary_propagates_unrelated_lookalike() -> None:
     class LookalikeError(RuntimeError):
-        exit_code = 1
+        exit_code = 2
 
         def format_message(self) -> str:
             return "not a usage error"
