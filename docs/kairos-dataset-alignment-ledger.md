@@ -432,7 +432,7 @@ Fresh trusted data is not treated as recovered untrusted bytes immediately after
 
 ## Proposed Slice 3F: remove shallow build orchestration
 
-- Status: approved; ready after green Slice 3E.
+- Status: green and integrated on `main` at `95fd7e122c01fc608d0e02d1431a47c620a27a4d`; Standards 0 and Spec 0.
 - Repository: Blockweaver.
 - Dependencies: green Slice 3E.
 
@@ -464,7 +464,7 @@ Blockweaver has four deep implementation modules rather than five modules with a
 
 ## Proposed Blockweaver release gate
 
-- Status: approved; blocked on green Slices 3A–3F.
+- Status: approved; ready after green Slices 3A–3F.
 - Independently verify the integrated Blockweaver head, choose the next compatible patch release, update package metadata/changelog only as required, push/tag/release through trusted publishing, verify GitHub/PyPI artifacts and hashes, and install from the public index in an isolated environment.
 - The release must retain the same public Python and five-command interface. Private hidden-work compatibility is not added; the fresh pre-3C inventory must prove no active work was abandoned.
 - KAIROS K1 and the final image must pin the new published patch if the Blockweaver consolidation is intended to ship. Do not build an image that still installs `blockweaver==0.3.2` after Slices 3A–3F are accepted.
@@ -573,6 +573,9 @@ GitHub issue [#4](https://github.com/edoski/blockweaver/issues/4) records approv
 - Slice 3E implementation: `2afd178a5619179ebac2c1d6fca1ac8926f7f49d` (`refactor(artifact): consolidate checkpoint validation passes`). Fresh checkpoints retain trusted metadata after durable write and digest instead of immediately entering recovered-byte admission; recovered checkpoints remain strict and every checkpoint keeps preassembly resealing. Reviewer `/root/consolidation_3e_review` returned Standards 0 and Spec 0.
 - Slice 3E measurement: five blocks across three checkpoints. Baseline fresh/resume semantic checkpoint reads were `3/3`; head fresh/resume reads are `0/1`. Baseline and head both perform six digest passes: three durable-write hashes and three preassembly reseals. All temporary instrumentation and detached worktrees were removed.
 - Slice 3E integration: merge `776f20226751b71720134aa33b69bfecd8a0fbee` (`merge(artifact): integrate consolidation slice 3e`). Main passed all 96 tests, Ruff lint/format, Pyright, Vulture, lock and diff checks, CLI/import smokes, and instrumentation-residue checks. No live provider, output, KAIROS, image, campaign, release, or publication occurred.
+- Slice 3F baseline: clean pushed `main` at `9a8ad767acb12b878ce22c72eb3f24c2441d1f93`. Implementer: `/root/consolidation_3f_impl`; worktree `/Users/edo/dev/python/blockweaver-slice-3f`; branch `codex/consolidation-slice-3f`.
+- Slice 3F implementation: `85ffd3adee6f0ba16bb7b3654c7e716bba66cbf8` (`refactor(sources): remove shallow build module`). `_build.py` is deleted; source acquisition/materialization and local plus optional-RPC verification compose in `_sources`, while CLI remains translation-only. Reviewer `/root/consolidation_3f_review` returned Standards 0 and Spec 0. Production drops 14 lines and implementation modules drop from five to four; tests and public interfaces are unchanged.
+- Slice 3F integration: merge `95fd7e122c01fc608d0e02d1431a47c620a27a4d` (`merge(sources): integrate consolidation slice 3f`). Main passed all 97 tests, Ruff lint/format, Pyright, Vulture, lock and diff checks, exact public/CLI inventory, optional-import, deleted-module, and adapter-presence checks. No live provider, output, KAIROS, image, campaign, release, or publication occurred.
 
 GitHub issue [#2](https://github.com/edoski/blockweaver/issues/2) records the authorized Blockweaver contract change.
 
