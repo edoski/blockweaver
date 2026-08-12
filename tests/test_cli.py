@@ -363,6 +363,8 @@ def test_parquet_download_selects_and_coalesces_features(tmp_path: Path, chains:
     assert frame["effective_priority_fee_per_gas_p50"].to_list() == [500, 550, 600, 650, 700]
     fee_calls = [call for batch in primary.requests for call in batch if call["method"] == "eth_feeHistory"]
     assert [call["params"] for call in fee_calls] == [["0x5", "0xe", [50]]]
+    verifier_fee_calls = [call for batch in verifier.requests for call in batch if call["method"] == "eth_feeHistory"]
+    assert [call["params"] for call in verifier_fee_calls] == [["0x5", "0xe", [50]]]
     block_calls = [call for batch in primary.requests for call in batch if call["method"] == "eth_getBlockByNumber"]
     acquired = [call for call in block_calls if call["params"][0] in {hex(number) for number in range(10, 15)}]
     assert all(call["params"][1] is False for call in acquired)
@@ -994,7 +996,7 @@ def test_committed_recovery_survives_partial_hidden_cleanup(
     assert not hidden.exists()
 
 
-def test_candidate_samples_must_equal_retained_provider_verified_facts(
+def test_final_candidate_samples_must_match_verifier(
     tmp_path: Path,
     chains: tuple[ChainServer, ChainServer],
     make_config: Any,

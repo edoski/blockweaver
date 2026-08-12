@@ -61,16 +61,14 @@ _MANIFEST_KEYS = {
 }
 Progress = Callable[[dict[str, object]], None]
 Publication = Callable[[Literal["publishing", "committed"]], None]
-FactReader = Callable[[list[int]], dict[int, dict[str, Value]]]
 
 
 @dataclass(frozen=True, slots=True)
 class VerifiedProof:
-    """Provider facts retained across candidate assembly."""
+    """Provider proof for canonical manifest construction."""
 
     anchor: Anchor
     verification: dict[str, object]
-    samples: dict[int, dict[str, Value]]
 
 
 class ArtifactSource(Protocol):
@@ -81,7 +79,7 @@ class ArtifactSource(Protocol):
 
     def chunks(self, first: int, last: int) -> AsyncIterator[tuple[list[Header], list[dict[str, Value]]]]: ...
 
-    async def prove(self, target: Header, read_facts: FactReader) -> VerifiedProof: ...
+    async def prove(self, target: Header) -> VerifiedProof: ...
 
     async def revalidate(self, dataset: Dataset) -> None: ...
 
@@ -311,13 +309,6 @@ class CheckpointSet:
         self.items.append(checkpoint)
         self.previous = checkpoint.last_header
         self.next_block = last + 1
-
-    def facts(self, numbers: list[int]) -> dict[int, dict[str, Value]]:
-        scans = [pl.scan_parquet(item.path).select(self.identity.plan.columns) for item in self.items]
-        selected = pl.concat(scans, how="vertical").filter(pl.col("block_number").is_in(numbers)).collect(engine="streaming")
-        if selected["block_number"].to_list() != numbers:
-            raise BlockweaverError("RESUME_INVALID", "Requested checkpoint rows are missing")
-        return {int(row["block_number"]): {name: value for name, value in row.items()} for row in selected.iter_rows(named=True)}
 
     def reseal(self) -> None:
         for checkpoint in self.items:
@@ -555,7 +546,7 @@ async def materialize_artifact(
                     or target.timestamp != identity.resolved_range["to_timestamp"]
                 ):
                     raise ValueError("Source did not return the exact resolved range")
-                proof = await source.prove(target, checkpoints.facts)
+                proof = await source.prove(target)
                 checkpoints.reseal()
                 candidate = _write_candidate(
                     hidden / "ready.tmp",
@@ -564,7 +555,6 @@ async def materialize_artifact(
                     sources=checkpoints.paths,
                     manifest=identity.manifest(tool_version, target.block_hash, proof),
                 )
-                _validate_verified_samples(candidate, proof)
                 acquired = candidate.row_count - reused
             else:
                 assert candidate is not None
@@ -587,12 +577,6 @@ async def materialize_artifact(
             }
         )
         return receipt
-
-
-def _validate_verified_samples(candidate: Dataset, proof: VerifiedProof) -> None:
-    numbers = list(proof.samples)
-    if proof.verification.get("sampled_blocks") != numbers or candidate._facts(numbers) != proof.samples:
-        raise BlockweaverError("RPC_MISMATCH", "Published candidate does not match the externally verified sample facts")
 
 
 def _download_receipt(dataset: Dataset, destination: Path, reused: int, acquired: int) -> dict[str, object]:
