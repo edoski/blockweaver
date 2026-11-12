@@ -68,6 +68,35 @@ def test_open_dataset_rejects_corrupt_artifact_boundaries(
     assert failure.value.code == "ARTIFACT_INVALID"
 
 
+RELEASED = Path(__file__).parent / "fixtures" / "released-0.3.4"
+
+
+@pytest.mark.parametrize(("dataset_id", "source"), [("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", "rpc"), ("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", "bigquery")])
+def test_datasets_written_by_release_0_3_4_open_verify_and_read_back_the_same_rows(dataset_id: str, source: str) -> None:
+    path = RELEASED / dataset_id
+    manifest = json.loads((path / "manifest.json").read_text())
+    assert (manifest["tool_version"], manifest["source"]["type"]) == ("0.3.4", source)
+
+    dataset = open_dataset(path)
+
+    assert (dataset.chain_id, dataset.first_block, dataset.last_block, dataset.row_count) == (1, 10, 14, 5)
+    assert dataset.schema == (
+        "block_number",
+        "timestamp",
+        "block_hash",
+        "parent_hash",
+        "base_fee_per_gas",
+        "gas_used",
+        "gas_limit",
+        "tx_count",
+        "effective_priority_fee_per_gas_p50",
+        "effective_priority_fee_per_gas_p90",
+    )
+    expected = json.loads((RELEASED / "rows.json").read_text())[dataset_id]
+    assert [list(row) for row in pl.read_parquet(dataset.data_path).rows()] == expected
+    assert invoke(["verify", str(path)]).exit_code == 0
+
+
 def test_open_dataset_reads_a_manifest_written_by_another_planner(tmp_path: Path, chains: tuple[ChainServer, ChainServer], make_config: Any) -> None:
     primary, verifier = chains
     config = make_config(tmp_path / "config.toml", primary, verifier, output_root=tmp_path / "out", features=("timestamp", "tx_count"))
