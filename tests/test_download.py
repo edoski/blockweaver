@@ -121,7 +121,7 @@ def test_download_reads_each_range_boundary_a_fixed_number_of_times(
     primary, verifier = chains
     config = make_config(tmp_path / "rpc.toml", primary, verifier, output_root=tmp_path / "rpc", features=("timestamp",))
     artifact_from(invoke(download_args(config, first=10, last=10)))
-    assert primary.request_counts[10] == 3, "one read each for resolution, acquisition and the candidate target"
+    assert primary.request_counts[10] == 2, "one read for resolution and one for acquisition"
 
     verifier.request_counts.clear()
     warehouse = bigquery_config(make_config, tmp_path / "bigquery.toml", primary, verifier, tmp_path / "bigquery", features=("timestamp",))
@@ -339,6 +339,15 @@ def test_verifier_disagreement_and_secret_redaction(tmp_path: Path, chains: tupl
     assert message["code"] == "RPC_MISMATCH"
     assert primary.url not in failure.output and verifier.url not in failure.output
     assert not any(path.name.endswith(DATASET_ID) and not path.name.startswith(".") for path in (tmp_path / "out").glob("*"))
+
+
+def test_verifier_finality_must_still_cover_the_target_at_proof_time(tmp_path: Path, chains: tuple[ChainServer, ChainServer], make_config: Any) -> None:
+    primary, verifier = chains
+    config = make_config(tmp_path / "config.toml", primary, verifier, output_root=tmp_path / "out")
+    primary.when_block_requested[13] = lambda: setattr(verifier, "finalized", 12)
+
+    assert error(invoke(download_args(config)))["code"] == "RANGE_UNFINALIZED"
+    assert not (tmp_path / "out" / DATASET_ID).exists()
 
 
 def test_publication_failure_recovers_ready_candidate(

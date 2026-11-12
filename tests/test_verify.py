@@ -11,6 +11,26 @@ from support import ChainServer, artifact_from, block_hash, download_args, error
 from blockweaver import BlockweaverError, _proof, open_dataset
 
 
+def header_reads(server: ChainServer) -> int:
+    return sum(1 for batch in server.requests for call in batch if call["method"] == "eth_getBlockByNumber")
+
+
+def test_proof_cost_does_not_grow_with_the_distance_to_the_head(tmp_path: Path, make_config: Any) -> None:
+    download_reads, verify_reads = [], []
+    for head in (30, 16_030):
+        with ChainServer(finalized=head) as primary, ChainServer(finalized=head) as verifier:
+            config = make_config(tmp_path / f"{head}.toml", primary, verifier, output_root=tmp_path / str(head))
+            artifact = artifact_from(invoke(download_args(config)))
+            download_reads.append(header_reads(verifier))
+            verifier.requests.clear()
+            verifier.finalized = head * 2
+            assert invoke(["verify", str(artifact), "--rpc-url", verifier.url]).exit_code == 0
+            verify_reads.append(header_reads(verifier))
+
+    assert download_reads[0] == download_reads[1] <= 12
+    assert verify_reads[0] == verify_reads[1] <= 10
+
+
 def test_verify_is_strict_locally_and_against_rpc(tmp_path: Path, chains: tuple[ChainServer, ChainServer], make_config: Any) -> None:
     primary, verifier = chains
     config = make_config(tmp_path / "config.toml", primary, verifier, output_root=tmp_path / "out")

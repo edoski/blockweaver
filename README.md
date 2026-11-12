@@ -81,7 +81,7 @@ Local verification is strict and needs no provider:
 blockweaver verify ./downloads/11111111-1111-4111-8111-111111111111
 ```
 
-RPC verification uses a configured profile or a direct URL. It checks deterministic samples and refreshes the stored finality proof. `--full-rpc` checks every row in bounded chunks, including ancestry across chunk boundaries.
+RPC verification uses a configured profile or a direct URL. It checks that the provider holds the dataset's last block hash, has finalized at or past the stored anchor, still holds the anchor block, and returns the same rows for five deterministic samples. The cost is a fixed handful of requests, however far the chain has moved since publication. `--full-rpc` checks every row in bounded chunks, including parent links across chunk boundaries.
 
 ```console
 blockweaver verify DATASET --provider verifier
@@ -92,7 +92,7 @@ RPC-only tuning requires `--provider` or `--rpc-url`. An explicit `--config` req
 
 Progress and errors are JSON Lines on stderr. Errors include stable `code` and `message` fields. Success is one JSON receipt on stdout. URLs and environment values are excluded from manifests, receipts, and intentional logs.
 
-Providers must implement EVM JSON-RPC batch requests, historical `eth_getBlockByNumber`, the configured `finalized` or `safe` tag, and `eth_feeHistory` when priority-fee features are selected. Independent verification consumes quota. Blockweaver checks provider agreement, numbered ancestry to the tagged anchor, a numbered anchor reread, and deterministic row samples; this is strong operational verification, not a trustless consensus client.
+Providers must implement EVM JSON-RPC batch requests, historical `eth_getBlockByNumber`, the configured `finalized` or `safe` tag, and `eth_feeHistory` when priority-fee features are selected. Independent verification consumes quota. Blockweaver checks that both providers agree on the last block's hash, that the verifier has finalized it, and that five deterministic rows match the verifier. Rows inside a download are hash-linked to each other. Blockweaver does not recompute block hashes and does not read the headers between the range and the finalized head, so this is operational verification by two independent providers, not a trustless consensus client.
 
 ## BigQuery source
 
@@ -114,7 +114,7 @@ blockweaver download --source bigquery --from-block 1000000 --to-block 1000999
 
 The same ranges, features, formats, resume state, receipts, and two-file artifacts apply to both sources. Time ranges are resolved against the configured verifier RPC before BigQuery planning. Blockweaver reads the required `blocks`, `transactions`, and `receipts` schemas, rejects unavailable selected features, then performs a dry run and checks its result schema and estimated bytes. Only then does it execute the fixed whitelisted query with `maximum_bytes_billed` enforced again by BigQuery. Results stream through bounded pages into the normal checkpoints.
 
-BigQuery rows are not trusted as chain truth. The verifier RPC checks chain ID, resolved edges, target hash, deterministic row samples, numbered ancestry, and a reread finalized or safe anchor before publication. The manifest records the dataset identifier and verifier profile, never the billing project, environment value, credentials, or SQL text. The configured dataset must expose the recognized common Google Blockchain Analytics schema; arbitrary SQL and field mappings are not supported.
+BigQuery rows are not trusted as chain truth. The verifier RPC checks chain ID, resolved edges, target hash, finality at or past the target, the recorded anchor, and deterministic row samples before publication. The manifest records the dataset identifier and verifier profile, never the billing project, environment value, credentials, or SQL text. The configured dataset must expose the recognized common Google Blockchain Analytics schema; arbitrary SQL and field mappings are not supported.
 
 For development:
 

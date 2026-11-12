@@ -9,7 +9,6 @@ from pathlib import Path
 from uuid import UUID
 
 from ._config import (
-    DownloadRequest,
     Provider,
 )
 from ._contract import (
@@ -115,43 +114,34 @@ async def verify_time_boundaries(
         raise BlockweaverError("RPC_MISMATCH", "Verifier RPC does not prove the resolved time-range edges")
 
 
-async def prove_finality(target: Header, verifier: Rpc, request: DownloadRequest) -> Anchor:
-    verifier_target = await verifier.header(target.block_number)
-    if target != verifier_target:
-        raise BlockweaverError("RPC_MISMATCH", "RPC endpoints disagree on the target block")
-    tagged = await verifier.tagged_header(request.chain.finality_tag)
-    if tagged.block_number < target.block_number:
+async def prove_target(number: int, block_hash: str, verifier: Rpc, tag: str) -> Anchor:
+    """The verifier holds the same target block and has finalized at or past it. Returns its finality head."""
+    if (await verifier.header(number)).block_hash != block_hash:
+        raise BlockweaverError("RPC_MISMATCH", "Verifier RPC disagrees on the target block hash")
+    head = await verifier.tagged_header(tag)
+    if head.block_number < number:
         raise BlockweaverError("RANGE_UNFINALIZED", "Verifier finality head does not cover the target")
-    await _connect_ancestry(verifier_target, tagged, verifier)
-    return Anchor(tagged.block_number, tagged.block_hash, request.chain.finality_tag)
+    return Anchor(head.block_number, head.block_hash, tag)
 
 
-async def _refresh_finality(target: Header, anchor: Anchor, rpc: Rpc) -> Anchor:
-    stored = await rpc.header(anchor.block_number)
-    if stored.block_hash != anchor.block_hash:
+async def check_artifact(artifact: Artifact, rpc: Rpc, *, full: bool = False) -> tuple[Anchor, list[int]]:
+    """Check a validated artifact against one provider at a cost that does not depend on the chain head.
+
+    The provider must hold the target hash, have finalized at or past the stored anchor, still hold the anchor block
+    under its number, and return the same rows: the deterministic samples, or every row when `full` is set.
+    """
+    dataset, anchor = artifact.dataset, artifact.anchor
+    fresh = await prove_target(dataset.last_block, artifact.target_hash, rpc, anchor.tag)
+    if fresh.block_number < anchor.block_number:
+        raise BlockweaverError("RPC_MISMATCH", "RPC finality head is behind the stored anchor")
+    if (await rpc.header(anchor.block_number)).block_hash != anchor.block_hash:
         raise BlockweaverError("RPC_MISMATCH", "Stored finalized anchor no longer matches RPC")
-    await _connect_ancestry(target, stored, rpc)
-    fresh = await rpc.tagged_header(anchor.tag)
-    if fresh.block_number < stored.block_number:
-        raise BlockweaverError("RPC_MISMATCH", "RPC finality head regressed behind the stored anchor")
-    await _connect_ancestry(stored, fresh, rpc)
-    return Anchor(fresh.block_number, fresh.block_hash, anchor.tag)
-
-
-async def _connect_ancestry(previous: Header, tagged: Header, rpc: Rpc) -> None:
-    cursor = previous.block_number + 1
-    while cursor <= tagged.block_number:
-        last = min(cursor + CHUNK_SIZE - 1, tagged.block_number)
-        segment = await rpc.headers(range(cursor, last + 1))
-        try:
-            validate_links(segment, previous)
-        except ValueError as error:
-            raise BlockweaverError("RPC_MISMATCH", str(error)) from None
-        previous = segment[-1]
-        cursor = last + 1
-    reread = await rpc.header(tagged.block_number)
-    if tagged != reread or previous != tagged:
-        raise BlockweaverError("RPC_MISMATCH", "Finality tag did not survive numbered reread")
+    samples = sample_numbers(dataset.dataset_id, dataset.first_block, dataset.last_block)
+    if full:
+        await _check_full_dataset(artifact, rpc)
+    else:
+        await _check_rows(artifact.rows(samples), samples, artifact.plan, rpc)
+    return fresh, samples
 
 
 async def _check_rows(
@@ -188,20 +178,6 @@ async def _check_full_dataset(artifact: Artifact, rpc: Rpc) -> None:
         raise BlockweaverError("ARTIFACT_INVALID", "Dataset streaming coverage changed during verification")
 
 
-async def candidate_target(artifact: Artifact, verifier: Rpc) -> Header:
-    target = await verifier.header(artifact.dataset.last_block)
-    if target.block_hash != artifact.target_hash:
-        raise BlockweaverError("RPC_MISMATCH", "Ready candidate target hash does not match verifier RPC")
-    return target
-
-
-async def finish_candidate_validation(artifact: Artifact, target: Header, verifier: Rpc) -> None:
-    await _refresh_finality(target, artifact.anchor, verifier)
-    dataset = artifact.dataset
-    samples = sample_numbers(dataset.dataset_id, dataset.first_block, dataset.last_block)
-    await _check_rows(artifact.rows(samples), samples, artifact.plan, verifier)
-
-
 def sample_numbers(dataset_id: UUID, first_block: int, last_block: int) -> list[int]:
     selected = {first_block, last_block}
     available = last_block - first_block - 1
@@ -219,15 +195,7 @@ async def verify_rpc(artifact: Artifact, provider: Provider, full: bool) -> dict
             chain_id = await rpc.chain_id()
             if chain_id != dataset.chain_id:
                 raise BlockweaverError("RPC_CHAIN_MISMATCH", "RPC chain ID does not match the dataset")
-            target = await rpc.header(dataset.last_block)
-            if target.block_hash != artifact.target_hash:
-                raise BlockweaverError("RPC_MISMATCH", "Dataset target hash does not match RPC")
-            fresh = await _refresh_finality(target, artifact.anchor, rpc)
-            samples = sample_numbers(dataset.dataset_id, dataset.first_block, dataset.last_block)
-            if full:
-                await _check_full_dataset(artifact, rpc)
-            else:
-                await _check_rows(artifact.rows(samples), samples, artifact.plan, rpc)
+            fresh, samples = await check_artifact(artifact, rpc, full=full)
             return {
                 "mode": "full_rpc" if full else "sample_rpc",
                 "provider": provider.name,

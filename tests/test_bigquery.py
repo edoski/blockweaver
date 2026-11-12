@@ -222,13 +222,13 @@ def test_bigquery_recovery_requires_exact_binding(
     assert json.loads(resumed.stderr.splitlines()[-1])["recovered"] is True
 
 
-@pytest.mark.parametrize("disagreement", ["target", "sample", "ancestry", "finality"])
+@pytest.mark.parametrize("disagreement", ["target", "sample", "finality"])
 def test_bigquery_rpc_disagreement_prevents_publication(
     tmp_path: Path, chains: tuple[ChainServer, ChainServer], make_config: Any, monkeypatch: pytest.MonkeyPatch, disagreement: str
 ) -> None:
     primary, verifier = chains
     config = bigquery_config(make_config, tmp_path / "config.toml", primary, verifier, tmp_path / "out", features=("base_fee_per_gas",))
-    changes = {"target": (14, {"hash": block_hash(99)}), "sample": (12, {"baseFeePerGas": hex(99)}), "ancestry": (16, {"parentHash": block_hash(1)})}
+    changes = {"target": (14, {"hash": block_hash(99)}), "sample": (12, {"baseFeePerGas": hex(99)})}
     if disagreement == "finality":
         verifier.tag_changes["hash"] = block_hash(99)
     else:

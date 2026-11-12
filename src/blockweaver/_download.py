@@ -26,9 +26,8 @@ from ._contract import (
 )
 from ._dataset import Artifact
 from ._proof import (
-    candidate_target,
-    finish_candidate_validation,
-    prove_finality,
+    check_artifact,
+    prove_target,
     resolve_range,
     sample_numbers,
     verify_time_boundaries,
@@ -69,16 +68,12 @@ class RpcSource:
             first = end + 1
 
     async def prove(self, target: Header) -> VerifiedProof:
-        anchor = await prove_finality(target, self.verifier, self.request)
+        anchor = await prove_target(target.block_number, target.block_hash, self.verifier, self.request.chain.finality_tag)
         samples = sample_numbers(self.request.dataset_id, self.resolved.first_block, self.resolved.last_block)
         return VerifiedProof(anchor, {**self._verification, "target_agreement": True, "sampled_blocks": samples})
 
     async def revalidate(self, artifact: Artifact) -> None:
-        verifier_target = await candidate_target(artifact, self.verifier)
-        target = await self.primary.header(artifact.dataset.last_block)
-        if target != verifier_target:
-            raise BlockweaverError("RPC_MISMATCH", "RPC endpoints disagree on the ready candidate target")
-        await finish_candidate_validation(artifact, verifier_target, self.verifier)
+        await check_artifact(artifact, self.verifier)
 
 
 class BigQuerySource:
@@ -121,7 +116,7 @@ class BigQuerySource:
             yield chunk
 
     async def prove(self, target: Header) -> VerifiedProof:
-        anchor = await prove_finality(target, self.verifier, self.request)
+        anchor = await prove_target(target.block_number, target.block_hash, self.verifier, self.request.chain.finality_tag)
         samples = sample_numbers(self.request.dataset_id, self.resolved.first_block, self.resolved.last_block)
         return VerifiedProof(
             anchor,
@@ -134,8 +129,7 @@ class BigQuerySource:
         )
 
     async def revalidate(self, artifact: Artifact) -> None:
-        verifier_target = await candidate_target(artifact, self.verifier)
-        await finish_candidate_validation(artifact, verifier_target, self.verifier)
+        await check_artifact(artifact, self.verifier)
 
 
 async def download(request: DownloadRequest, *, progress: Progress, publication: Publication) -> dict[str, object]:
