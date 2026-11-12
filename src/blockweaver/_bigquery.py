@@ -7,15 +7,7 @@ from dataclasses import dataclass
 from importlib import import_module
 from typing import Any
 
-from ._contract import (
-    BlocksColumn,
-    BlockweaverError,
-    Plan,
-    ReceiptPercentile,
-    Row,
-    TransactionRows,
-    bigquery_tables,
-)
+from ._contract import BlocksColumn, BlockweaverError, Plan, ReceiptPercentile, Row, TransactionRows, bigquery_tables
 
 BigQuerySchema = dict[str, tuple[str, str]]
 

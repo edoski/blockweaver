@@ -8,25 +8,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from uuid import UUID
 
-from ._config import (
-    Provider,
-)
-from ._contract import (
-    Anchor,
-    BlockweaverError,
-    Header,
-    Plan,
-    Progress,
-    RequestedRange,
-    ResolvedRange,
-    Value,
-    validate_links,
-)
+from ._config import Provider
+from ._contract import Anchor, BlockweaverError, Header, Plan, Progress, RequestedRange, ResolvedRange, Value, validate_links
 from ._dataset import Artifact, read_artifact
-from ._rpc import (
-    CHUNK_SIZE,
-    Rpc,
-)
+from ._rpc import CHUNK_SIZE, Rpc
 
 
 @dataclass(frozen=True, slots=True)

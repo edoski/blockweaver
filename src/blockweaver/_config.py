@@ -15,36 +15,14 @@ from typing import Any, Literal
 from urllib.parse import urlsplit
 from uuid import UUID
 
-from ._contract import (
-    INT64_MAX,
-    NAME,
-    BlockweaverError,
-    OutputFormat,
-    Plan,
-    RequestedRange,
-    Source,
-    plan_features,
-    validate_dataset_identifier,
-)
+from ._contract import INT64_MAX, NAME, BlockweaverError, OutputFormat, Plan, RequestedRange, Source, plan_features, validate_dataset_identifier
 
 DEFAULT_BATCH_SIZE = 20
-
-
 DEFAULT_CONCURRENCY = 6
-
-
 DEFAULT_TIMEOUT = 30
-
-
 _ENV = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
-
-
 _DATE = re.compile(r"\d{4}-\d{2}-\d{2}\Z")
-
-
 _DATETIME = re.compile(r"(\d{4}-\d{2}-\d{2})T(\d{2})(?::(\d{2})(?::(\d{2}))?)?(Z|[+-]\d{2}:\d{2})\Z")
-
-
 _PROJECT = re.compile(r"[a-z][a-z0-9-]{4,61}[a-z0-9]\Z")
 
 

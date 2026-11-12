@@ -14,46 +14,20 @@ from typing import Any, TypeVar
 import aiohttp
 
 from ._config import Provider
-from ._contract import (
-    INT64_MAX,
-    BlockweaverError,
-    FeeHistory,
-    Header,
-    HeaderKey,
-    Plan,
-    Row,
-    Value,
-    plan_features,
-)
+from ._contract import INT64_MAX, BlockweaverError, FeeHistory, Header, HeaderKey, Plan, Row, Value, plan_features
 
 _QUANTITY = re.compile(r"0x(?:0|[1-9a-f][0-9a-f]*)\Z")
-
-
 _TRANSIENT_HTTP = {408, 425, 429, *range(500, 600)}
 _REFUSED_HTTP = {400, 413}
 _ATTEMPTS = 10
 _UNREACHABLE_ATTEMPTS = 3
 _BACKOFF_CAP = 30.0
-
-
 _FATAL_RPC = {-32700, -32600, -32601, -32602, -32000, -32001, -32003, -32004, -32006}
-
-
 _LIMIT_RPC = -32005
-
-
 CHUNK_SIZE = 1024
-
-
 Validator = Callable[[Any], Any]
-
-
 _Left = TypeVar("_Left")
-
-
 _Right = TypeVar("_Right")
-
-
 _INTEGRITY_PLAN = plan_features([])
 
 

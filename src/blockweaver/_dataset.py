@@ -35,11 +35,7 @@ from ._contract import (
 )
 
 _DECIMAL = re.compile(r"0|[1-9][0-9]*\Z")
-
-
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
-
-
 _MANIFEST_KEYS = {
     "tool_version",
     "dataset_id",

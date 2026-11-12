@@ -5,44 +5,13 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 
 from . import __version__
-from ._bigquery import (
-    BigQueryClient,
-    compile_bigquery,
-    open_bigquery,
-    prepare_query,
-    query_chunks,
-)
-from ._config import (
-    BigQueryDownloadRequest,
-    DownloadRequest,
-    RpcDownloadRequest,
-)
-from ._contract import (
-    BlockweaverError,
-    Header,
-    Progress,
-    ResolvedRange,
-    Row,
-)
+from ._bigquery import BigQueryClient, compile_bigquery, open_bigquery, prepare_query, query_chunks
+from ._config import BigQueryDownloadRequest, DownloadRequest, RpcDownloadRequest
+from ._contract import BlockweaverError, Header, Progress, ResolvedRange, Row
 from ._dataset import Artifact
-from ._proof import (
-    check_artifact,
-    prove_target,
-    resolve_range,
-    sample_numbers,
-    verify_time_boundaries,
-)
-from ._rpc import (
-    CHUNK_SIZE,
-    Rpc,
-    paired,
-)
-from ._work import (
-    ArtifactSource,
-    Publication,
-    VerifiedProof,
-    materialize_artifact,
-)
+from ._proof import check_artifact, prove_target, resolve_range, sample_numbers, verify_time_boundaries
+from ._rpc import CHUNK_SIZE, Rpc, paired
+from ._work import ArtifactSource, Publication, VerifiedProof, materialize_artifact
 
 
 class RpcSource:

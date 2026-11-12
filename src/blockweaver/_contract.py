@@ -10,33 +10,17 @@ from enum import Enum
 from typing import Any, ClassVar, Literal
 
 OutputFormat = Literal["parquet", "csv"]
-
-
 Source = Literal["rpc", "bigquery"]
-
-
 Value = int | str
-
-
 Row = dict[str, Value]
 Progress = Callable[[dict[str, object]], None]
-
-
 INT64_MAX = 2**63 - 1
-
-
 HASH_PATTERN = "0x[0-9a-f]{64}"
-
-
 HASH = re.compile(HASH_PATTERN + r"\Z")
 HEX_PATTERN = "0x[0-9a-f]*"
 _HEX = re.compile(HEX_PATTERN + r"\Z")
 _RAW_HEADER = re.compile(r"header\.([A-Za-z][A-Za-z0-9]{0,63})\Z")
-
-
 NAME = re.compile(r"[a-z0-9][a-z0-9_-]*\Z")
-
-
 _DATASET = re.compile(r"([a-z][a-z0-9-]{4,61}[a-z0-9])\.([A-Za-z_][A-Za-z0-9_]{0,1023})\Z")
 
 
@@ -145,14 +129,8 @@ TIMESTAMP = Feature(
 
 
 BLOCK_HASH = Feature("block_hash", "UTF-8", "hex", Domain.HASH, HeaderKey("hash", "text"), BlocksColumn("block_hash", "STRING"))
-
-
 PARENT_HASH = Feature("parent_hash", "UTF-8", "hex", Domain.HASH, HeaderKey("parentHash", "text"), BlocksColumn("parent_hash", "STRING"))
-
-
 CORE = (TIMESTAMP, BLOCK_HASH, PARENT_HASH)
-
-
 FEATURES = (
     *CORE,
     Feature("base_fee_per_gas", "Int64", "wei/gas", Domain.POSITIVE, HeaderKey("baseFeePerGas", "quantity"), BlocksColumn("base_fee_per_gas", "INTEGER")),
