@@ -82,7 +82,7 @@ From RPC this is one `eth_feeHistory` call per chunk of up to 1,024 blocks. From
 The BigQuery query is fixed. It reads `blocks`, and `transactions` and `receipts` when a selected column needs them. A block fails the download, instead of receiving a value, in these cases.
 
 - A percentile is selected and the gas of its receipts does not add up to the block's gas used.
-- `tx_count` is selected and the block's transaction rows and receipt rows differ in number.
+- `tx_count` is selected and the block's transaction rows and receipt rows differ in number, or the block reports gas used and has no transaction rows.
 - A percentile is selected and the block's base fee or one receipt's price is missing.
 - The result does not cover the resolved range exactly.
 
@@ -99,12 +99,12 @@ A download publishes only when all of these hold.
 3. Consecutive rows are hash-linked: each block's parent hash is the previous block's hash.
 4. The verifier holds the same hash for the last block as the source.
 5. The verifier's finality head is at or past the last block. That head becomes `finalized_anchor`.
-6. Five deterministic rows match the verifier on every column: the first, the last and three chosen from the dataset UUID.
+6. Up to five deterministic rows match the verifier on every column: the first, the last and three adjacent rows whose position is derived from the dataset UUID.
 7. The assembled pair passes the same reader that `open_dataset` uses.
 
-`verify PATH` repeats step 7 offline. `verify PATH --provider NAME` adds steps 1, 4 and 6 against that provider, and requires its finality head to be at or past the recorded anchor and the anchor block to keep its hash. `--full-rpc` compares every row instead of five.
+`verify PATH` repeats step 7 offline. `verify PATH --provider NAME` adds steps 1, 4 and 6 against that provider, and requires its finality head to be at or past the recorded anchor and the anchor block to keep its hash. `--full-rpc` compares every row instead of the samples.
 
-These checks cost a fixed number of requests, however far the chain head is from the range. They are operational checks by two independent providers. Blockweaver does not recompute block hashes and does not read the headers between the range and the finality head. Two providers that return the same wrong data are not detected. Rows other than the five samples rest on the source and on the hash links, unless `--full-rpc` is run.
+These checks cost a fixed number of requests, however far the chain head is from the range. They are operational checks by two independent providers. Blockweaver does not recompute block hashes and does not read the headers between the range and the finality head. Two providers that return the same wrong data are not detected. Rows other than the samples rest on the source and on the hash links, unless `--full-rpc` is run.
 
 ## Work directories are private and tied to one version
 
@@ -112,7 +112,7 @@ An interrupted download keeps checkpoints under `ROOT/.blockweaver-<uuid>/`. Rep
 
 ## Error codes are stable
 
-Errors are one JSON line on stderr with `code` and `message`. The message may change between versions. The code does not.
+Errors are one JSON line on stderr with `code` and `message`. The message may change between versions. The code does not. During a BigQuery download, a verifier answer outside the protocol or a column's domain is reported as `BIGQUERY_INVALID`, and an unexpected error as `BIGQUERY_FAILED`.
 
 | Code | Meaning |
 | --- | --- |
