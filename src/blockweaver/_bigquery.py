@@ -135,8 +135,10 @@ def compile_bigquery(dataset: str, plan: Plan) -> BigQueryPlan:
             expression = f"UNIX_SECONDS(b.{recipe.column})" if recipe.type == "TIMESTAMP" else f"b.{recipe.column}"
         elif isinstance(recipe, TransactionRows):
             expression = "COALESCE(t.tx_count, 0)"
-        else:
+        elif isinstance(recipe, ReceiptPercentile):
             expression = f"IF(r.block_number IS NULL, 0, r.{feature.name})"
+        else:
+            raise ValueError(f"Feature {feature.name} is not available from BigQuery")
         projections.append(f"{expression} AS {feature.name}")
     result_schema = {projection.rpartition(" AS ")[2]: "INTEGER" for projection in projections}
     result_schema.update({feature.name: "STRING" for feature in plan.acquired if feature.dtype == "UTF-8"})

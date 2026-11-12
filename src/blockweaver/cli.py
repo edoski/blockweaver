@@ -24,7 +24,7 @@ from ._config import (
     resolve_download_request,
     selected_config_path,
 )
-from ._contract import FEATURES, BlockweaverError
+from ._contract import FEATURES, BlockweaverError, raw_header_document
 from ._download import download as download_dataset
 from ._proof import verify_dataset
 from ._work import Publication, fsync_directory
@@ -153,6 +153,7 @@ def features(
                 "available_sources": list(sources),
                 "mandatory": {"name": "block_number", "type": "Int64", "unit": "block"},
                 "features": [feature.document() for feature in FEATURES],
+                "patterns": [raw_header_document()],
             }
         )
     except BlockweaverError as error:

@@ -453,6 +453,9 @@ def resolve_download_request(
             plan = plan_features(features)
         except ValueError as error:
             raise BlockweaverError("FEATURE_INVALID", str(error)) from None
+    unavailable = [feature.name for feature in plan.features if selected_source not in feature.sources]
+    if unavailable:
+        raise BlockweaverError("SOURCE_FEATURE_UNAVAILABLE", f"Feature {unavailable[0]} is not available from source={selected_source}")
     bounds = requested_range(from_block, to_block, from_time, to_time)
     root = (output_root if output_root is not None else config.defaults.output_root).expanduser()
     selected_format = output_format if output_format is not None else config.defaults.output_format

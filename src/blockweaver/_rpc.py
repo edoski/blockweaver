@@ -16,6 +16,7 @@ import aiohttp
 from ._config import Provider
 from ._contract import (
     INT64_MAX,
+    BlockweaverError,
     FeeHistory,
     Header,
     HeaderKey,
@@ -79,7 +80,7 @@ def quantity(value: Any, label: str) -> int:
 
 
 def parse_block(value: Any, *, expected: int | None, plan: Plan) -> dict[str, Value]:
-    """Decode the header keys a plan acquires from one eth_getBlockByNumber result."""
+    """Decode the header keys a plan acquires from one eth_getBlockByNumber result. A key the block lacks is left out."""
     if not isinstance(value, dict):
         raise ValueError("Invalid block response shape")
     number = quantity(value.get("number"), "block number")
@@ -91,7 +92,7 @@ def parse_block(value: Any, *, expected: int | None, plan: Plan) -> dict[str, Va
             continue
         key, kind = feature.rpc.key, feature.rpc.kind
         if key not in value:
-            raise ValueError(f"Block {number} response is missing {key}")
+            continue
         raw = value[key]
         if kind == "quantity":
             block[feature.name] = quantity(raw, f"block {number} {key}")
@@ -181,6 +182,10 @@ class Rpc:
         return [self._row(plan, {**block, **{name: fee[percentile] for name, percentile in rewards}}) for block, fee in zip(blocks, fees, strict=True)]
 
     def _row(self, plan: Plan, values: dict[str, Value]) -> Row:
+        name, number = self.provider.name, values["block_number"]
+        for feature in plan.acquired:
+            if feature.name not in values and isinstance(feature.rpc, HeaderKey):
+                raise BlockweaverError("SOURCE_FEATURE_UNAVAILABLE", f"RPC provider {name}: block {number} has no header key {feature.rpc.key}")
         try:
             return plan.row(values)
         except ValueError as error:

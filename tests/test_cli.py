@@ -88,7 +88,7 @@ def test_strict_config_discovery_has_no_secrets(tmp_path: Path, chains: tuple[Ch
         ]
     }
     catalog = json.loads(feature_result.stdout)
-    assert set(catalog) == {"chain", "available_sources", "mandatory", "features"}
+    assert set(catalog) == {"chain", "available_sources", "mandatory", "features", "patterns"}
     assert catalog["available_sources"] == ["rpc"]
     assert catalog["mandatory"]["name"] == "block_number"
     assert {item["name"] for item in catalog["features"]} >= {"timestamp", "block_hash", "effective_priority_fee_per_gas_p90"}

@@ -29,6 +29,9 @@ HASH_PATTERN = "0x[0-9a-f]{64}"
 
 
 HASH = re.compile(HASH_PATTERN + r"\Z")
+HEX_PATTERN = "0x[0-9a-f]*"
+_HEX = re.compile(HEX_PATTERN + r"\Z")
+_RAW_HEADER = re.compile(r"header\.([A-Za-z][A-Za-z0-9]{0,63})\Z")
 
 
 NAME = re.compile(r"[a-z0-9][a-z0-9_-]*\Z")
@@ -51,10 +54,11 @@ class Domain(Enum):
     NONNEGATIVE = "nonnegative"
     POSITIVE = "positive"
     HASH = "lowercase 0x-prefixed 32-byte hash"
+    HEX = "lowercase 0x-prefixed hex string"
 
     def admits(self, value: object) -> bool:
-        if self is Domain.HASH:
-            return isinstance(value, str) and HASH.fullmatch(value) is not None
+        if self in {Domain.HASH, Domain.HEX}:
+            return isinstance(value, str) and (HASH if self is Domain.HASH else _HEX).fullmatch(value) is not None
         return type(value) is int and (self is Domain.NONNEGATIVE or value > 0) and 0 <= value <= INT64_MAX
 
 
@@ -63,7 +67,7 @@ class HeaderKey:
     """An eth_getBlockByNumber key and how its value becomes a column value."""
 
     key: str
-    kind: Literal["quantity", "hash", "count"]
+    kind: Literal["quantity", "count", "text"]
     family: ClassVar[str] = "header"
 
 
@@ -100,7 +104,7 @@ class Feature:
     unit: str
     domain: Domain
     rpc: HeaderKey | FeeHistory
-    bigquery: BlocksColumn | TransactionRows | ReceiptPercentile
+    bigquery: BlocksColumn | TransactionRows | ReceiptPercentile | None
     at_most: str | None = None
     nondecreasing: bool = False
 
@@ -108,14 +112,19 @@ class Feature:
     def rule(self) -> str:
         return self.domain.value + (", nondecreasing" if self.nondecreasing else "") + (f" and at most {self.at_most}" if self.at_most else "")
 
+    @property
+    def sources(self) -> tuple[Source, ...]:
+        return ("rpc",) if self.bigquery is None else ("rpc", "bigquery")
+
     def document(self) -> dict[str, object]:
         partners = _bound_partners(self)
+        families = {"rpc": self.rpc.family} if self.bigquery is None else {"rpc": self.rpc.family, "bigquery": self.bigquery.family}
         return {
             "name": self.name,
             "type": self.dtype,
             "unit": self.unit,
-            "supported_sources": ["rpc", "bigquery"],
-            "acquisition_families": {"rpc": self.rpc.family, "bigquery": self.bigquery.family},
+            "supported_sources": list(self.sources),
+            "acquisition_families": families,
             "domain_rule": self.rule,
             "hidden_dependencies": {
                 "rpc": [partner.rpc.key for partner in partners if isinstance(partner.rpc, HeaderKey)],
@@ -135,10 +144,10 @@ TIMESTAMP = Feature(
 )
 
 
-BLOCK_HASH = Feature("block_hash", "UTF-8", "hex", Domain.HASH, HeaderKey("hash", "hash"), BlocksColumn("block_hash", "STRING"))
+BLOCK_HASH = Feature("block_hash", "UTF-8", "hex", Domain.HASH, HeaderKey("hash", "text"), BlocksColumn("block_hash", "STRING"))
 
 
-PARENT_HASH = Feature("parent_hash", "UTF-8", "hex", Domain.HASH, HeaderKey("parentHash", "hash"), BlocksColumn("parent_hash", "STRING"))
+PARENT_HASH = Feature("parent_hash", "UTF-8", "hex", Domain.HASH, HeaderKey("parentHash", "text"), BlocksColumn("parent_hash", "STRING"))
 
 
 CORE = (TIMESTAMP, BLOCK_HASH, PARENT_HASH)
@@ -158,6 +167,16 @@ FEATURES = (
 
 
 FEATURE_BY_NAME = {feature.name: feature for feature in FEATURES}
+
+
+def raw_header(key: str) -> Feature:
+    """Any header key as the node returns it. The value is a hex string, never decoded, and comes from RPC only."""
+    return Feature(f"header.{key}", "UTF-8", "hex", Domain.HEX, HeaderKey(key, "text"), None)
+
+
+def raw_header_document() -> dict[str, object]:
+    document = raw_header("<key>").document()
+    return {"pattern": document["name"], **{name: document[name] for name in ("type", "unit", "supported_sources", "acquisition_families", "domain_rule")}}
 
 
 def _bound_partners(feature: Feature) -> list[Feature]:
@@ -248,13 +267,16 @@ def plan_features(names: list[str] | tuple[str, ...]) -> Plan:
         raise ValueError("Features must not contain duplicates")
     if "block_number" in names:
         raise ValueError("block_number is always included and must not be selected")
-    unknown = sorted(set(names) - FEATURE_BY_NAME.keys())
+    raw = sorted(name for name in names if name not in FEATURE_BY_NAME)
+    unknown = [name for name in raw if _RAW_HEADER.fullmatch(name) is None]
     if unknown:
         raise ValueError(f"Unknown feature: {unknown[0]}")
+    passthrough = tuple(raw_header(name.partition(".")[2]) for name in raw)
     selected = tuple(feature for feature in FEATURES if feature.name in names)
     stored = tuple(feature for feature in FEATURES if feature in CORE or feature in selected)
     partners = [partner for feature in selected for partner in _bound_partners(feature)]
-    return Plan(selected, stored, tuple(feature for feature in FEATURES if feature in stored or feature in partners))
+    acquired = tuple(feature for feature in FEATURES if feature in stored or feature in partners)
+    return Plan((*selected, *passthrough), (*stored, *passthrough), (*acquired, *passthrough))
 
 
 def validate_dataset_identifier(value: str) -> str:

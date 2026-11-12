@@ -97,6 +97,7 @@ class ChainServer:
         self.item_errors: dict[int, list[int]] = {}
         self.limit_batches = False
         self.batch_refusal: tuple[int, int] | None = None
+        self.keys_from: dict[str, int] = {}
         self.when_block_requested: dict[int, Callable[[], None]] = {}
         state = self
 
@@ -189,6 +190,9 @@ class ChainServer:
             "gasUsed": hex(sum(item.gas_used for item in transactions)),
             "gasLimit": hex(GAS_LIMIT),
             "transactions": [block_hash(number * 10 + offset) for offset in range(len(transactions))],
+            "extraData": "0x" + (b"fake" * (number % 3)).hex(),
+            "mixHash": block_hash(number + 7),
+            **{key: hex(number * 2**70) for key, first in self.keys_from.items() if number >= first},
             **self.changes.get(number, {}),
         }
 

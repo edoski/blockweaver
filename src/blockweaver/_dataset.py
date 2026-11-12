@@ -19,6 +19,7 @@ from ._contract import (
     BLOCK_HASH,
     HASH,
     HASH_PATTERN,
+    HEX_PATTERN,
     NAME,
     TIMESTAMP,
     Anchor,
@@ -402,8 +403,8 @@ def _validate_rows(
 
 
 def _outside(domain: Domain, column: pl.Expr) -> pl.Expr:
-    if domain is Domain.HASH:
-        return ~column.str.contains(f"^{HASH_PATTERN}$")
+    if domain in {Domain.HASH, Domain.HEX}:
+        return ~column.str.contains(f"^{HASH_PATTERN if domain is Domain.HASH else HEX_PATTERN}$")
     return column <= 0 if domain is Domain.POSITIVE else column < 0
 
 
