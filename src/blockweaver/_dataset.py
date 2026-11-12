@@ -251,8 +251,9 @@ def _read_artifact(path: Path, *, work: bool) -> Artifact:
     if names[0] != "block_number":
         raise ValueError("block_number must be the first schema column")
     plan = plan_features(names[1:])
-    if schema != plan.schema_document() or manifest["acquisition_plan"] != plan.document(source):
-        raise ValueError("Schema or acquisition plan is not canonical")
+    if schema != plan.schema_document():
+        raise ValueError("Schema is not canonical")
+    _validate_acquisition_plan(manifest["acquisition_plan"])
     output = _exact_table(manifest["output"], {"filename", "format", "bytes", "sha256"}, "output")
     if output["format"] not in {"parquet", "csv"} or output["filename"] != f"blocks.{output['format']}":
         raise ValueError("Invalid output descriptor")
@@ -320,6 +321,20 @@ def _read_artifact(path: Path, *, work: bool) -> Artifact:
     for name, value in facts.items():
         object.__setattr__(dataset, name, value)
     return Artifact(dataset, manifest, plan, Anchor(anchor["block_number"], anchor["block_hash"], anchor["tag"]), fingerprint)
+
+
+def _validate_acquisition_plan(value: object) -> None:
+    """Accept any well-formed plan. It records how the rows were acquired, by whichever planner wrote the dataset."""
+    families = _exact_table(value, {"families"}, "acquisition plan")["families"]
+    if not isinstance(families, list) or not families:
+        raise ValueError("Invalid acquisition plan")
+    for family in families:
+        if not isinstance(family, dict) or not isinstance(family.get("family"), str) or not family["family"]:
+            raise ValueError("Invalid acquisition plan family")
+        for detail in family.values():
+            members = detail if isinstance(detail, list) else [detail]
+            if any(type(member) not in {str, int} for member in members):
+                raise ValueError("Invalid acquisition plan family")
 
 
 def _validate_data(path: Path, plan: Plan, output_format: str, resolved: dict[str, int], target_hash: str) -> int:

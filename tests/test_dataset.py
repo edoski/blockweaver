@@ -14,7 +14,7 @@ from blockweaver import BlockweaverError, _work, open_dataset
 
 @pytest.mark.parametrize(
     "corruption",
-    ["json", "uuid_path", "extra", "digest", "schema", "range", "domain", "target", "verification"],
+    ["json", "uuid_path", "extra", "digest", "schema", "range", "domain", "target", "verification", "plan"],
 )
 def test_open_dataset_rejects_corrupt_artifact_boundaries(
     tmp_path: Path,
@@ -57,6 +57,8 @@ def test_open_dataset_rejects_corrupt_artifact_boundaries(
             manifest["output"]["sha256"] = hashlib.sha256(data_path.read_bytes()).hexdigest()
         elif corruption == "target":
             manifest["target_hash"] = block_hash(999)
+        elif corruption == "plan":
+            manifest["acquisition_plan"]["families"][0]["family"] = 7
         else:
             manifest["verification"]["target_agreement"] = False
         manifest_path.write_text(json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n")
@@ -64,6 +66,31 @@ def test_open_dataset_rejects_corrupt_artifact_boundaries(
     with pytest.raises(BlockweaverError) as failure:
         open_dataset(artifact)
     assert failure.value.code == "ARTIFACT_INVALID"
+
+
+def test_open_dataset_reads_a_manifest_written_by_another_planner(tmp_path: Path, chains: tuple[ChainServer, ChainServer], make_config: Any) -> None:
+    primary, verifier = chains
+    config = make_config(tmp_path / "config.toml", primary, verifier, output_root=tmp_path / "out", features=("timestamp", "tx_count"))
+    artifact = artifact_from(invoke(download_args(config)))
+    manifest_path = artifact / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["source"] = {"type": "bigquery", "dataset": "bigquery-public-data.goog_blockchain_test_us", "verifier": "verifier"}
+    manifest["verification"] = {
+        "verifier_chain_id": 1,
+        "dry_run_bytes": 0,
+        "target_agreement": True,
+        "sampled_blocks": manifest["verification"]["sampled_blocks"],
+    }
+    manifest["acquisition_plan"] = {
+        "families": [
+            {"family": "blocks", "table": "blocks", "fields": ["block_hash", "block_number", "block_timestamp", "parent_hash"]},
+            {"family": "legacy_counts", "table": "token_transfers", "fields": ["block_hash"], "reward_percentiles": [50]},
+        ]
+    }
+    manifest_path.write_text(json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n")
+
+    assert open_dataset(artifact).schema == ("block_number", "timestamp", "tx_count")
+    assert invoke(["verify", str(artifact)]).exit_code == 0
 
 
 def test_open_dataset_binds_data_bytes_that_still_parse(tmp_path: Path, chains: tuple[ChainServer, ChainServer], make_config: Any) -> None:
