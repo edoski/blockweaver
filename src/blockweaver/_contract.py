@@ -230,6 +230,7 @@ def bigquery_tables(plan: Plan) -> dict[str, dict[str, str]]:
     tables = {"blocks": blocks}
     if any(isinstance(feature.bigquery, TransactionRows) for feature in plan.acquired):
         tables["transactions"] = {"block_hash": "STRING", "block_timestamp": "TIMESTAMP"}
+        tables["receipts"] = {"block_hash": "STRING", "block_timestamp": "TIMESTAMP"}
     if plan.percentiles:
         blocks.update({"base_fee_per_gas": "INTEGER", "gas_used": "INTEGER"})
         tables["receipts"] = {

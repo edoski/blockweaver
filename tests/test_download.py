@@ -96,7 +96,8 @@ def test_parquet_download_selects_and_coalesces_features(tmp_path: Path, chains:
     assert manifest["source"] == {"type": "rpc", "provider": "primary", "verifier": "verifier"}
     assert manifest["verification"]["target_agreement"] is True
     assert primary.url not in manifest_text and verifier.url not in manifest_text
-    assert all(json.loads(line)["event"] for line in result.stderr.splitlines())
+    events = [json.loads(line)["event"] for line in result.stderr.splitlines()]
+    assert events == ["request", "checkpoint", "published"], "a fresh download reports no resume"
 
 
 def test_header_only_tx_count_uses_only_block_cardinality(
@@ -238,6 +239,7 @@ def test_resume_reuses_only_complete_chunks_and_rejects_rebinding(
     receipt = json.loads(result.stdout)
     assert receipt["reused_rows"] == 2
     assert receipt["acquired_rows"] == 3
+    assert {"event": "resume", "reused_rows": 2} in [json.loads(line) for line in result.stderr.splitlines()]
     assert primary.request_counts[10] == 4
     assert primary.request_counts[11] == 1
 

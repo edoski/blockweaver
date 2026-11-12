@@ -14,6 +14,7 @@ from support import (
     ROUNDING_EDGE_BLOCK,
     ChainServer,
     FakeBigQuery,
+    Transaction,
     artifact_from,
     bigquery_config,
     block_hash,
@@ -147,14 +148,34 @@ def test_bigquery_and_rpc_agree_on_every_feature_and_block_shape(
     monkeypatch.setattr(_download, "open_bigquery", lambda _project: FakeBigQuery(verifier))
     warehouse = bigquery_config(make_config, tmp_path / "bigquery.toml", primary, verifier, tmp_path / "bigquery", features=features)
     rpc = make_config(tmp_path / "rpc.toml", primary, verifier, output_root=tmp_path / "rpc", features=features)
-    last = ROUNDING_EDGE_BLOCK - 1
-    from_warehouse = pl.read_parquet(artifact_from(invoke(download_args(warehouse, first=0, last=last))) / "blocks.parquet")
-    from_rpc = pl.read_parquet(artifact_from(invoke(download_args(rpc, first=0, last=last))) / "blocks.parquet")
+    from_warehouse = pl.read_parquet(artifact_from(invoke(download_args(warehouse, first=0, last=30))) / "blocks.parquet")
+    from_rpc = pl.read_parquet(artifact_from(invoke(download_args(rpc, first=0, last=30))) / "blocks.parquet")
     assert from_warehouse.equals(from_rpc)
-    assert from_warehouse["tx_count"].to_list() == [0, 1, 2, 3, 3] * 3 + [0, 1]
+    assert from_warehouse["tx_count"].to_list()[:10] == [0, 1, 2, 3, 3] * 2
 
 
-@pytest.mark.xfail(strict=True, reason="the query rounds the gas threshold up, the execution client rounds it down")
+def test_bigquery_matches_the_client_rule_on_edge_blocks(tmp_path: Path, make_config: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    edge_blocks = {
+        10: [Transaction(21_000, 7)],
+        11: [Transaction(21_000, 5), Transaction(21_000, 5), Transaction(21_000, 1)],
+        12: [Transaction(0, 0), Transaction(21_000, 3), Transaction(21_000, 9)],
+        13: [Transaction(0, 4)],
+        14: [],
+    }
+    features = ("gas_used", "tx_count", P50, P90)
+    with ChainServer(transactions=edge_blocks) as primary, ChainServer(transactions=edge_blocks) as verifier:
+        monkeypatch.setattr(_download, "open_bigquery", lambda _project: FakeBigQuery(verifier))
+        warehouse = bigquery_config(make_config, tmp_path / "bigquery.toml", primary, verifier, tmp_path / "bigquery", features=features)
+        rpc = make_config(tmp_path / "rpc.toml", primary, verifier, output_root=tmp_path / "rpc", features=features)
+        from_warehouse = pl.read_parquet(artifact_from(invoke(download_args(warehouse))) / "blocks.parquet")
+        from_rpc = pl.read_parquet(artifact_from(invoke(download_args(rpc))) / "blocks.parquet")
+
+    assert from_warehouse.equals(from_rpc)
+    assert from_warehouse["tx_count"].to_list() == [1, 3, 3, 1, 0]
+    assert from_warehouse[P50].to_list() == [7, 5, 3, 4, 0]
+    assert from_warehouse[P90].to_list() == [7, 5, 9, 4, 0]
+
+
 def test_bigquery_percentile_floors_the_gas_threshold(
     tmp_path: Path, chains: tuple[ChainServer, ChainServer], make_config: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -187,6 +208,53 @@ def test_bigquery_rejects_a_block_with_a_missing_receipt(
     monkeypatch.setattr(_download, "open_bigquery", lambda _project: warehouse)
     failure = error(invoke(download_args(config)))
     assert failure["code"] == "BIGQUERY_INVALID" and "block 13" in failure["message"]
+
+
+@pytest.mark.parametrize(
+    ("features", "damage", "message"),
+    [
+        (("tx_count",), "DELETE FROM {transactions} WHERE block_hash = '" + block_hash(13) + "'", "block 13"),
+        (("tx_count",), "DELETE FROM {receipts} WHERE block_hash = '" + block_hash(13) + "' AND transaction_index = 0", "block 13"),
+        ((P50,), "UPDATE {blocks} SET base_fee_per_gas = NULL WHERE block_number = 13", "Block 13"),
+        ((P50,), "UPDATE {receipts} SET effective_gas_price = NULL WHERE block_hash = '" + block_hash(13) + "' AND transaction_index = 1", "Block 13"),
+    ],
+)
+def test_bigquery_fails_instead_of_writing_a_value_the_warehouse_cannot_support(
+    tmp_path: Path,
+    chains: tuple[ChainServer, ChainServer],
+    make_config: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    features: tuple[str, ...],
+    damage: str,
+    message: str,
+) -> None:
+    primary, verifier = chains
+    config = bigquery_config(make_config, tmp_path / "config.toml", primary, verifier, tmp_path / "out", features=features)
+    warehouse = FakeBigQuery(verifier)
+    warehouse.execute(damage)
+    monkeypatch.setattr(_download, "open_bigquery", lambda _project: warehouse)
+    failure = error(invoke(download_args(config)))
+    assert failure["code"] == "BIGQUERY_INVALID" and message in failure["message"]
+    assert not (tmp_path / "out" / DATASET_ID).exists()
+
+
+def test_bigquery_resume_after_the_last_checkpoint_still_records_a_dry_run(
+    tmp_path: Path, chains: tuple[ChainServer, ChainServer], make_config: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    primary, verifier = chains
+    config = bigquery_config(make_config, tmp_path / "config.toml", primary, verifier, tmp_path / "out")
+    clients = [FakeBigQuery(verifier, bytes_processed=777), FakeBigQuery(verifier, bytes_processed=777)]
+    queued_clients = iter(clients)
+    monkeypatch.setattr(_download, "open_bigquery", lambda _project: next(queued_clients))
+    real_candidate = _work._write_candidate
+    monkeypatch.setattr(_work, "_write_candidate", Mock(side_effect=KeyboardInterrupt))
+    assert error(invoke(download_args(config)))["code"] == "INTERRUPTED"
+    monkeypatch.setattr(_work, "_write_candidate", real_candidate)
+
+    artifact = artifact_from(invoke(download_args(config)))
+
+    assert "execute" not in clients[1].calls and clients[1].calls[-1] == "dry_run"
+    assert json.loads((artifact / "manifest.json").read_text())["verification"]["dry_run_bytes"] == 777
 
 
 @pytest.mark.parametrize("missing", [12, 14])

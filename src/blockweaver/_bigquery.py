@@ -25,6 +25,7 @@ class BigQueryPlan:
     sql: str
     table_fields: dict[str, dict[str, str]]
     result_schema: dict[str, str]
+    checks: tuple[tuple[str, str, str], ...]
 
 
 class BigQueryClient:
@@ -81,59 +82,53 @@ def open_bigquery(project: str) -> BigQueryClient:
 
 
 def compile_bigquery(dataset: str, plan: Plan) -> BigQueryPlan:
+    """The one fixed query shape. Receipts are a second witness: their gas must add up to the block's, and their count must equal the transaction count."""
     tables = bigquery_tables(plan)
-    result_schema = {"block_number": "INTEGER"}
+    window = "block_timestamp BETWEEN TIMESTAMP_SECONDS(@from_timestamp) AND TIMESTAMP_SECONDS(@to_timestamp)"
+    percentiles = [(feature.name, feature.bigquery.percentile) for feature in plan.acquired if isinstance(feature.bigquery, ReceiptPercentile)]
+    counts = [feature for feature in plan.acquired if isinstance(feature.bigquery, TransactionRows)]
     ctes = [
         "requested_blocks AS (\n"
         f"  SELECT {', '.join(sorted(tables['blocks']))}\n"
         f"  FROM `{dataset}.blocks`\n"
-        "  WHERE block_number BETWEEN @first_block AND @last_block\n"
-        "    AND block_timestamp BETWEEN TIMESTAMP_SECONDS(@from_timestamp) AND TIMESTAMP_SECONDS(@to_timestamp)\n"
+        f"  WHERE block_number BETWEEN @first_block AND @last_block\n    AND {window}\n"
         ")"
     ]
     joins: list[str] = []
     projections = ["b.block_number AS block_number"]
-    if "transactions" in tables:
-        ctes.append(
-            "tx_counts AS (\n"
-            "  SELECT block_hash, COUNT(*) AS tx_count\n"
-            f"  FROM `{dataset}.transactions`\n"
-            "  WHERE block_timestamp BETWEEN TIMESTAMP_SECONDS(@from_timestamp) AND TIMESTAMP_SECONDS(@to_timestamp)\n"
-            "  GROUP BY block_hash\n"
-            ")"
-        )
+    checks: list[tuple[str, str, str]] = []
+    if counts:
+        ctes.append(f"tx_counts AS (\n  SELECT block_hash, COUNT(*) AS tx_count\n  FROM `{dataset}.transactions`\n  WHERE {window}\n  GROUP BY block_hash\n)")
         joins.append("LEFT JOIN tx_counts AS t USING (block_hash)")
+        projections.append("COALESCE(r.receipt_count, 0) AS _receipt_count")
+        checks.extend(("_receipt_count", feature.name, "transaction and receipt counts disagree") for feature in counts)
     if "receipts" in tables:
-        ctes.extend(
-            [
-                "requested_receipts AS (\n"
-                "  SELECT block_hash, transaction_index, gas_used, effective_gas_price\n"
-                f"  FROM `{dataset}.receipts`\n"
-                "  WHERE block_timestamp BETWEEN TIMESTAMP_SECONDS(@from_timestamp) AND TIMESTAMP_SECONDS(@to_timestamp)\n"
-                ")",
-                "weighted_receipts AS (\n"
-                "  SELECT b.block_number, r.transaction_index, r.gas_used, b.gas_used AS block_gas_used,\n"
+        weighted, statistics = "", ["COUNT(*) AS receipt_count"]
+        if percentiles:
+            weighted = (
+                ", r.gas_used, b.gas_used AS block_gas_used,\n"
                 "    r.effective_gas_price - b.base_fee_per_gas AS priority_fee,\n"
                 "    SUM(r.gas_used) OVER (PARTITION BY b.block_number "
                 "ORDER BY r.effective_gas_price - b.base_fee_per_gas, r.transaction_index "
-                "ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS cumulative_gas\n"
-                "  FROM requested_receipts AS r JOIN requested_blocks AS b\n"
-                "    ON r.block_hash = b.block_hash\n"
-                ")",
-                "receipt_stats AS (\n"
-                "  SELECT block_number, SUM(gas_used) AS receipt_gas_used,\n    "
-                + ",\n    ".join(
-                    f"MIN(IF(cumulative_gas >= CAST(CEIL(CAST(block_gas_used AS BIGNUMERIC) * {feature.bigquery.percentile} / 100) AS INT64), "
-                    f"priority_fee, NULL)) AS {feature.name}"
-                    for feature in plan.acquired
-                    if isinstance(feature.bigquery, ReceiptPercentile)
-                )
-                + "\n  FROM weighted_receipts GROUP BY block_number\n)",
+                "ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS cumulative_gas"
+            )
+            statistics.append("SUM(gas_used) AS receipt_gas_used")
+            statistics.extend(
+                f"IF(LOGICAL_OR(priority_fee IS NULL), NULL, MIN(IF(cumulative_gas >= DIV(block_gas_used * {percentile}, 100), priority_fee, NULL))) AS {name}"
+                for name, percentile in percentiles
+            )
+            projections.extend(["b.gas_used AS _block_gas_used", "COALESCE(r.receipt_gas_used, 0) AS _receipt_gas_used"])
+            checks.append(("_receipt_gas_used", "_block_gas_used", "receipts are incomplete"))
+        fields = sorted(set(tables["receipts"]) - {"block_timestamp"})
+        ctes.extend(
+            [
+                f"requested_receipts AS (\n  SELECT {', '.join(fields)}\n  FROM `{dataset}.receipts`\n  WHERE {window}\n)",
+                f"block_receipts AS (\n  SELECT b.block_number{weighted}\n"
+                "  FROM requested_receipts AS r JOIN requested_blocks AS b\n    ON r.block_hash = b.block_hash\n)",
+                "receipt_stats AS (\n  SELECT block_number,\n    " + ",\n    ".join(statistics) + "\n  FROM block_receipts GROUP BY block_number\n)",
             ]
         )
         joins.append("LEFT JOIN receipt_stats AS r USING (block_number)")
-        projections.extend(["b.gas_used AS _proof_gas_used", "COALESCE(r.receipt_gas_used, 0) AS _receipt_gas_used"])
-        result_schema.update({"_proof_gas_used": "INTEGER", "_receipt_gas_used": "INTEGER"})
     for feature in plan.acquired:
         recipe = feature.bigquery
         if isinstance(recipe, BlocksColumn):
@@ -141,14 +136,15 @@ def compile_bigquery(dataset: str, plan: Plan) -> BigQueryPlan:
         elif isinstance(recipe, TransactionRows):
             expression = "COALESCE(t.tx_count, 0)"
         else:
-            expression = f"COALESCE(r.{feature.name}, 0)"
+            expression = f"IF(r.block_number IS NULL, 0, r.{feature.name})"
         projections.append(f"{expression} AS {feature.name}")
-        result_schema[feature.name] = "STRING" if feature.dtype == "UTF-8" else "INTEGER"
+    result_schema = {projection.rpartition(" AS ")[2]: "INTEGER" for projection in projections}
+    result_schema.update({feature.name: "STRING" for feature in plan.acquired if feature.dtype == "UTF-8"})
     sql = "WITH " + ",\n".join(ctes) + "\nSELECT\n  " + ",\n  ".join(projections) + "\nFROM requested_blocks AS b\n"
     if joins:
         sql += "\n".join(joins) + "\n"
     sql += "ORDER BY block_number"
-    return BigQueryPlan(sql, tables, result_schema)
+    return BigQueryPlan(sql, tables, result_schema, tuple(checks))
 
 
 def prepare_query(
@@ -187,7 +183,7 @@ def query_chunks(
     expected = parameters["first_block"]
     for page in warehouse.pages(query.sql, parameters, maximum_bytes_billed, chunk_size):
         for value in page:
-            rows.append(_parse_bigquery_row(value, query.result_schema, plan, expected))
+            rows.append(_parse_bigquery_row(value, query, plan, expected))
             expected += 1
             if len(rows) == chunk_size:
                 yield rows
@@ -196,11 +192,12 @@ def query_chunks(
         yield rows
 
 
-def _parse_bigquery_row(value: Mapping[str, object], schema: dict[str, str], plan: Plan, expected: int) -> Row:
-    if set(value) != set(schema):
+def _parse_bigquery_row(value: Mapping[str, object], query: BigQueryPlan, plan: Plan, expected: int) -> Row:
+    if set(value) != set(query.result_schema):
         raise BlockweaverError("BIGQUERY_INVALID", "BigQuery returned a noncanonical row shape")
     if type(value["block_number"]) is not int or value["block_number"] != expected:
         raise BlockweaverError("BIGQUERY_INVALID", "BigQuery did not return the exact contiguous requested range")
-    if plan.percentiles and value["_receipt_gas_used"] != value["_proof_gas_used"]:
-        raise BlockweaverError("BIGQUERY_INVALID", f"BigQuery receipts are incomplete for block {expected}")
+    for witness, claim, problem in query.checks:
+        if value[witness] != value[claim]:
+            raise BlockweaverError("BIGQUERY_INVALID", f"BigQuery {problem} for block {expected}")
     return plan.row(value)

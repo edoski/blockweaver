@@ -388,7 +388,8 @@ async def materialize_artifact(
                 checkpoints = recovery.checkpoints
                 assert checkpoints is not None
                 reused = checkpoints.next_block - identity.resolved_range["from_block"]
-                progress({"event": "resume", "reused_rows": reused})
+                if reused:
+                    progress({"event": "resume", "reused_rows": reused})
                 async for rows in source.chunks(checkpoints.next_block, identity.resolved_range["to_block"]):
                     checkpoint = checkpoints.write(rows)
                     progress({"event": "checkpoint", "from_block": checkpoint.first, "to_block": checkpoint.last})
