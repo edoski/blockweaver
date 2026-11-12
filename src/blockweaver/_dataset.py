@@ -196,8 +196,8 @@ def _read_artifact(path: Path, *, work: bool) -> Artifact:
         manifest_bytes = manifest_path.read_bytes()
     except OSError as error:
         raise ValueError("Invalid JSON file: manifest.json") from error
-    manifest = _decode_json(manifest_bytes, "manifest.json")
-    if manifest_bytes != _canonical_json(manifest):
+    manifest = decode_json(manifest_bytes, "manifest.json")
+    if manifest_bytes != canonical_json(manifest):
         raise ValueError("manifest.json is not canonical JSON")
     if set(manifest) != _MANIFEST_KEYS:
         raise ValueError("manifest.json has a noncanonical shape")
@@ -336,11 +336,11 @@ def _validate_acquisition_plan(value: object) -> None:
 
 def _validate_data(path: Path, plan: Plan, output_format: str, resolved: dict[str, int], target_hash: str) -> int:
     if output_format == "parquet":
-        if pl.read_parquet_schema(path) != _polars_schema(plan.schema):
+        if pl.read_parquet_schema(path) != polars_schema(plan.schema):
             raise ValueError("Parquet schema is not canonical")
     else:
         _validate_csv_tokens(path, plan)
-    return _validate_rows(
+    return validate_rows(
         _scan_data(path, plan, output_format),
         plan.features,
         first=resolved["from_block"],
@@ -351,7 +351,7 @@ def _validate_data(path: Path, plan: Plan, output_format: str, resolved: dict[st
     )
 
 
-def _validate_rows(
+def validate_rows(
     frame: pl.LazyFrame,
     features: tuple[Feature, ...],
     *,
@@ -422,10 +422,10 @@ def _validate_csv_tokens(path: Path, plan: Plan) -> None:
 def _scan_data(path: Path, plan: Plan, output_format: str) -> pl.LazyFrame:
     if output_format == "parquet":
         return pl.scan_parquet(path)
-    return pl.scan_csv(path, schema=_polars_schema(plan.schema))
+    return pl.scan_csv(path, schema=polars_schema(plan.schema))
 
 
-def _polars_schema(schema: dict[str, str]):
+def polars_schema(schema: dict[str, str]):
     return {name: pl.Int64 if dtype == "Int64" else pl.String for name, dtype in schema.items()}
 
 
@@ -469,7 +469,7 @@ def _exact_table(value: object, keys: set[str], label: str) -> dict[str, Any]:
     return value
 
 
-def _decode_json(data: bytes, name: str) -> dict[str, Any]:
+def decode_json(data: bytes, name: str) -> dict[str, Any]:
     try:
         value = json.loads(data.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
@@ -479,5 +479,5 @@ def _decode_json(data: bytes, name: str) -> dict[str, Any]:
     return value
 
 
-def _canonical_json(value: object) -> bytes:
+def canonical_json(value: object) -> bytes:
     return (json.dumps(value, ensure_ascii=True, allow_nan=False, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")

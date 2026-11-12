@@ -22,7 +22,7 @@ import polars as pl
 
 from ._config import DownloadRequest
 from ._contract import Anchor, BlockweaverError, Header, OutputFormat, Plan, Progress, ResolvedRange, Row, validate_links
-from ._dataset import Artifact, _canonical_json, _decode_json, _polars_schema, _validate_rows, file_hash, read_artifact, validate_manifest_source
+from ._dataset import Artifact, canonical_json, decode_json, file_hash, polars_schema, read_artifact, validate_manifest_source, validate_rows
 
 _CHUNK = re.compile(r"(\d{20})-(\d{20})-([0-9a-f]{64})\.parquet\Z")
 Publication = Callable[[Literal["publishing", "committed"]], None]
@@ -282,7 +282,7 @@ def _prepare_work(hidden: Path, identity: ArtifactIdentity, size: int, *, recove
 def _write_checkpoint(chunks: Path, first: int, last: int, plan: Plan, rows: list[Row]) -> Checkpoint:
     temporary = chunks / f".{first:020d}-{last:020d}.parquet.tmp"
     try:
-        pl.DataFrame(rows, schema=_polars_schema(plan.stored_schema)).write_parquet(temporary, compression="zstd", row_group_size=4096)
+        pl.DataFrame(rows, schema=polars_schema(plan.stored_schema)).write_parquet(temporary, compression="zstd", row_group_size=4096)
         _fsync_file(temporary)
         digest = file_hash(temporary)
         path = chunks / f"{first:020d}-{last:020d}-{digest}.parquet"
@@ -298,9 +298,9 @@ def _read_checkpoint(path: Path, plan: Plan, first: int, last: int, digest: str)
         if file_hash(path) != digest:
             raise ValueError
         frame = pl.read_parquet(path)
-        if frame.schema != _polars_schema(plan.stored_schema):
+        if frame.schema != polars_schema(plan.stored_schema):
             raise ValueError
-        _validate_rows(frame.lazy(), plan.stored, first=first, last=last)
+        validate_rows(frame.lazy(), plan.stored, first=first, last=last)
         headers = [Header.of(row) for row in frame.iter_rows(named=True)]
         validate_links(headers)
         return Checkpoint(path, first, last, digest, headers[0], headers[-1])
@@ -462,11 +462,11 @@ def _read_json(path: Path) -> dict[str, Any]:
         data = path.read_bytes()
     except OSError as error:
         raise ValueError(f"Invalid JSON file: {path.name}") from error
-    return _decode_json(data, path.name)
+    return decode_json(data, path.name)
 
 
 def _write_json(path: Path, value: object) -> None:
-    data = _canonical_json(value)
+    data = canonical_json(value)
     temporary = path.with_suffix(path.suffix + ".tmp")
     try:
         temporary.write_bytes(data)
