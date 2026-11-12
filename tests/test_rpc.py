@@ -53,9 +53,8 @@ def test_rpc_limit_splits_immediately_and_retries_only_pending_calls(chains: tup
     assert [[call["params"][0] for call in batch] for batch in primary.requests] == [["0xa", "0xb", "0xc"], ["0xb"]]
     primary.requests.clear()
     primary.rpc_errors = [-32005]
-    with pytest.raises(RuntimeError, match="limit exceeded"):
-        asyncio.run(request())
-    assert len(primary.requests) == 1
+    assert [header.block_number for header in asyncio.run(request())] == [10, 11, 12]
+    assert [len(batch) for batch in primary.requests] == [3, 1], "a limit error on the only pending call is retried, not split"
 
 
 def test_rpc_retries_preserve_original_pending_order(chains: tuple[ChainServer, ChainServer]) -> None:
@@ -95,11 +94,60 @@ def test_rpc_retry_is_bounded_and_retry_after_is_validated(chains: tuple[ChainSe
     asyncio.run(request())
     assert delays == [0.25]
     delays.clear()
-    primary.rpc_errors = [-32603] * 12
-    with pytest.raises(RuntimeError, match="12 attempts") as failure:
+    primary.rpc_errors = [-32603] * 10
+    with pytest.raises(RuntimeError, match="RPC provider primary failed eth_getBlockByNumber after 10 attempts") as failure:
         asyncio.run(request())
-    assert "provider detail" not in str(failure.value)
-    assert len(delays) == 11
+    assert "provider detail" not in str(failure.value) and primary.url not in str(failure.value)
+    assert len(delays) == 9
+
+
+def test_rate_limited_batch_is_retried_whole_and_never_split(chains: tuple[ChainServer, ChainServer], monkeypatch: pytest.MonkeyPatch) -> None:
+    primary, _verifier = chains
+    primary.http_failures, primary.retry_after = 10**9, "x"
+
+    async def sleep(_delay: float) -> None:
+        return None
+
+    async def request() -> None:
+        async with _rpc.Rpc(Provider("primary", primary.url, 20, 6, 2)) as rpc:
+            await rpc.headers(range(10, 30))
+
+    monkeypatch.setattr(_rpc.asyncio, "sleep", sleep)
+    with pytest.raises(RuntimeError, match="after 10 attempts: HTTP 429"):
+        asyncio.run(request())
+    assert [len(batch) for batch in primary.requests] == [20] * 10
+
+
+@pytest.mark.parametrize("status", [200, 400])
+def test_refused_batch_is_split_and_the_smaller_size_is_remembered(chains: tuple[ChainServer, ChainServer], status: int) -> None:
+    primary, _verifier = chains
+    primary.batch_refusal = (3, status)
+
+    async def request() -> list[int]:
+        async with _rpc.Rpc(Provider("primary", primary.url, 20, 1, 2)) as rpc:
+            first = await rpc.headers(range(0, 20))
+            primary.requests.clear()
+            second = await rpc.headers(range(20, 30))
+            return [header.block_number for header in [*first, *second]]
+
+    assert asyncio.run(request()) == list(range(30))
+    assert primary.requests and all(len(batch) <= 3 for batch in primary.requests), "later groups start at a size the provider accepts"
+
+
+def test_unreachable_provider_fails_within_three_attempts(monkeypatch: pytest.MonkeyPatch) -> None:
+    delays: list[float] = []
+
+    async def sleep(delay: float) -> None:
+        delays.append(delay)
+
+    async def request() -> None:
+        async with _rpc.Rpc(Provider("typo", "http://127.0.0.1:1", 20, 6, 2)) as rpc:
+            await rpc.chain_id()
+
+    monkeypatch.setattr(_rpc.asyncio, "sleep", sleep)
+    with pytest.raises(RuntimeError, match="RPC provider typo failed eth_chainId after 3 attempts: no response"):
+        asyncio.run(request())
+    assert len(delays) == 2
 
 
 def test_rpc_groups_are_concurrent_and_cancel_siblings(chains: tuple[ChainServer, ChainServer], monkeypatch: pytest.MonkeyPatch) -> None:

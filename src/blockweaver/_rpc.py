@@ -29,6 +29,10 @@ _QUANTITY = re.compile(r"0x(?:0|[1-9a-f][0-9a-f]*)\Z")
 
 
 _TRANSIENT_HTTP = {408, 425, 429, *range(500, 600)}
+_REFUSED_HTTP = {400, 413}
+_ATTEMPTS = 10
+_UNREACHABLE_ATTEMPTS = 3
+_BACKOFF_CAP = 30.0
 
 
 _FATAL_RPC = {-32700, -32600, -32601, -32602, -32000, -32001, -32003, -32004, -32006}
@@ -106,6 +110,8 @@ class Rpc:
         self._semaphore = asyncio.Semaphore(provider.concurrency)
         self._session: aiohttp.ClientSession | None = None
         self._next_id = 1
+        self._batch_size = provider.batch_size
+        self._answered = False
 
     async def __aenter__(self) -> Rpc:
         self._session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=self.provider.timeout))
@@ -133,14 +139,14 @@ class Rpc:
         validators: dict[int, Validator] = {}
         for call, number in zip(calls, numbers, strict=True):
             validators[int(call["id"])] = lambda value, expected=number: parse_block(value, expected=expected, plan=plan)
-        groups = [calls[index : index + self.provider.batch_size] for index in range(0, len(calls), self.provider.batch_size)]
+        groups = [calls[index : index + self._batch_size] for index in range(0, len(calls), self._batch_size)]
         replies: dict[int, Any] = {}
         for part in await self._run_groups(groups, validators):
             replies.update(part)
         return [replies[int(call["id"])] for call in calls]
 
     async def headers(self, numbers: Sequence[int]) -> list[Header]:
-        return [Header.of(_INTEGRITY_PLAN.row(block)) for block in await self._blocks(numbers, _INTEGRITY_PLAN)]
+        return [Header.of(self._row(_INTEGRITY_PLAN, block)) for block in await self._blocks(numbers, _INTEGRITY_PLAN)]
 
     async def header(self, number: int) -> Header:
         return (await self.headers([number]))[0]
@@ -149,7 +155,7 @@ class Rpc:
         call = self._calls("eth_getBlockByNumber", [[tag, False]])[0]
         item_id = int(call["id"])
         reply = await self._run([call], {item_id: lambda value: parse_block(value, expected=None, plan=_INTEGRITY_PLAN)})
-        return Header.of(_INTEGRITY_PLAN.row(reply[item_id]))
+        return Header.of(self._row(_INTEGRITY_PLAN, reply[item_id]))
 
     async def fee_history(self, first_block: int, last_block: int, percentiles: tuple[int, ...]) -> list[dict[int, int]]:
         count = last_block - first_block + 1
@@ -172,52 +178,61 @@ class Rpc:
             blocks = await self._blocks(numbers, plan)
             fees = [(await self.fee_history(number, number, plan.percentiles))[0] for number in numbers]
         rewards = [(feature.name, feature.rpc.percentile) for feature in plan.acquired if isinstance(feature.rpc, FeeHistory)]
-        return [plan.row({**block, **{name: fee[percentile] for name, percentile in rewards}}) for block, fee in zip(blocks, fees, strict=True)]
+        return [self._row(plan, {**block, **{name: fee[percentile] for name, percentile in rewards}}) for block, fee in zip(blocks, fees, strict=True)]
 
-    async def _run(self, calls: list[dict[str, Any]], validators: dict[int, Validator], prior_attempts: int = 0) -> dict[int, Any]:
+    def _row(self, plan: Plan, values: dict[str, Value]) -> Row:
+        try:
+            return plan.row(values)
+        except ValueError as error:
+            raise ValueError(f"RPC provider {self.provider.name}: {error}") from None
+
+    async def _run(self, calls: list[dict[str, Any]], validators: dict[int, Validator]) -> dict[int, Any]:
+        """Send one batch until every call has a validated result.
+
+        A transient failure retries the same pending calls after a backoff and never splits them, so a rate limit does
+        not multiply requests. Only a provider that refuses the batch as too large is answered with smaller batches.
+        """
         pending = {int(call["id"]): call for call in calls}
         complete: dict[int, Any] = {}
-        attempt = prior_attempts
-        while pending and attempt < 12:
+        method = calls[0]["method"]
+        name = self.provider.name
+        attempt, failure = 0, ""
+        while True:
             attempt += 1
             status, payload, retry_after = await self._post(list(pending.values()))
-            if status not in _TRANSIENT_HTTP:
-                if status != 200:
-                    raise RuntimeError(f"RPC returned non-retryable HTTP status {status}")
-                accepted, retry, limit = self._parse(payload, tuple(pending), validators)
+            refused = status in _REFUSED_HTTP
+            if status == 200:
+                try:
+                    accepted, refused, failure = _parse_batch(payload, pending, validators)
+                except _Rejected as error:
+                    raise RuntimeError(f"RPC provider {name} rejected {method} with JSON-RPC error {error}") from None
+                except ValueError as error:
+                    raise ValueError(f"RPC provider {name} sent an invalid {method} reply: {error}") from None
                 complete.update(accepted)
-                pending = {item_id: pending[item_id] for item_id in retry}
-                if limit:
-                    if len(pending) == 1:
-                        raise RuntimeError("RPC limit exceeded for a single request")
-                    items = list(pending.values())
-                    midpoint = len(items) // 2
-                    first, second = await self._run_groups([items[:midpoint], items[midpoint:]], validators, attempt)
-                    complete.update(first)
-                    complete.update(second)
+                pending = {item_id: call for item_id, call in pending.items() if item_id not in accepted}
+                if not pending:
                     return complete
-            if not pending:
-                return complete
-            if attempt >= 3 and len(pending) > 1:
+            elif status is None:
+                failure = "no response"
+            elif refused or status in _TRANSIENT_HTTP:
+                failure = f"HTTP {status}"
+            else:
+                raise RuntimeError(f"RPC provider {name} answered {method} with non-retryable HTTP status {status}")
+            if refused and len(pending) > 1:
+                self._batch_size = min(self._batch_size, len(pending) // 2)
                 items = list(pending.values())
-                midpoint = len(items) // 2
-                first, second = await self._run_groups([items[:midpoint], items[midpoint:]], validators, attempt)
-                complete.update(first)
-                complete.update(second)
+                for part in await self._run_groups([items[: len(items) // 2], items[len(items) // 2 :]], validators):
+                    complete.update(part)
                 return complete
-            if attempt == 12:
-                break
-            delay = retry_after if retry_after is not None else random.uniform(0, min(2 ** (attempt - 4), 2.0))
-            await asyncio.sleep(max(0.0, delay))
-        raise RuntimeError("RPC request failed after 12 attempts")
+            if refused and status != 200:
+                raise RuntimeError(f"RPC provider {name} answered a single {method} call with non-retryable HTTP status {status}")
+            if attempt >= (_ATTEMPTS if self._answered else _UNREACHABLE_ATTEMPTS):
+                raise RuntimeError(f"RPC provider {name} failed {method} after {attempt} attempts: {failure}")
+            delay = retry_after if retry_after is not None else random.uniform(0, min(0.5 * 2 ** (attempt - 1), _BACKOFF_CAP))
+            await asyncio.sleep(delay)
 
-    async def _run_groups(
-        self,
-        groups: Iterable[list[dict[str, Any]]],
-        validators: dict[int, Validator],
-        prior_attempts: int = 0,
-    ) -> list[dict[int, Any]]:
-        tasks = [asyncio.create_task(self._run(group, validators, prior_attempts)) for group in groups if group]
+    async def _run_groups(self, groups: Iterable[list[dict[str, Any]]], validators: dict[int, Validator]) -> list[dict[int, Any]]:
+        tasks = [asyncio.create_task(self._run(group, validators)) for group in groups if group]
         try:
             return list(await asyncio.gather(*tasks))
         except BaseException:
@@ -226,52 +241,64 @@ class Rpc:
             await asyncio.gather(*tasks, return_exceptions=True)
             raise
 
-    async def _post(self, calls: list[dict[str, Any]]) -> tuple[int, Any, float | None]:
+    async def _post(self, calls: list[dict[str, Any]]) -> tuple[int | None, Any, float | None]:
+        """One HTTP exchange: its status, its JSON payload when the status is 200, and any Retry-After. No response is status None."""
         assert self._session is not None
         try:
             async with self._semaphore, self._session.post(self.provider.url, json=calls) as response:
-                retry_after = _retry_after(response.headers.get("Retry-After"))
-                if response.status in _TRANSIENT_HTTP:
+                self._answered = True
+                if response.status != 200:
                     await response.read()
-                    return response.status, None, retry_after
+                    return response.status, None, _retry_after(response.headers.get("Retry-After"))
                 try:
-                    return response.status, await response.json(content_type=None), retry_after
+                    return 200, await response.json(content_type=None), None
                 except (ValueError, aiohttp.ClientError) as error:
-                    raise RuntimeError("RPC returned invalid JSON") from error
+                    raise RuntimeError(f"RPC provider {self.provider.name} returned invalid JSON") from error
         except (TimeoutError, aiohttp.ClientError):
-            return 408, None, None
+            return None, None, None
 
-    @staticmethod
-    def _parse(payload: Any, expected: tuple[int, ...], validators: dict[int, Validator]) -> tuple[dict[int, Any], tuple[int, ...], bool]:
-        if not isinstance(payload, list):
-            raise ValueError("Invalid JSON-RPC batch response shape")
-        accepted: dict[int, Any] = {}
-        expected_ids = set(expected)
-        seen: set[int] = set()
-        limit = False
-        for member in payload:
-            if not isinstance(member, dict) or member.get("jsonrpc") != "2.0":
-                raise ValueError("Invalid JSON-RPC response member")
-            item_id = member.get("id")
-            if type(item_id) is not int or item_id not in expected_ids or item_id in seen:
-                raise ValueError("JSON-RPC response ID mismatch")
-            seen.add(item_id)
-            has_result = "result" in member
-            has_error = "error" in member
-            if has_result == has_error:
-                raise ValueError("Invalid JSON-RPC result shape")
-            if has_error:
-                error = member["error"]
-                if not isinstance(error, dict) or type(error.get("code")) is not int or not isinstance(error.get("message"), str):
-                    raise ValueError("Invalid JSON-RPC error shape")
-                if error["code"] in _FATAL_RPC:
-                    raise RuntimeError("RPC rejected a valid protocol request")
-                limit = limit or error["code"] == _LIMIT_RPC
-                continue
-            if member["result"] is None:
-                continue
+
+class _Rejected(Exception):
+    """A JSON-RPC error code that retrying cannot cure."""
+
+
+def _parse_batch(payload: Any, pending: dict[int, dict[str, Any]], validators: dict[int, Validator]) -> tuple[dict[int, Any], bool, str]:
+    """Validated results by call ID, whether the provider refused the batch as too large, and why calls are still pending."""
+    if isinstance(payload, dict) and payload.get("id") is None and "error" in payload:
+        return {}, True, f"JSON-RPC error {_error_code(payload)} for the whole batch"
+    if not isinstance(payload, list):
+        raise ValueError("Invalid JSON-RPC batch response shape")
+    accepted: dict[int, Any] = {}
+    seen: set[int] = set()
+    refused = False
+    failure = "missing result"
+    for member in payload:
+        if not isinstance(member, dict) or member.get("jsonrpc") != "2.0":
+            raise ValueError("Invalid JSON-RPC response member")
+        item_id = member.get("id")
+        if type(item_id) is not int or item_id not in pending or item_id in seen:
+            raise ValueError("JSON-RPC response ID mismatch")
+        seen.add(item_id)
+        if ("result" in member) == ("error" in member):
+            raise ValueError("Invalid JSON-RPC result shape")
+        if "error" in member:
+            code = _error_code(member)
+            if code in _FATAL_RPC:
+                raise _Rejected(code)
+            refused = refused or code == _LIMIT_RPC
+            failure = f"JSON-RPC error {code}"
+        elif member["result"] is None:
+            failure = "null result"
+        else:
             accepted[item_id] = validators[item_id](member["result"])
-        return accepted, tuple(item_id for item_id in expected if item_id not in accepted), limit
+    return accepted, refused, failure
+
+
+def _error_code(member: dict[str, Any]) -> int:
+    error = member["error"]
+    if not isinstance(error, dict) or type(error.get("code")) is not int or not isinstance(error.get("message"), str):
+        raise ValueError("Invalid JSON-RPC error shape")
+    return error["code"]
 
 
 def _retry_after(value: str | None) -> float | None:

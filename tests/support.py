@@ -96,6 +96,7 @@ class ChainServer:
         self.rpc_errors: list[int] = []
         self.item_errors: dict[int, list[int]] = {}
         self.limit_batches = False
+        self.batch_refusal: tuple[int, int] | None = None
         self.when_block_requested: dict[int, Callable[[], None]] = {}
         state = self
 
@@ -110,6 +111,11 @@ class ChainServer:
                     self.send_response(429)
                     self.send_header("Retry-After", state.retry_after)
                     self.end_headers()
+                    return
+                if state.batch_refusal is not None and len(calls) > state.batch_refusal[0]:
+                    refusal = {"jsonrpc": "2.0", "error": {"code": -32014, "message": "too many RPC calls in batch request"}}
+                    status = state.batch_refusal[1]
+                    self.reply(status, {**refusal, "id": None} if status == 200 else [{**refusal, "id": call["id"]} for call in calls])
                     return
                 replies = []
                 for call in calls:
@@ -148,8 +154,11 @@ class ChainServer:
                     item_id = call["id"] + 10_000 if state.wrong_id_once else call["id"]
                     state.wrong_id_once = False
                     replies.append({"jsonrpc": "2.0", "id": item_id, "result": result})
-                body = json.dumps(list(reversed(replies))).encode()
-                self.send_response(200)
+                self.reply(200, list(reversed(replies)))
+
+            def reply(self, status: int, payload: Any) -> None:
+                body = json.dumps(payload).encode()
+                self.send_response(status)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
