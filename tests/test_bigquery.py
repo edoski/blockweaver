@@ -215,6 +215,11 @@ def test_bigquery_rejects_a_block_with_a_missing_receipt(
     [
         (("tx_count",), "DELETE FROM {transactions} WHERE block_hash = '" + block_hash(13) + "'", "block 13"),
         (("tx_count",), "DELETE FROM {receipts} WHERE block_hash = '" + block_hash(13) + "' AND transaction_index = 0", "block 13"),
+        (
+            ("tx_count",),
+            "DELETE FROM {receipts} WHERE block_hash = '{hash}'; DELETE FROM {transactions} WHERE block_hash = '{hash}'".replace("{hash}", block_hash(13)),
+            "block 13",
+        ),
         ((P50,), "UPDATE {blocks} SET base_fee_per_gas = NULL WHERE block_number = 13", "Block 13"),
         ((P50,), "UPDATE {receipts} SET effective_gas_price = NULL WHERE block_hash = '" + block_hash(13) + "' AND transaction_index = 1", "Block 13"),
     ],

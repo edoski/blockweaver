@@ -17,7 +17,7 @@ class BigQueryPlan:
     sql: str
     table_fields: dict[str, dict[str, str]]
     result_schema: dict[str, str]
-    checks: tuple[tuple[str, str, str], ...]
+    checks: tuple[tuple[str, str], ...]
 
 
 class BigQueryClient:
@@ -74,7 +74,11 @@ def open_bigquery(project: str) -> BigQueryClient:
 
 
 def compile_bigquery(dataset: str, plan: Plan) -> BigQueryPlan:
-    """The one fixed query shape. Receipts are a second witness: their gas must add up to the block's, and their count must equal the transaction count."""
+    """The one fixed query shape. Each check is a result column that must be 0, with the problem a nonzero value means.
+
+    Receipts are a second witness: their gas must add up to the block's, and their count must equal the transaction count.
+    The block is a third: gas was used only if there are transactions.
+    """
     tables = bigquery_tables(plan)
     window = "block_timestamp BETWEEN TIMESTAMP_SECONDS(@from_timestamp) AND TIMESTAMP_SECONDS(@to_timestamp)"
     percentiles = [(feature.name, feature.bigquery.percentile) for feature in plan.acquired if isinstance(feature.bigquery, ReceiptPercentile)]
@@ -88,12 +92,14 @@ def compile_bigquery(dataset: str, plan: Plan) -> BigQueryPlan:
     ]
     joins: list[str] = []
     projections = ["b.block_number AS block_number"]
-    checks: list[tuple[str, str, str]] = []
+    checks: list[tuple[str, str]] = []
     if counts:
         ctes.append(f"tx_counts AS (\n  SELECT block_hash, COUNT(*) AS tx_count\n  FROM `{dataset}.transactions`\n  WHERE {window}\n  GROUP BY block_hash\n)")
         joins.append("LEFT JOIN tx_counts AS t USING (block_hash)")
-        projections.append("COALESCE(r.receipt_count, 0) AS _receipt_count")
-        checks.extend(("_receipt_count", feature.name, "transaction and receipt counts disagree") for feature in counts)
+        projections.append("COALESCE(t.tx_count, 0) - COALESCE(r.receipt_count, 0) AS _count_gap")
+        projections.append("IF(b.gas_used > 0 AND COALESCE(t.tx_count, 0) = 0, 1, 0) AS _unexplained_gas")
+        checks.append(("_count_gap", "transaction and receipt counts disagree"))
+        checks.append(("_unexplained_gas", "reports gas used but no transactions"))
     if "receipts" in tables:
         weighted, statistics = "", ["COUNT(*) AS receipt_count"]
         if percentiles:
@@ -109,8 +115,8 @@ def compile_bigquery(dataset: str, plan: Plan) -> BigQueryPlan:
                 f"IF(LOGICAL_OR(priority_fee IS NULL), NULL, MIN(IF(cumulative_gas >= DIV(block_gas_used * {percentile}, 100), priority_fee, NULL))) AS {name}"
                 for name, percentile in percentiles
             )
-            projections.extend(["b.gas_used AS _block_gas_used", "COALESCE(r.receipt_gas_used, 0) AS _receipt_gas_used"])
-            checks.append(("_receipt_gas_used", "_block_gas_used", "receipt gas does not add up to the gas used"))
+            projections.append("b.gas_used - COALESCE(r.receipt_gas_used, 0) AS _receipt_gas_gap")
+            checks.append(("_receipt_gas_gap", "receipt gas does not add up to the gas used"))
         fields = sorted(set(tables["receipts"]) - {"block_timestamp"})
         ctes.extend(
             [
@@ -191,7 +197,7 @@ def _parse_bigquery_row(value: Mapping[str, object], query: BigQueryPlan, plan: 
         raise BlockweaverError("BIGQUERY_INVALID", "BigQuery returned a noncanonical row shape")
     if type(value["block_number"]) is not int or value["block_number"] != expected:
         raise BlockweaverError("BIGQUERY_INVALID", "BigQuery did not return the exact contiguous requested range")
-    for witness, claim, problem in query.checks:
-        if value[witness] != value[claim]:
+    for column, problem in query.checks:
+        if value[column] != 0:
             raise BlockweaverError("BIGQUERY_INVALID", f"BigQuery {problem} for block {expected}")
     return plan.row(value)

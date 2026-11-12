@@ -64,10 +64,10 @@ class BigQuerySource:
         self._query = compile_bigquery(request.dataset, request.plan)
         self._dry_run_bytes: int | None = None
 
-    def _parameters(self, first: int) -> dict[str, int]:
+    def _parameters(self, first: int, last: int) -> dict[str, int]:
         return {
             "first_block": first,
-            "last_block": self.resolved.last_block,
+            "last_block": last,
             "from_timestamp": self.resolved.first_timestamp,
             "to_timestamp": self.resolved.last_timestamp,
         }
@@ -75,7 +75,7 @@ class BigQuerySource:
     def _dry_run(self) -> int:
         """Check the schemas and the cost of the whole range once per run, before any billable query and before the manifest."""
         if self._dry_run_bytes is None:
-            parameters = self._parameters(self.resolved.first_block)
+            parameters = self._parameters(self.resolved.first_block, self.resolved.last_block)
             self._dry_run_bytes = prepare_query(self.warehouse, self.request.dataset, self._query, parameters, self.request.bigquery.maximum_bytes_billed)
             self.progress({"event": "bigquery_dry_run", "bytes_processed": self._dry_run_bytes})
         return self._dry_run_bytes
@@ -85,7 +85,7 @@ class BigQuerySource:
             return
         self._dry_run()
         limit = self.request.bigquery.maximum_bytes_billed
-        for chunk in query_chunks(self.warehouse, self._query, self._parameters(first), limit, self.request.plan, CHUNK_SIZE):
+        for chunk in query_chunks(self.warehouse, self._query, self._parameters(first, last), limit, self.request.plan, CHUNK_SIZE):
             yield chunk
 
     async def prove(self, target: Header) -> VerifiedProof:
