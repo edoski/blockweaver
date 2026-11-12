@@ -96,7 +96,9 @@ class ChainServer:
         self.rpc_errors: list[int] = []
         self.item_errors: dict[int, list[int]] = {}
         self.limit_batches = False
+        self.failure_status = 429
         self.batch_refusal: tuple[int, int] | None = None
+        self.batch_refusal_code = -32014
         self.keys_from: dict[str, int] = {}
         self.when_block_requested: dict[int, Callable[[], None]] = {}
         state = self
@@ -109,12 +111,12 @@ class ChainServer:
                 state.requests.append(calls)
                 if state.http_failures:
                     state.http_failures -= 1
-                    self.send_response(429)
+                    self.send_response(state.failure_status)
                     self.send_header("Retry-After", state.retry_after)
                     self.end_headers()
                     return
                 if state.batch_refusal is not None and len(calls) > state.batch_refusal[0]:
-                    refusal = {"jsonrpc": "2.0", "error": {"code": -32014, "message": "too many RPC calls in batch request"}}
+                    refusal = {"jsonrpc": "2.0", "error": {"code": state.batch_refusal_code, "message": "too many RPC calls in batch request"}}
                     status = state.batch_refusal[1]
                     self.reply(status, {**refusal, "id": None} if status == 200 else [{**refusal, "id": call["id"]} for call in calls])
                     return
@@ -217,7 +219,7 @@ class ChainServer:
         self._thread.join()
 
 
-_BIGQUERY_TYPES = {"BIGINT": "INTEGER", "HUGEINT": "INTEGER", "VARCHAR": "STRING", "TIMESTAMP WITH TIME ZONE": "TIMESTAMP"}
+_BIGQUERY_TYPES = {"INTEGER": "INTEGER", "BIGINT": "INTEGER", "HUGEINT": "INTEGER", "VARCHAR": "STRING", "TIMESTAMP WITH TIME ZONE": "TIMESTAMP"}
 
 
 def _bigquery_field(duckdb_type: str) -> tuple[str, str]:

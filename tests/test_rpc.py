@@ -134,6 +134,45 @@ def test_refused_batch_is_split_and_the_smaller_size_is_remembered(chains: tuple
     assert primary.requests and all(len(batch) <= 3 for batch in primary.requests), "later groups start at a size the provider accepts"
 
 
+def test_limit_errors_on_part_of_a_batch_are_retried_without_shrinking_it(chains: tuple[ChainServer, ChainServer]) -> None:
+    primary, _verifier = chains
+    primary.item_errors[11] = [-32005]
+    primary.item_errors[12] = [-32005]
+
+    async def request() -> None:
+        async with _rpc.Rpc(Provider("primary", primary.url, 3, 1, 2)) as rpc:
+            await rpc.headers([10, 11, 12])
+            await rpc.headers([20, 21, 22])
+
+    asyncio.run(request())
+    assert [len(batch) for batch in primary.requests] == [3, 2, 3]
+
+
+def test_a_provider_that_rejects_batches_outright_fails_at_once(chains: tuple[ChainServer, ChainServer]) -> None:
+    primary, _verifier = chains
+    primary.batch_refusal, primary.batch_refusal_code = (0, 200), -32600
+
+    async def request() -> None:
+        async with _rpc.Rpc(Provider("primary", primary.url, 20, 6, 2)) as rpc:
+            await rpc.chain_id()
+
+    with pytest.raises(RuntimeError, match="RPC provider primary rejected eth_chainId with JSON-RPC error -32600"):
+        asyncio.run(request())
+    assert len(primary.requests) == 1
+
+
+def test_a_gateway_error_before_any_answer_counts_as_unreachable(chains: tuple[ChainServer, ChainServer]) -> None:
+    primary, _verifier = chains
+    primary.http_failures, primary.failure_status = 10**9, 503
+
+    async def request() -> None:
+        async with _rpc.Rpc(Provider("primary", primary.url, 20, 6, 2)) as rpc:
+            await rpc.chain_id()
+
+    with pytest.raises(RuntimeError, match="after 3 attempts: HTTP 503"):
+        asyncio.run(request())
+
+
 def test_unreachable_provider_fails_within_three_attempts(monkeypatch: pytest.MonkeyPatch) -> None:
     delays: list[float] = []
 

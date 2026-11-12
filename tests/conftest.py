@@ -7,6 +7,13 @@ from pathlib import Path
 import pytest
 from support import ChainServer
 
+from blockweaver import _rpc
+
+
+@pytest.fixture(autouse=True)
+def instant_backoff(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(_rpc.random, "uniform", lambda _low, _high: 0.0)
+
 
 @pytest.fixture
 def chains() -> Iterator[tuple[ChainServer, ChainServer]]:

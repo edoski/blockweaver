@@ -18,7 +18,8 @@ from ._contract import INT64_MAX, BlockweaverError, FeeHistory, Header, HeaderKe
 
 _QUANTITY = re.compile(r"0x(?:0|[1-9a-f][0-9a-f]*)\Z")
 _TRANSIENT_HTTP = {408, 425, 429, *range(500, 600)}
-_REFUSED_HTTP = {400, 413}
+_TOO_LARGE_HTTP = {400, 413}
+_ANSWERED_HTTP = {200, 429}
 _ATTEMPTS = 10
 _UNREACHABLE_ATTEMPTS = 3
 _BACKOFF_CAP = 30.0
@@ -169,7 +170,7 @@ class Rpc:
         """Send one batch until every call has a validated result.
 
         A transient failure retries the same pending calls after a backoff and never splits them, so a rate limit does
-        not multiply requests. Only a provider that refuses the batch as too large is answered with smaller batches.
+        not multiply requests. Only a provider that refuses the whole batch as too large is answered with smaller batches.
         """
         pending = {int(call["id"]): call for call in calls}
         complete: dict[int, Any] = {}
@@ -179,10 +180,10 @@ class Rpc:
         while True:
             attempt += 1
             status, payload, retry_after = await self._post(list(pending.values()))
-            refused = status in _REFUSED_HTTP
+            too_large = False
             if status == 200:
                 try:
-                    accepted, refused, failure = _parse_batch(payload, pending, validators)
+                    accepted, too_large, failure = _parse_batch(payload, pending, validators)
                 except _Rejected as error:
                     raise RuntimeError(f"RPC provider {name} rejected {method} with JSON-RPC error {error}") from None
                 except ValueError as error:
@@ -193,18 +194,18 @@ class Rpc:
                     return complete
             elif status is None:
                 failure = "no response"
-            elif refused or status in _TRANSIENT_HTTP:
+            elif status in _TRANSIENT_HTTP:
                 failure = f"HTTP {status}"
+            elif status in _TOO_LARGE_HTTP and len(pending) > 1:
+                too_large = True
             else:
                 raise RuntimeError(f"RPC provider {name} answered {method} with non-retryable HTTP status {status}")
-            if refused and len(pending) > 1:
+            if too_large:
                 self._batch_size = min(self._batch_size, len(pending) // 2)
                 items = list(pending.values())
                 for part in await self._run_groups([items[: len(items) // 2], items[len(items) // 2 :]], validators):
                     complete.update(part)
                 return complete
-            if refused and status != 200:
-                raise RuntimeError(f"RPC provider {name} answered a single {method} call with non-retryable HTTP status {status}")
             if attempt >= (_ATTEMPTS if self._answered else _UNREACHABLE_ATTEMPTS):
                 raise RuntimeError(f"RPC provider {name} failed {method} after {attempt} attempts: {failure}")
             delay = retry_after if retry_after is not None else random.uniform(0, min(0.5 * 2 ** (attempt - 1), _BACKOFF_CAP))
@@ -225,7 +226,7 @@ class Rpc:
         assert self._session is not None
         try:
             async with self._semaphore, self._session.post(self.provider.url, json=calls) as response:
-                self._answered = True
+                self._answered = self._answered or response.status in _ANSWERED_HTTP
                 if response.status != 200:
                     await response.read()
                     return response.status, None, _retry_after(response.headers.get("Retry-After"))
@@ -242,14 +243,22 @@ class _Rejected(Exception):
 
 
 def _parse_batch(payload: Any, pending: dict[int, dict[str, Any]], validators: dict[int, Validator]) -> tuple[dict[int, Any], bool, str]:
-    """Validated results by call ID, whether the provider refused the batch as too large, and why calls are still pending."""
+    """Validated results by call ID, whether the provider refused the whole batch as too large, and why calls are still pending.
+
+    A batch counts as too large only when it holds several calls and none succeeded: one error object for the whole
+    batch, or the limit code on every call. The limit code on part of a batch is a rate limit and is retried.
+    """
+    several = len(pending) > 1
     if isinstance(payload, dict) and payload.get("id") is None and "error" in payload:
-        return {}, True, f"JSON-RPC error {_error_code(payload)} for the whole batch"
+        code = _error_code(payload)
+        if code in _FATAL_RPC and not several:
+            raise _Rejected(code)
+        return {}, several, f"JSON-RPC error {code} for the whole batch"
     if not isinstance(payload, list):
         raise ValueError("Invalid JSON-RPC batch response shape")
     accepted: dict[int, Any] = {}
     seen: set[int] = set()
-    refused = False
+    limited = 0
     failure = "missing result"
     for member in payload:
         if not isinstance(member, dict) or member.get("jsonrpc") != "2.0":
@@ -264,13 +273,13 @@ def _parse_batch(payload: Any, pending: dict[int, dict[str, Any]], validators: d
             code = _error_code(member)
             if code in _FATAL_RPC:
                 raise _Rejected(code)
-            refused = refused or code == _LIMIT_RPC
+            limited += code == _LIMIT_RPC
             failure = f"JSON-RPC error {code}"
         elif member["result"] is None:
             failure = "null result"
         else:
             accepted[item_id] = validators[item_id](member["result"])
-    return accepted, refused, failure
+    return accepted, several and limited == len(pending), failure
 
 
 def _error_code(member: dict[str, Any]) -> int:
