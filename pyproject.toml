@@ -32,9 +32,11 @@ blockweaver = "blockweaver.cli:app"
 
 [dependency-groups]
 dev = [
+  "duckdb>=2,<3",
   "pyright>=1.1.403,<2",
   "pytest>=8.4,<9",
   "ruff>=0.12,<1",
+  "sqlglot>=30,<31",
   "vulture>=2.14,<3",
 ]
 

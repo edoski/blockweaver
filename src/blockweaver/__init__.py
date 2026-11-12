@@ -3,7 +3,7 @@
 from importlib.metadata import version
 
 from ._contract import BlockweaverError
-from ._corpus import Dataset, open_dataset
+from ._dataset import Dataset, open_dataset
 
 __version__ = version("blockweaver")
 

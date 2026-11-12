@@ -23,7 +23,7 @@ verifier = "verifier"
 
 Configuration is strict: unknown keys, unknown profiles, invalid URLs, ambiguous `url`/`url_env` pairs, and non-finite or greater-than-one-hour timeouts fail before network access. Chain profiles may override `provider` and `verifier`. CLI values override the selected chain and provider profiles, which override global defaults.
 
-Inspect configuration and the closed feature catalog without exposing endpoints. `chains` reports `available_sources`; `features` reports top-level `available_sources` and per-feature `supported_sources`.
+Inspect configuration and the feature catalog without exposing endpoints. `chains` reports `available_sources`; `features` reports top-level `available_sources`, per-feature `supported_sources`, and the `header.<key>` pattern.
 
 ```console
 blockweaver chains
@@ -48,7 +48,9 @@ blockweaver download \
 
 Dates mean the full UTC day. Datetimes accept timezone-aware hour, minute, or second precision; reduced-precision end bounds include the final second of that period. Blockweaver resolves time bounds against the finalized chain and rejects pre-genesis, empty, future, and partly unfinalized requests instead of clipping them.
 
-`block_number` is always the first column. Other columns are selected explicitly or inherited from `defaults.features`. Header features share `eth_getBlockByNumber`; selected priority-fee percentiles share one `eth_feeHistory` request per acquisition chunk with only the requested percentiles.
+`block_number` is always the first column. Other columns are selected explicitly or inherited from `defaults.features`.
+
+Besides the typed catalog, any block header key can be selected as `header.<key>`, for example `--feature header.extraData` or `--feature header.settledExcess`. The column holds the node's own lowercase `0x` hex string and is never decoded, so a value wider than 64 bits is kept exactly and a chain can change what a key means without a Blockweaver release. A key whose value is a list or an object is rejected. Raw header columns come from RPC only and follow the typed columns in name order. A key that part of the range lacks fails the download with `SOURCE_FEATURE_UNAVAILABLE` and the first block without it, so split the range at the fork that introduced the key. Header features share `eth_getBlockByNumber`; selected priority-fee percentiles share one `eth_feeHistory` request per acquisition chunk with only the requested percentiles.
 
 An omitted `--id` mints a UUID4 and emits it on stderr before acquisition. Reusing an explicit `--id` resumes only an exact binding of chain, requested and resolved range, features, format, source, and provider profile names. Batch size, concurrency, timeout, and endpoint credentials may change between attempts.
 
@@ -60,9 +62,9 @@ ROOT/<uuid4>/
   blocks.parquet | blocks.csv
 ```
 
-The directory UUID must equal the manifest's dataset UUID. Parquet is the typed default. CSV uses canonical decimal integers and UTF-8 strings; `manifest.json` is its type authority. The unversioned manifest records the tool version, request, resolved range, ordered schema and units, acquisition plan, chain identity, non-secret provider profile names, finality proof, verification samples, byte size, and SHA-256 digest. JSON is sorted, compact, UTF-8, and newline-terminated.
+The directory UUID must equal the manifest's dataset UUID. Parquet is the typed default. CSV uses canonical decimal integers and UTF-8 strings; `manifest.json` is its type authority. The unversioned manifest records the tool version, request, resolved range, ordered schema and units, acquisition plan, chain identity, non-secret provider profile names, finality proof, verification samples, byte size, and SHA-256 digest. JSON is sorted, compact, UTF-8, and newline-terminated. [The dataset contract](docs/contract.md) defines every manifest key, every column, the error codes, and what the checks prove.
 
-Work is checkpointed under a hidden directory. Complete chunks are digest-bound and validated before reuse. The fully assembled candidate is validated, synced, and atomically renamed without replacement; existing destinations are never overwritten.
+Work is checkpointed under a hidden directory. Complete chunks are digest-bound and validated before reuse. Checkpoints are an internal format, so finish or delete an interrupted download before upgrading Blockweaver. The fully assembled candidate is validated, synced, and atomically renamed without replacement; existing destinations are never overwritten.
 
 Python consumers use the same strict local validator as `verify`:
 
@@ -81,7 +83,7 @@ Local verification is strict and needs no provider:
 blockweaver verify ./downloads/11111111-1111-4111-8111-111111111111
 ```
 
-RPC verification uses a configured profile or a direct URL. It checks deterministic samples and refreshes the stored finality proof. `--full-rpc` checks every row in bounded chunks, including ancestry across chunk boundaries.
+RPC verification uses a configured profile or a direct URL. It checks that the provider holds the dataset's last block hash, has finalized at or past the stored anchor, still holds the anchor block, and returns the same rows for up to five deterministic samples. The cost is a fixed handful of requests, however far the chain has moved since publication. `--full-rpc` checks every row in bounded chunks, including parent links across chunk boundaries.
 
 ```console
 blockweaver verify DATASET --provider verifier
@@ -92,7 +94,7 @@ RPC-only tuning requires `--provider` or `--rpc-url`. An explicit `--config` req
 
 Progress and errors are JSON Lines on stderr. Errors include stable `code` and `message` fields. Success is one JSON receipt on stdout. URLs and environment values are excluded from manifests, receipts, and intentional logs.
 
-Providers must implement EVM JSON-RPC batch requests, historical `eth_getBlockByNumber`, the configured `finalized` or `safe` tag, and `eth_feeHistory` when priority-fee features are selected. Independent verification consumes quota. Blockweaver checks provider agreement, numbered ancestry to the tagged anchor, a numbered anchor reread, and deterministic row samples; this is strong operational verification, not a trustless consensus client.
+Providers must implement EVM JSON-RPC batch requests, historical `eth_getBlockByNumber`, the configured `finalized` or `safe` tag, and `eth_feeHistory` when priority-fee features are selected. A request that times out, is rate limited, or fails on the server is retried whole, up to ten attempts, with exponential backoff capped at 30 seconds; a `Retry-After` header is honoured up to 60 seconds. A batch the provider refuses as too large is split, and the smaller size is kept for the rest of the run, so `batch_size` may exceed a provider's limit. A provider that has never answered fails after three attempts. Errors name the provider profile and the method, never the URL. Independent verification consumes quota. Blockweaver checks that both providers agree on the last block's hash, that the verifier has finalized it, and that up to five deterministic rows match the verifier. Rows inside a download are hash-linked to each other. Blockweaver does not recompute block hashes and does not read the headers between the range and the finalized head, so this is operational verification by two independent providers, not a trustless consensus client.
 
 ## BigQuery source
 
@@ -112,9 +114,11 @@ Select it globally with `defaults.source = "bigquery"` or per request:
 blockweaver download --source bigquery --from-block 1000000 --to-block 1000999
 ```
 
-The same ranges, features, formats, resume state, receipts, and two-file artifacts apply to both sources. Time ranges are resolved against the configured verifier RPC before BigQuery planning. Blockweaver reads the required `blocks`, `transactions`, and `receipts` schemas, rejects unavailable selected features, then performs a dry run and checks its result schema and estimated bytes. Only then does it execute the fixed whitelisted query with `maximum_bytes_billed` enforced again by BigQuery. Results stream through bounded pages into the normal checkpoints.
+The same ranges, formats, resume state, receipts, and two-file artifacts apply to both sources. Every typed feature is available from both. Raw `header.<key>` columns are refused for BigQuery before any network call. Time ranges are resolved against the configured verifier RPC before BigQuery planning. Blockweaver reads the required `blocks`, `transactions`, and `receipts` schemas, rejects unavailable selected features, then performs a dry run and checks its result schema and estimated bytes. Only then does it execute the fixed whitelisted query with `maximum_bytes_billed` enforced again by BigQuery. Results stream through bounded pages into the normal checkpoints. The dry run happens on every run that writes a manifest, including one resumed after its last checkpoint.
 
-BigQuery rows are not trusted as chain truth. The verifier RPC checks chain ID, resolved edges, target hash, deterministic row samples, numbered ancestry, and a reread finalized or safe anchor before publication. The manifest records the dataset identifier and verifier profile, never the billing project, environment value, credentials, or SQL text. The configured dataset must expose the recognized common Google Blockchain Analytics schema; arbitrary SQL and field mappings are not supported.
+Priority-fee percentiles follow the execution client's `eth_feeHistory` rule: the first transaction, by ascending effective priority fee, whose running gas reaches `floor(gas_used * p / 100)`. Receipts act as a second witness. A block fails the download, instead of receiving a value, when its receipts do not add up to its gas used, when its transaction and receipt counts differ, when it reports gas used and has no transaction rows, or when its base fee or a receipt price is missing. `tx_count` therefore reads both the `transactions` and the `receipts` table.
+
+BigQuery rows are not trusted as chain truth. The verifier RPC checks chain ID, resolved edges, target hash, finality at or past the target, the recorded anchor, and deterministic row samples before publication. The manifest records the dataset identifier and verifier profile, never the billing project, environment value, credentials, or SQL text. The configured dataset must expose the recognized common Google Blockchain Analytics schema; arbitrary SQL and field mappings are not supported.
 
 For development:
 

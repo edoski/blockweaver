@@ -14,18 +14,20 @@ from uuid import UUID, uuid4
 import typer
 from typer.core import TyperGroup
 
-from ._contract import (
-    FEATURES,
-    BlockweaverError,
+from ._config import (
+    DEFAULT_BATCH_SIZE,
+    DEFAULT_CONCURRENCY,
+    DEFAULT_TIMEOUT,
     Provider,
     available_sources,
     load_config,
     resolve_download_request,
     selected_config_path,
 )
-from ._corpus import Publication
-from ._sources import download as download_dataset
-from ._sources import verify_dataset
+from ._contract import FEATURES, BlockweaverError, raw_header_document
+from ._download import download as download_dataset
+from ._proof import verify_dataset
+from ._work import Publication, fsync_directory
 
 
 class _UsageFailure(Protocol):
@@ -35,7 +37,7 @@ class _UsageFailure(Protocol):
 
 
 _USAGE_ERROR = cast(type[Exception], typer.BadParameter.__base__)
-_EXAMPLE_CONFIG = """[defaults]
+_EXAMPLE_CONFIG = f"""[defaults]
 chain = "local"
 source = "rpc"
 provider = "primary"
@@ -51,15 +53,15 @@ finality_tag = "finalized"
 
 [providers.primary]
 url_env = "BLOCKWEAVER_PRIMARY_RPC_URL"
-batch_size = 20
-concurrency = 6
-timeout = 30
+batch_size = {DEFAULT_BATCH_SIZE}
+concurrency = {DEFAULT_CONCURRENCY}
+timeout = {DEFAULT_TIMEOUT}
 
 [providers.verifier]
 url_env = "BLOCKWEAVER_VERIFIER_RPC_URL"
-batch_size = 20
-concurrency = 6
-timeout = 30
+batch_size = {DEFAULT_BATCH_SIZE}
+concurrency = {DEFAULT_CONCURRENCY}
+timeout = {DEFAULT_TIMEOUT}
 
 # [bigquery]
 # project_env = "GOOGLE_CLOUD_PROJECT"
@@ -103,7 +105,7 @@ def init(config: ConfigPath = None) -> None:
         except BaseException:
             path.unlink(missing_ok=True)
             raise
-        _sync_directory(path.parent)
+        fsync_directory(path.parent)
         _output({"operation": "init", "path": str(path)})
     except FileExistsError:
         _abort(BlockweaverError("CONFIG_EXISTS", f"Configuration already exists: {path}"))
@@ -151,6 +153,7 @@ def features(
                 "available_sources": list(sources),
                 "mandatory": {"name": "block_number", "type": "Int64", "unit": "block"},
                 "features": [feature.document() for feature in FEATURES],
+                "patterns": [raw_header_document()],
             }
         )
     except BlockweaverError as error:
@@ -239,9 +242,9 @@ def verify(
             selected_provider = Provider(
                 "cli",
                 rpc_url,
-                batch_size if batch_size is not None else 20,
-                concurrency if concurrency is not None else 6,
-                timeout if timeout is not None else 30,
+                batch_size if batch_size is not None else DEFAULT_BATCH_SIZE,
+                concurrency if concurrency is not None else DEFAULT_CONCURRENCY,
+                timeout if timeout is not None else DEFAULT_TIMEOUT,
             )
         if selected_provider is not None:
             secrets.append(selected_provider.url)
@@ -301,11 +304,3 @@ def _redact(message: str, secrets: list[str]) -> str:
         if secret:
             message = message.replace(secret, "<redacted>")
     return message
-
-
-def _sync_directory(path: Path) -> None:
-    descriptor = os.open(path, os.O_RDONLY)
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
