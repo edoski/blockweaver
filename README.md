@@ -62,9 +62,9 @@ ROOT/<uuid4>/
   blocks.parquet | blocks.csv
 ```
 
-The directory UUID must equal the manifest's dataset UUID. Parquet is the typed default. CSV uses canonical decimal integers and UTF-8 strings; `manifest.json` is its type authority. The unversioned manifest records the tool version, request, resolved range, ordered schema and units, acquisition plan, chain identity, non-secret provider profile names, finality proof, verification samples, byte size, and SHA-256 digest. JSON is sorted, compact, UTF-8, and newline-terminated.
+The directory UUID must equal the manifest's dataset UUID. Parquet is the typed default. CSV uses canonical decimal integers and UTF-8 strings; `manifest.json` is its type authority. The unversioned manifest records the tool version, request, resolved range, ordered schema and units, acquisition plan, chain identity, non-secret provider profile names, finality proof, verification samples, byte size, and SHA-256 digest. JSON is sorted, compact, UTF-8, and newline-terminated. [The dataset contract](docs/contract.md) defines every manifest key, every column, the error codes, and what the checks prove.
 
-Work is checkpointed under a hidden directory. Complete chunks are digest-bound and validated before reuse. The fully assembled candidate is validated, synced, and atomically renamed without replacement; existing destinations are never overwritten.
+Work is checkpointed under a hidden directory. Complete chunks are digest-bound and validated before reuse. Checkpoints are an internal format, so finish or delete an interrupted download before upgrading Blockweaver. The fully assembled candidate is validated, synced, and atomically renamed without replacement; existing destinations are never overwritten.
 
 Python consumers use the same strict local validator as `verify`:
 

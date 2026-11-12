@@ -110,7 +110,7 @@ def compile_bigquery(dataset: str, plan: Plan) -> BigQueryPlan:
                 for name, percentile in percentiles
             )
             projections.extend(["b.gas_used AS _block_gas_used", "COALESCE(r.receipt_gas_used, 0) AS _receipt_gas_used"])
-            checks.append(("_receipt_gas_used", "_block_gas_used", "receipts are incomplete"))
+            checks.append(("_receipt_gas_used", "_block_gas_used", "receipt gas does not add up to the gas used"))
         fields = sorted(set(tables["receipts"]) - {"block_timestamp"})
         ctes.extend(
             [
