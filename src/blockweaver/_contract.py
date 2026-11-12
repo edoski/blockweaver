@@ -19,10 +19,13 @@ OutputFormat = Literal["parquet", "csv"]
 Source = Literal["rpc", "bigquery"]
 Value = int | str
 
-_INT64_MAX = 2**63 - 1
+INT64_MAX = 2**63 - 1
+DEFAULT_BATCH_SIZE = 20
+DEFAULT_CONCURRENCY = 6
+DEFAULT_TIMEOUT = 30
 _QUANTITY = re.compile(r"0x(?:0|[1-9a-f][0-9a-f]*)\Z")
-_HASH = re.compile(r"0x[0-9a-f]{64}\Z")
-_NAME = re.compile(r"[a-z0-9][a-z0-9_-]*\Z")
+HASH = re.compile(r"0x[0-9a-f]{64}\Z")
+NAME = re.compile(r"[a-z0-9][a-z0-9_-]*\Z")
 _ENV = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 _DATE = re.compile(r"\d{4}-\d{2}-\d{2}\Z")
 _DATETIME = re.compile(r"(\d{4}-\d{2}-\d{2})T(\d{2})(?::(\d{2})(?::(\d{2}))?)?(Z|[+-]\d{2}:\d{2})\Z")
@@ -164,15 +167,13 @@ class Plan:
             *({"name": feature.name, "type": feature.dtype, "unit": feature.unit} for feature in self.features),
         ]
 
-    def document(self, source: Source = "rpc") -> dict[str, object]:
-        return _rpc_plan_document(self) if source == "rpc" else self._bigquery_requirements.document()
-
-
-def _rpc_plan_document(plan: Plan) -> dict[str, object]:
-    families: list[dict[str, object]] = [{"family": "header", "method": "eth_getBlockByNumber", "fields": list(plan.header_fields)}]
-    if plan.percentiles:
-        families.append({"family": "fee_history", "method": "eth_feeHistory", "reward_percentiles": list(plan.percentiles)})
-    return {"families": families}
+    def document(self, source: Source) -> dict[str, object]:
+        if source == "bigquery":
+            return self._bigquery_requirements.document()
+        families: list[dict[str, object]] = [{"family": "header", "method": "eth_getBlockByNumber", "fields": list(self.header_fields)}]
+        if self.percentiles:
+            families.append({"family": "fee_history", "method": "eth_feeHistory", "reward_percentiles": list(self.percentiles)})
+        return {"families": families}
 
 
 def _bigquery_requirements(features: tuple[Feature, ...], percentiles: tuple[int, ...]) -> _BigQueryRequirements:
@@ -226,7 +227,7 @@ def validate_manifest_source(value: object) -> Source:
     source = value.get("type")
     if source == "rpc":
         if set(value) != {"type", "provider", "verifier"} or any(
-            not isinstance(value[field], str) or _NAME.fullmatch(value[field]) is None for field in ("provider", "verifier")
+            not isinstance(value[field], str) or NAME.fullmatch(value[field]) is None for field in ("provider", "verifier")
         ):
             raise ValueError("Invalid manifest source")
         return "rpc"
@@ -235,7 +236,7 @@ def validate_manifest_source(value: object) -> Source:
             set(value) != {"type", "dataset", "verifier"}
             or not isinstance(value["dataset"], str)
             or not isinstance(value["verifier"], str)
-            or _NAME.fullmatch(value["verifier"]) is None
+            or NAME.fullmatch(value["verifier"]) is None
         ):
             raise ValueError("Invalid manifest source")
         validate_dataset_identifier(value["dataset"])
@@ -440,7 +441,7 @@ def load_config(path: Path) -> Config:
         plan = plan_features(feature_values)
         defaults = Defaults(
             _name(defaults_raw["chain"], "defaults.chain"),
-            source,  # type: ignore[arg-type]
+            source,
             _name(defaults_raw["provider"], "defaults.provider") if "provider" in defaults_raw else None,
             _name(defaults_raw["verifier"], "defaults.verifier"),
             Path(_string(defaults_raw["output_root"], "defaults.output_root")).expanduser(),
@@ -514,9 +515,9 @@ def _parse_providers(value: object) -> dict[str, ProviderSpec]:
         providers[name] = ProviderSpec(
             url,
             url_env,
-            _integer(item.get("batch_size", 20), f"providers.{name}.batch_size"),
-            _integer(item.get("concurrency", 6), f"providers.{name}.concurrency"),
-            _number(item.get("timeout", 30), f"providers.{name}.timeout"),
+            _integer(item.get("batch_size", DEFAULT_BATCH_SIZE), f"providers.{name}.batch_size"),
+            _integer(item.get("concurrency", DEFAULT_CONCURRENCY), f"providers.{name}.concurrency"),
+            _number(item.get("timeout", DEFAULT_TIMEOUT), f"providers.{name}.timeout"),
         )
     return providers
 
@@ -592,7 +593,7 @@ def requested_range(
     if block_used:
         if from_block is None or to_block is None:
             raise BlockweaverError("RANGE_INVALID", "Both --from-block and --to-block are required")
-        if from_block < 0 or to_block < 0 or from_block > _INT64_MAX or to_block > _INT64_MAX:
+        if from_block < 0 or to_block < 0 or from_block > INT64_MAX or to_block > INT64_MAX:
             raise BlockweaverError("RANGE_INVALID", "Block bounds must be signed Int64 nonnegative integers")
         if from_block > to_block:
             raise BlockweaverError("RANGE_INVALID", "Range start must not exceed range end")
@@ -761,7 +762,7 @@ def parse_time(value: str, *, end: bool) -> int:
             parsed += {"date": timedelta(days=1), "hour": timedelta(hours=1), "minute": timedelta(minutes=1), "second": timedelta(seconds=1)}[precision]
             parsed -= timedelta(seconds=1)
         timestamp = int(parsed.timestamp())
-        if timestamp < 0 or timestamp > _INT64_MAX:
+        if timestamp < 0 or timestamp > INT64_MAX:
             raise ValueError
         return timestamp
     except (OverflowError, ValueError):
@@ -814,13 +815,13 @@ def quantity(value: Any, label: str) -> int:
     if not isinstance(value, str) or _QUANTITY.fullmatch(value) is None:
         raise ValueError(f"Invalid {label} quantity")
     parsed = int(value, 16)
-    if parsed > _INT64_MAX:
+    if parsed > INT64_MAX:
         raise ValueError(f"{label} quantity exceeds signed Int64")
     return parsed
 
 
 def block_hash(value: Any, label: str) -> str:
-    if not isinstance(value, str) or _HASH.fullmatch(value) is None:
+    if not isinstance(value, str) or HASH.fullmatch(value) is None:
         raise ValueError(f"Invalid {label}")
     return value
 
@@ -905,13 +906,13 @@ def _string(value: object, label: str) -> str:
 
 def _name(value: object, label: str) -> str:
     parsed = _string(value, label)
-    if _NAME.fullmatch(parsed) is None:
+    if NAME.fullmatch(parsed) is None:
         raise ValueError(f"{label} must contain lowercase letters, digits, underscores, or hyphens")
     return parsed
 
 
 def _positive_int(value: object, label: str) -> int:
-    if type(value) is not int or value <= 0 or value > _INT64_MAX:
+    if type(value) is not int or value <= 0 or value > INT64_MAX:
         raise ValueError(f"{label} must be a positive signed Int64 integer")
     return value
 

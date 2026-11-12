@@ -19,6 +19,7 @@ import aiohttp
 
 from . import __version__
 from ._contract import (
+    INT64_MAX,
     Anchor,
     BigQueryDownloadRequest,
     BlockweaverError,
@@ -137,8 +138,6 @@ def compile_bigquery(dataset: str, plan: Plan) -> BigQueryPlan:
         "_proof_hash": "STRING",
         "_proof_parent_hash": "STRING",
     }
-    if gas_domain_proof:
-        block_fields.update({"gas_used": "INTEGER", "gas_limit": "INTEGER"})
     tables = {"blocks": block_fields}
     ctes = [
         "requested_blocks AS (\n"
@@ -420,7 +419,6 @@ def _parse_fee_history(value: Any, first_block: int, count: int, percentiles: tu
 
 
 Progress = Callable[[dict[str, object]], None]
-SourceOperation = Callable[[ArtifactSource], Awaitable[dict[str, object]]]
 
 
 class RpcSource:
@@ -438,10 +436,6 @@ class RpcSource:
         self.verifier = verifier
         self.resolved = resolved
         self._verification = {"primary_chain_id": primary_chain_id, "verifier_chain_id": verifier_chain_id}
-
-    @property
-    def chunk_size(self) -> int:
-        return CHUNK_SIZE
 
     async def chunks(self, first: int, last: int) -> AsyncIterator[tuple[list[Header], list[dict[str, Value]]]]:
         while first <= last:
@@ -479,10 +473,6 @@ class BigQuerySource:
         self.verifier_chain_id = verifier_chain_id
         self.progress = progress
         self.dry_run_bytes = 0
-
-    @property
-    def chunk_size(self) -> int:
-        return CHUNK_SIZE
 
     async def chunks(self, first: int, last: int) -> AsyncIterator[tuple[list[Header], list[dict[str, Value]]]]:
         if first > last:
@@ -533,20 +523,16 @@ class BigQuerySource:
 
 async def download(request: DownloadRequest, *, progress: Progress, publication: Publication) -> dict[str, object]:
     progress({"event": "request", "dataset_id": str(request.dataset_id)})
-    return await acquire(
-        request,
-        progress,
-        lambda source: materialize_artifact(request, source, tool_version=__version__, progress=progress, publication=publication),
-    )
-
-
-async def acquire(request: DownloadRequest, progress: Progress, operation: SourceOperation) -> dict[str, object]:
     if isinstance(request, RpcDownloadRequest):
-        return await _acquire_rpc(request, operation)
-    return await _acquire_bigquery(request, progress, operation)
+        return await _download_rpc(request, progress, publication)
+    return await _download_bigquery(request, progress, publication)
 
 
-async def _acquire_rpc(request: RpcDownloadRequest, operation: SourceOperation) -> dict[str, object]:
+async def _materialize(request: DownloadRequest, source: ArtifactSource, progress: Progress, publication: Publication) -> dict[str, object]:
+    return await materialize_artifact(request, source, tool_version=__version__, chunk_size=CHUNK_SIZE, progress=progress, publication=publication)
+
+
+async def _download_rpc(request: RpcDownloadRequest, progress: Progress, publication: Publication) -> dict[str, object]:
     try:
         async with _rpc(request.primary) as primary, _rpc(request.verifier) as verifier:
             primary_chain_id, verifier_chain_id = await _paired(primary.chain_id(), verifier.chain_id())
@@ -565,7 +551,8 @@ async def _acquire_rpc(request: RpcDownloadRequest, operation: SourceOperation) 
                     verifier_tag.block_number,
                     independent=True,
                 )
-            return await operation(RpcSource(request, primary, verifier, resolution.value, primary_chain_id, verifier_chain_id))
+            source = RpcSource(request, primary, verifier, resolution.value, primary_chain_id, verifier_chain_id)
+            return await _materialize(request, source, progress, publication)
     except BlockweaverError:
         raise
     except ValueError as error:
@@ -576,7 +563,7 @@ async def _acquire_rpc(request: RpcDownloadRequest, operation: SourceOperation) 
         raise BlockweaverError("IO_FAILED", str(error)) from None
 
 
-async def _acquire_bigquery(request: BigQueryDownloadRequest, progress: Progress, operation: SourceOperation) -> dict[str, object]:
+async def _download_bigquery(request: BigQueryDownloadRequest, progress: Progress, publication: Publication) -> dict[str, object]:
     try:
         warehouse = open_bigquery(request.bigquery.project)
         async with _rpc(request.verifier) as verifier:
@@ -593,7 +580,8 @@ async def _acquire_bigquery(request: BigQueryDownloadRequest, progress: Progress
                     tagged.block_number,
                     independent=False,
                 )
-            return await operation(BigQuerySource(request, verifier, warehouse, resolution.value, verifier_chain_id, progress))
+            source = BigQuerySource(request, verifier, warehouse, resolution.value, verifier_chain_id, progress)
+            return await _materialize(request, source, progress, publication)
     except BlockweaverError:
         raise
     except ValueError as error:
@@ -930,6 +918,6 @@ def _parse_bigquery_row(value: Mapping[str, object], schema: dict[str, str], pla
 
 
 def _bigquery_int(value: object, label: str) -> int:
-    if type(value) is not int or value < 0 or value > 2**63 - 1:
+    if type(value) is not int or value < 0 or value > INT64_MAX:
         raise BlockweaverError("BIGQUERY_INVALID", f"BigQuery returned an invalid {label}")
     return value

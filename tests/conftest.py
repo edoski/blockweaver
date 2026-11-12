@@ -24,7 +24,6 @@ class ChainServer:
         self.request_counts: dict[int, int] = {}
         self.http_failures = 0
         self.retry_after = "0"
-        self.omit_counts: dict[int, int] = {}
         self.changes: dict[int, dict[str, Any]] = {}
         self.tag_changes: dict[str, Any] = {}
         self.fee_history_changes: dict[str, Any] = {}
@@ -74,9 +73,6 @@ class ChainServer:
                         selector = params[0]
                         number = state.finalized if selector in {"finalized", "safe"} else int(selector, 16)
                         state.request_counts[number] = state.request_counts.get(number, 0) + 1
-                        if state.omit_counts.get(number, 0):
-                            state.omit_counts[number] -= 1
-                            continue
                         result = state.block(number)
                         if selector in {"finalized", "safe"}:
                             result.update(state.tag_changes)
@@ -95,7 +91,7 @@ class ChainServer:
                 del format, args
 
         self._server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+        self._thread = threading.Thread(target=self._server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
 
     @property
     def url(self) -> str:

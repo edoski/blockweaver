@@ -24,6 +24,8 @@ from uuid import UUID
 import polars as pl
 
 from ._contract import (
+    HASH,
+    NAME,
     Anchor,
     BlockweaverError,
     DownloadRequest,
@@ -39,9 +41,7 @@ from ._contract import (
 )
 
 _CHUNK = re.compile(r"(\d{20})-(\d{20})-([0-9a-f]{64})\.parquet\Z")
-_HASH = re.compile(r"0x[0-9a-f]{64}\Z")
 _DECIMAL = re.compile(r"0|[1-9][0-9]*\Z")
-_NAME = re.compile(r"[a-z0-9][a-z0-9_-]*\Z")
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _MANIFEST_KEYS = {
     "tool_version",
@@ -74,9 +74,6 @@ class VerifiedProof:
 class ArtifactSource(Protocol):
     resolved: ResolvedRange
 
-    @property
-    def chunk_size(self) -> int: ...
-
     def chunks(self, first: int, last: int) -> AsyncIterator[tuple[list[Header], list[dict[str, Value]]]]: ...
 
     async def prove(self, target: Header) -> VerifiedProof: ...
@@ -104,7 +101,6 @@ class ArtifactState:
     source: dict[str, object]
     requested_range: dict[str, object]
     resolved_range: dict[str, int]
-    verification: dict[str, object]
     fingerprints: PairFingerprint
 
 
@@ -285,7 +281,7 @@ class CheckpointSet:
                 raise BlockweaverError("RESUME_INVALID", f"Unexpected checkpoint file: {path.name}")
             parsed.append((int(match.group(1)), int(match.group(2)), match.group(3), path))
         for first, last, digest, path in sorted(parsed):
-            checkpoints._append(_read_checkpoint(path, identity.plan, digest), first, last)
+            checkpoints._append(_read_checkpoint(path, identity.plan, first, last, digest))
         return checkpoints
 
     def write(self, headers: list[Header], rows: list[dict[str, Value]]) -> Checkpoint:
@@ -295,12 +291,12 @@ class CheckpointSet:
             raise ValueError("Source did not return a deterministic complete chunk")
         validate_links(headers, self.previous)
         checkpoint = _write_checkpoint(self.chunks, first, last, self.identity.plan, headers, rows)
-        self._append(checkpoint, first, last)
+        self._append(checkpoint)
         return checkpoint
 
-    def _append(self, checkpoint: Checkpoint, first: int, last: int) -> None:
+    def _append(self, checkpoint: Checkpoint) -> None:
         expected_last = min(self.next_block + self.size - 1, self.identity.resolved_range["to_block"])
-        if (first, last) != (self.next_block, expected_last) or (checkpoint.first, checkpoint.last) != (first, last):
+        if (checkpoint.first, checkpoint.last) != (self.next_block, expected_last):
             raise BlockweaverError("RESUME_INVALID", "Checkpoints are not a deterministic complete prefix")
         try:
             validate_links([checkpoint.first_header], self.previous)
@@ -308,7 +304,7 @@ class CheckpointSet:
             raise BlockweaverError("RESUME_INVALID", str(error)) from None
         self.items.append(checkpoint)
         self.previous = checkpoint.last_header
-        self.next_block = last + 1
+        self.next_block = checkpoint.last + 1
 
     def reseal(self) -> None:
         for checkpoint in self.items:
@@ -409,7 +405,7 @@ def _prepare_work(hidden: Path, identity: ArtifactIdentity, size: int, *, recove
         shutil.rmtree(path) if path.is_dir() else path.unlink()
     chunks.mkdir()
     _write_json(binding_path, expected_binding)
-    _fsync_directory(hidden)
+    fsync_directory(hidden)
     return Recovery("checkpointing", CheckpointSet(chunks, identity, size))
 
 
@@ -439,24 +435,20 @@ def _write_checkpoint(chunks: Path, first: int, last: int, plan: Plan, headers: 
         digest = file_hash(temporary)
         path = chunks / f"{first:020d}-{last:020d}-{digest}.parquet"
         os.replace(temporary, path)
-        _fsync_directory(chunks)
+        fsync_directory(chunks)
         return Checkpoint(path, first, last, digest, headers[0], headers[-1])
     finally:
         temporary.unlink(missing_ok=True)
 
 
-def _read_checkpoint(path: Path, plan: Plan, digest: str) -> Checkpoint:
+def _read_checkpoint(path: Path, plan: Plan, first: int, last: int, digest: str) -> Checkpoint:
     try:
-        match = _CHUNK.fullmatch(path.name)
-        if match is None or match.group(3) != digest:
-            raise ValueError
         if file_hash(path) != digest:
             raise ValueError
         frame = pl.read_parquet(path)
         proof_columns = ["_proof_hash", "_proof_parent_hash", "_proof_timestamp"]
         if frame.schema != checkpoint_schema(plan) or frame.is_empty() or frame.select(proof_columns).null_count().row(0) != (0,) * len(proof_columns):
             raise ValueError
-        first, last = int(match.group(1)), int(match.group(2))
         _validate_rows(frame.select(plan.columns).lazy(), plan, first=first, last=last)
         for row in frame.iter_rows(named=True):
             if "timestamp" in plan.columns and row["timestamp"] != row["_proof_timestamp"]:
@@ -468,7 +460,7 @@ def _read_checkpoint(path: Path, plan: Plan, digest: str) -> Checkpoint:
         headers = [
             Header(row["block_number"], row["_proof_hash"], row["_proof_parent_hash"], row["_proof_timestamp"], {}) for row in frame.iter_rows(named=True)
         ]
-        if any(_HASH.fullmatch(value) is None for header in headers for value in (header.block_hash, header.parent_hash)):
+        if any(HASH.fullmatch(value) is None for header in headers for value in (header.block_hash, header.parent_hash)):
             raise ValueError
         validate_links(headers)
         return Checkpoint(path, first, last, digest, headers[0], headers[-1])
@@ -503,7 +495,7 @@ def _write_candidate(
         "sha256": file_hash(data_path),
     }
     _write_json(candidate / "manifest.json", {**manifest, "completed_at": _completion_time(), "output": output})
-    _fsync_directory(candidate)
+    fsync_directory(candidate)
     return _open_dataset(candidate, work=True)
 
 
@@ -512,6 +504,7 @@ async def materialize_artifact(
     source: ArtifactSource,
     *,
     tool_version: str,
+    chunk_size: int,
     progress: Progress,
     publication: Publication,
 ) -> dict[str, object]:
@@ -520,7 +513,7 @@ async def materialize_artifact(
     identity = ArtifactIdentity.from_request(request, source.resolved)
     with _locked_work(identity) as lock:
         hidden = lock.path
-        recovery = _prepare_work(hidden, identity, source.chunk_size, recoverable=lock.recoverable)
+        recovery = _prepare_work(hidden, identity, chunk_size, recoverable=lock.recoverable)
         recovered = recovery.kind != "checkpointing" or bool(recovery.checkpoints and recovery.checkpoints.items)
         if recovery.kind == "committed":
             assert recovery.dataset is not None
@@ -629,7 +622,7 @@ def _read_dataset(path: Path, *, work: bool) -> Dataset:
         raise ValueError("Invalid tool version")
     dataset_id = _canonical_uuid(manifest["dataset_id"])
     chain = _exact_table(manifest["chain"], {"name", "chain_id"}, "chain")
-    if not isinstance(chain["name"], str) or _NAME.fullmatch(chain["name"]) is None or type(chain["chain_id"]) is not int or chain["chain_id"] <= 0:
+    if not isinstance(chain["name"], str) or NAME.fullmatch(chain["name"]) is None or type(chain["chain_id"]) is not int or chain["chain_id"] <= 0:
         raise ValueError("Invalid manifest chain")
     source_value = manifest["source"]
     source = validate_manifest_source(source_value)
@@ -696,9 +689,9 @@ def _read_dataset(path: Path, *, work: bool) -> Dataset:
     anchor = _exact_table(manifest["finalized_anchor"], {"block_number", "block_hash", "tag"}, "finalized anchor")
     if type(anchor["block_number"]) is not int or anchor["block_number"] < resolved["to_block"]:
         raise ValueError("Finalized anchor does not cover the dataset")
-    if _HASH.fullmatch(anchor["block_hash"]) is None or anchor["tag"] not in {"finalized", "safe"}:
+    if HASH.fullmatch(anchor["block_hash"]) is None or anchor["tag"] not in {"finalized", "safe"}:
         raise ValueError("Invalid finalized anchor")
-    if not isinstance(manifest["target_hash"], str) or _HASH.fullmatch(manifest["target_hash"]) is None:
+    if not isinstance(manifest["target_hash"], str) or HASH.fullmatch(manifest["target_hash"]) is None:
         raise ValueError("Invalid target hash")
     verification = validate_verification(manifest["verification"], chain["chain_id"], source)
     samples = verification["sampled_blocks"]
@@ -731,7 +724,6 @@ def _read_dataset(path: Path, *, work: bool) -> Dataset:
         source_value,
         requested,
         resolved,
-        verification,
         fingerprint,
     )
     return _make_dataset(
@@ -857,7 +849,7 @@ def _stage_candidate(hidden: Path, candidate: Path) -> None:
     ready = hidden / "ready"
     if candidate != ready:
         os.rename(candidate, ready)
-    _fsync_directory(hidden)
+    fsync_directory(hidden)
 
 
 def _publish(hidden: Path, destination: Path) -> None:
@@ -867,10 +859,10 @@ def _publish(hidden: Path, destination: Path) -> None:
         raise BlockweaverError("PUBLICATION_FAILED", "Candidate does not contain exactly the canonical artifact pair")
     for path in files:
         _sync_final_file(path)
-    _fsync_directory(ready)
+    fsync_directory(ready)
     _rename_no_replace(ready, destination)
-    _fsync_directory(destination.parent)
-    _fsync_directory(hidden)
+    fsync_directory(destination.parent)
+    fsync_directory(hidden)
 
 
 def _discard_work(lock: WorkLock) -> None:
@@ -881,7 +873,7 @@ def _discard_work(lock: WorkLock) -> None:
         shutil.rmtree(lock.path)
     except FileNotFoundError:
         raise BlockweaverError("PUBLICATION_FAILED", "Work directory disappeared before cleanup") from None
-    _fsync_directory(root)
+    fsync_directory(root)
 
 
 def _fingerprint_pair(path: Path, data_name: str) -> PairFingerprint:
@@ -976,7 +968,7 @@ def _sync_final_file(path: Path) -> None:
             raise OSError(errno.ENOTSUP, "Durable artifact publication is unavailable")
 
 
-def _fsync_directory(path: Path) -> None:
+def fsync_directory(path: Path) -> None:
     descriptor = os.open(path, os.O_RDONLY)
     try:
         os.fsync(descriptor)

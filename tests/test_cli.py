@@ -22,8 +22,6 @@ from typer.testing import CliRunner
 from blockweaver import BlockweaverError, Dataset, _corpus, _sources, open_dataset
 from blockweaver import cli as cli_module
 from blockweaver._contract import (
-    BigQueryDownloadRequest,
-    BigQuerySettings,
     Chain,
     Provider,
     RpcDownloadRequest,
@@ -616,11 +614,8 @@ def test_paired_provider_failure_cancels_and_awaits_sibling(
     monkeypatch.setattr(_sources.Rpc, "chain_id", chain_id)
 
     async def exercise() -> tuple[bool, int]:
-        async def unused(_source: _corpus.ArtifactSource) -> dict[str, object]:
-            raise AssertionError("acquisition continued after provider failure")
-
         with pytest.raises(BlockweaverError, match="primary failed"):
-            await _sources.acquire(request, lambda _event: None, unused)
+            await _sources.download(request, progress=lambda _event: None, publication=lambda _phase: None)
         current = asyncio.current_task()
         pending = [task for task in asyncio.all_tasks() if task is not current and not task.done()]
         cancelled_before_cleanup = sibling_cancelled
@@ -632,48 +627,24 @@ def test_paired_provider_failure_cancels_and_awaits_sibling(
     assert asyncio.run(exercise()) == (True, 0)
 
 
-def test_range_resolution_reads_unique_boundaries_once(
+def test_download_reads_each_range_boundary_a_fixed_number_of_times(
     tmp_path: Path,
     chains: tuple[ChainServer, ChainServer],
+    make_config: Any,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     primary, verifier = chains
-    chain = Chain("test", 1, "finalized", None, None, BQ_DATASET)
-    rpc_request = RpcDownloadRequest(
-        dataset_id=UUID(DATASET_ID),
-        chain=chain,
-        requested_range=requested_range(10, 10, None, None),
-        plan=plan_features(["timestamp"]),
-        output_root=tmp_path,
-        output_format="parquet",
-        primary=Provider("primary", primary.url, 3, 2, 2),
-        verifier=Provider("verifier", verifier.url, 3, 2, 2),
-    )
-
-    async def stop_after_resolution(_source: _corpus.ArtifactSource) -> dict[str, object]:
-        return {}
-
-    asyncio.run(_sources.acquire(rpc_request, lambda _event: None, stop_after_resolution))
-    assert primary.request_counts[10] == 1
+    config = make_config(tmp_path / "rpc.toml", primary, verifier, output_root=tmp_path / "rpc", features=("timestamp",))
+    artifact_from(invoke(download_args(config, first=10, last=10)))
+    assert primary.request_counts[10] == 3, "one read each for resolution, acquisition and the candidate target"
 
     verifier.request_counts.clear()
-    verifier.requests.clear()
+    warehouse = bigquery_config(make_config, tmp_path / "bigquery.toml", primary, verifier, tmp_path / "bigquery", features=("timestamp",))
+    monkeypatch.setattr(_sources, "open_bigquery", lambda _project: FakeBigQuery(verifier))
     start = datetime.fromtimestamp(verifier.timestamp_base + 10, UTC).isoformat().replace("+00:00", "Z")
     end = datetime.fromtimestamp(verifier.timestamp_base + 14, UTC).isoformat().replace("+00:00", "Z")
-    bigquery_request = BigQueryDownloadRequest(
-        dataset_id=UUID(DATASET_ID),
-        chain=chain,
-        requested_range=requested_range(None, None, start, end),
-        plan=plan_features(["timestamp"]),
-        output_root=tmp_path,
-        output_format="parquet",
-        dataset=BQ_DATASET,
-        bigquery=BigQuerySettings("billing-project", 1000),
-        verifier=Provider("verifier", verifier.url, 3, 2, 2),
-    )
-    monkeypatch.setattr(_sources, "open_bigquery", lambda _project: FakeBigQuery(verifier))
-    asyncio.run(_sources.acquire(bigquery_request, lambda _event: None, stop_after_resolution))
-    assert {number: verifier.request_counts[number] for number in (10, 14)} == {10: 1, 14: 1}
+    artifact_from(invoke(["download", "--config", str(warehouse), "--id", DATASET_ID, "--from-time", start, "--to-time", end]))
+    assert {number: verifier.request_counts[number] for number in (10, 14)} == {10: 2, 14: 4}
 
 
 def test_time_range_csv_and_reduced_precision(tmp_path: Path, chains: tuple[ChainServer, ChainServer], make_config: Any) -> None:
@@ -1095,7 +1066,7 @@ def test_publication_syncs_both_rename_parents_then_root_after_cleanup(
     config = make_config(tmp_path / "config.toml", primary, verifier, output_root=output_root)
     synced: list[Path] = []
     final_files: list[str] = []
-    real_directory_sync = _corpus._fsync_directory
+    real_directory_sync = _corpus.fsync_directory
     real_file_sync = _corpus._sync_final_file
 
     def sync_directory(path: Path) -> None:
@@ -1106,7 +1077,7 @@ def test_publication_syncs_both_rename_parents_then_root_after_cleanup(
         final_files.append(path.name)
         real_file_sync(path)
 
-    monkeypatch.setattr(_corpus, "_fsync_directory", sync_directory)
+    monkeypatch.setattr(_corpus, "fsync_directory", sync_directory)
     monkeypatch.setattr(_corpus, "_sync_final_file", sync_file)
 
     artifact_from(invoke(download_args(config)))
