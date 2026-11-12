@@ -8,7 +8,7 @@ import polars as pl
 import pytest
 from support import ChainServer, artifact_from, block_hash, download_args, error, invoke
 
-from blockweaver import BlockweaverError, Dataset, _sources, open_dataset
+from blockweaver import BlockweaverError, _proof, open_dataset
 
 
 def test_verify_is_strict_locally_and_against_rpc(tmp_path: Path, chains: tuple[ChainServer, ChainServer], make_config: Any) -> None:
@@ -99,15 +99,15 @@ def test_rpc_verify_reseals_artifact_bytes_after_network_wait(
     primary, verifier = chains
     config = make_config(tmp_path / "config.toml", primary, verifier, output_root=tmp_path / "out")
     artifact = artifact_from(invoke(download_args(config)))
-    real_verify = _sources.verify_rpc
+    real_verify = _proof.verify_rpc
 
-    async def mutate_after_rpc(dataset: Dataset, provider: Any, full: bool) -> dict[str, object]:
-        result = await real_verify(dataset, provider, full)
-        with dataset.data_path.open("ab") as stream:
+    async def mutate_after_rpc(artifact: Any, provider: Any, full: bool) -> dict[str, object]:
+        result = await real_verify(artifact, provider, full)
+        with artifact.dataset.data_path.open("ab") as stream:
             stream.write(b"changed")
         return result
 
-    monkeypatch.setattr(_sources, "verify_rpc", mutate_after_rpc)
+    monkeypatch.setattr(_proof, "verify_rpc", mutate_after_rpc)
 
     result = invoke(["verify", str(artifact), "--config", str(config), "--provider", "verifier"])
 
@@ -129,7 +129,7 @@ def test_full_rpc_verification_is_chunked_and_checks_cross_chunk_ancestry(
         features=("effective_priority_fee_per_gas_p50",),
     )
     artifact = artifact_from(invoke(download_args(config, last=15)))
-    monkeypatch.setattr(_sources, "CHUNK_SIZE", 2)
+    monkeypatch.setattr(_proof, "CHUNK_SIZE", 2)
     verifier.requests.clear()
 
     verified = invoke(["verify", str(artifact), "--config", str(config), "--provider", "verifier", "--full-rpc"])

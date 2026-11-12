@@ -9,7 +9,7 @@ import polars as pl
 import pytest
 from support import ChainServer, artifact_from, block_hash, download_args, error, invoke
 
-from blockweaver import BlockweaverError, _corpus, open_dataset
+from blockweaver import BlockweaverError, _work, open_dataset
 
 
 @pytest.mark.parametrize(
@@ -94,7 +94,7 @@ def test_manifest_requires_canonical_json_and_completion_follows_data_assembly(
         observed = any(output_root.glob(".blockweaver-*/ready.tmp/blocks.parquet"))
         return "2026-08-10T12:00:00Z"
 
-    monkeypatch.setattr(_corpus, "_completion_time", completion_time)
+    monkeypatch.setattr(_work, "_completion_time", completion_time)
     artifact = artifact_from(invoke(download_args(config)))
     assert observed
     manifest_path = artifact / "manifest.json"

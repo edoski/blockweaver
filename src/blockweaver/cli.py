@@ -14,21 +14,20 @@ from uuid import UUID, uuid4
 import typer
 from typer.core import TyperGroup
 
-from ._contract import (
+from ._config import (
     DEFAULT_BATCH_SIZE,
     DEFAULT_CONCURRENCY,
     DEFAULT_TIMEOUT,
-    FEATURES,
-    BlockweaverError,
     Provider,
     available_sources,
     load_config,
     resolve_download_request,
     selected_config_path,
 )
-from ._corpus import Publication, fsync_directory
-from ._sources import download as download_dataset
-from ._sources import verify_dataset
+from ._contract import FEATURES, BlockweaverError
+from ._download import download as download_dataset
+from ._proof import verify_dataset
+from ._work import Publication, fsync_directory
 
 
 class _UsageFailure(Protocol):

@@ -22,7 +22,7 @@ from support import (
     invoke,
 )
 
-from blockweaver import _corpus, _sources, open_dataset
+from blockweaver import _bigquery, _download, _work, open_dataset
 
 P50 = "effective_priority_fee_per_gas_p50"
 P90 = "effective_priority_fee_per_gas_p90"
@@ -45,7 +45,7 @@ def test_bigquery_only_configuration_needs_no_unused_primary(
         include_primary=False,
     )
     warehouse = FakeBigQuery(verifier)
-    monkeypatch.setattr(_sources, "open_bigquery", lambda _project: warehouse)
+    monkeypatch.setattr(_download, "open_bigquery", lambda _project: warehouse)
     rejected = error(invoke([*download_args(config), "--provider", "verifier"]))
     assert rejected["code"] == "SOURCE_OPTION_INVALID"
     assert verifier.requests == [] and warehouse.calls == []
@@ -60,7 +60,7 @@ def test_bigquery_rejects_invalid_dataset_and_missing_optional_dependency(
     config = make_config(tmp_path / "config.toml", primary, verifier, output_root=tmp_path / "out", source="bigquery", dataset="bad.dataset;drop")
     assert error(invoke(["chains", "--config", str(config)]))["code"] == "CONFIG_INVALID"
     config = bigquery_config(make_config, tmp_path / "valid.toml", primary, verifier, tmp_path / "out")
-    monkeypatch.setattr(_sources, "import_module", Mock(side_effect=ModuleNotFoundError))
+    monkeypatch.setattr(_bigquery, "import_module", Mock(side_effect=ModuleNotFoundError))
     assert error(invoke(download_args(config)))["code"] == "SOURCE_DEPENDENCY_MISSING"
     assert primary.requests == verifier.requests == []
 
@@ -72,18 +72,18 @@ def test_bigquery_schema_and_cost_fail_before_billable_query(
     config = bigquery_config(make_config, tmp_path / "config.toml", primary, verifier, tmp_path / "out", features=(P50,))
     unavailable = FakeBigQuery(verifier)
     unavailable.execute("ALTER TABLE {receipts} DROP COLUMN effective_gas_price")
-    monkeypatch.setattr(_sources, "open_bigquery", lambda _project: unavailable)
+    monkeypatch.setattr(_download, "open_bigquery", lambda _project: unavailable)
     assert error(invoke(download_args(config)))["code"] == "SOURCE_FEATURE_UNAVAILABLE"
     assert "dry_run" not in unavailable.calls and "execute" not in unavailable.calls
 
     repeated = FakeBigQuery(verifier)
     repeated.execute("ALTER TABLE {receipts} ALTER effective_gas_price TYPE BIGINT[] USING [effective_gas_price]")
-    monkeypatch.setattr(_sources, "open_bigquery", lambda _project: repeated)
+    monkeypatch.setattr(_download, "open_bigquery", lambda _project: repeated)
     assert error(invoke(download_args(config, dataset_id="33333333-3333-4333-8333-333333333333")))["code"] == "SOURCE_FEATURE_UNAVAILABLE"
     assert "dry_run" not in repeated.calls and "execute" not in repeated.calls
 
     expensive = FakeBigQuery(verifier, bytes_processed=1001)
-    monkeypatch.setattr(_sources, "open_bigquery", lambda _project: expensive)
+    monkeypatch.setattr(_download, "open_bigquery", lambda _project: expensive)
     assert error(invoke(download_args(config, dataset_id="22222222-2222-4222-8222-222222222222")))["code"] == "BIGQUERY_COST_LIMIT"
     assert expensive.calls[-1] == "dry_run" and "execute" not in expensive.calls
 
@@ -101,10 +101,10 @@ def test_bigquery_header_only_plan_reads_only_required_block_fields(
     warehouse.execute("DROP TABLE {receipts}")
     for column in ("base_fee_per_gas", "gas_used", "gas_limit"):
         warehouse.execute(f"ALTER TABLE {{blocks}} DROP COLUMN {column}")
-    monkeypatch.setattr(_sources, "open_bigquery", lambda _project: warehouse)
+    monkeypatch.setattr(_download, "open_bigquery", lambda _project: warehouse)
     artifact = artifact_from(invoke(download_args(config)))
     assert warehouse.calls == [f"schema:{BQ_DATASET}.blocks", "dry_run", "execute"]
-    monkeypatch.setattr(_sources, "import_module", Mock(side_effect=AssertionError("local loading imported Google")))
+    monkeypatch.setattr(_bigquery, "import_module", Mock(side_effect=AssertionError("local loading imported Google")))
     assert open_dataset(artifact).schema == ("block_number", "timestamp")
 
 
@@ -116,8 +116,8 @@ def test_bigquery_streams_selected_fields_and_matches_rpc_artifacts(
     config = bigquery_config(make_config, tmp_path / "config.toml", primary, verifier, tmp_path / "out", features=features)
     clients = [FakeBigQuery(verifier), FakeBigQuery(verifier)]
     queued_clients = iter(clients)
-    monkeypatch.setattr(_sources, "open_bigquery", lambda _project: next(queued_clients))
-    monkeypatch.setattr(_sources, "CHUNK_SIZE", 2)
+    monkeypatch.setattr(_download, "open_bigquery", lambda _project: next(queued_clients))
+    monkeypatch.setattr(_download, "CHUNK_SIZE", 2)
     start = datetime.fromtimestamp(verifier.timestamp_base + 10, UTC).isoformat().replace("+00:00", "Z")
     end = datetime.fromtimestamp(verifier.timestamp_base + 14, UTC).isoformat().replace("+00:00", "Z")
     base = ["download", "--config", str(config), "--from-time", start, "--to-time", end]
@@ -144,7 +144,7 @@ def test_bigquery_and_rpc_agree_on_every_feature_and_block_shape(
 ) -> None:
     primary, verifier = chains
     features = ("timestamp", "block_hash", "parent_hash", "base_fee_per_gas", "gas_used", "gas_limit", "tx_count", P50, P90)
-    monkeypatch.setattr(_sources, "open_bigquery", lambda _project: FakeBigQuery(verifier))
+    monkeypatch.setattr(_download, "open_bigquery", lambda _project: FakeBigQuery(verifier))
     warehouse = bigquery_config(make_config, tmp_path / "bigquery.toml", primary, verifier, tmp_path / "bigquery", features=features)
     rpc = make_config(tmp_path / "rpc.toml", primary, verifier, output_root=tmp_path / "rpc", features=features)
     last = ROUNDING_EDGE_BLOCK - 1
@@ -160,7 +160,7 @@ def test_bigquery_percentile_floors_the_gas_threshold(
 ) -> None:
     primary, verifier = chains
     config = bigquery_config(make_config, tmp_path / "config.toml", primary, verifier, tmp_path / "out", features=(P50,))
-    monkeypatch.setattr(_sources, "open_bigquery", lambda _project: FakeBigQuery(verifier))
+    monkeypatch.setattr(_download, "open_bigquery", lambda _project: FakeBigQuery(verifier))
     artifact = artifact_from(invoke(download_args(config, first=ROUNDING_EDGE_BLOCK, last=ROUNDING_EDGE_BLOCK)))
     assert pl.read_parquet(artifact / "blocks.parquet")[P50].to_list() == [1]
 
@@ -172,7 +172,7 @@ def test_bigquery_checks_the_gas_domain_of_an_unselected_field(
     config = bigquery_config(make_config, tmp_path / "config.toml", primary, verifier, tmp_path / "out", features=("gas_used",))
     warehouse = FakeBigQuery(verifier)
     warehouse.execute("UPDATE {blocks} SET gas_limit = 20000 WHERE block_number = 12")
-    monkeypatch.setattr(_sources, "open_bigquery", lambda _project: warehouse)
+    monkeypatch.setattr(_download, "open_bigquery", lambda _project: warehouse)
     failure = error(invoke(download_args(config)))
     assert failure["code"] == "BIGQUERY_INVALID" and "Block 12 has gas_used outside its domain" in failure["message"]
 
@@ -184,7 +184,7 @@ def test_bigquery_rejects_a_block_with_a_missing_receipt(
     config = bigquery_config(make_config, tmp_path / "config.toml", primary, verifier, tmp_path / "out", features=(P50,))
     warehouse = FakeBigQuery(verifier)
     warehouse.execute(f"DELETE FROM {{receipts}} WHERE block_hash = '{block_hash(13)}' AND transaction_index = 1")
-    monkeypatch.setattr(_sources, "open_bigquery", lambda _project: warehouse)
+    monkeypatch.setattr(_download, "open_bigquery", lambda _project: warehouse)
     failure = error(invoke(download_args(config)))
     assert failure["code"] == "BIGQUERY_INVALID" and "block 13" in failure["message"]
 
@@ -198,8 +198,8 @@ def test_bigquery_rejects_a_result_that_does_not_cover_the_range(
     verifier.changes[14] = {"timestamp": hex(verifier.timestamp_base + 13)}
     warehouse = FakeBigQuery(verifier)
     warehouse.execute(f"DELETE FROM {{blocks}} WHERE block_number = {missing}")
-    monkeypatch.setattr(_sources, "open_bigquery", lambda _project: warehouse)
-    monkeypatch.setattr(_sources, "CHUNK_SIZE", 2)
+    monkeypatch.setattr(_download, "open_bigquery", lambda _project: warehouse)
+    monkeypatch.setattr(_download, "CHUNK_SIZE", 2)
     assert error(invoke(download_args(config)))["code"] == "BIGQUERY_INVALID"
     assert not (tmp_path / "out" / DATASET_ID).exists()
 
@@ -210,13 +210,13 @@ def test_bigquery_recovery_requires_exact_binding(
     primary, verifier = chains
     config = bigquery_config(make_config, tmp_path / "config.toml", primary, verifier, tmp_path / "out")
     clients = iter(FakeBigQuery(primary) for _ in range(3))
-    monkeypatch.setattr(_sources, "open_bigquery", lambda _project: next(clients))
-    real_rename = _corpus._rename_no_replace
+    monkeypatch.setattr(_download, "open_bigquery", lambda _project: next(clients))
+    real_rename = _work._rename_no_replace
 
-    monkeypatch.setattr(_corpus, "_rename_no_replace", Mock(side_effect=KeyboardInterrupt))
+    monkeypatch.setattr(_work, "_rename_no_replace", Mock(side_effect=KeyboardInterrupt))
     assert error(invoke(download_args(config)))["code"] == "INTERRUPTED"
     assert error(invoke([*download_args(config), "--format", "csv"]))["code"] == "RESUME_MISMATCH"
-    monkeypatch.setattr(_corpus, "_rename_no_replace", real_rename)
+    monkeypatch.setattr(_work, "_rename_no_replace", real_rename)
     resumed = invoke(download_args(config))
     assert Path(json.loads(resumed.stdout)["path"]).is_dir()
     assert json.loads(resumed.stderr.splitlines()[-1])["recovered"] is True
@@ -234,7 +234,7 @@ def test_bigquery_rpc_disagreement_prevents_publication(
     else:
         number, change = changes[disagreement]
         verifier.changes[number] = change
-    monkeypatch.setattr(_sources, "open_bigquery", lambda _project: FakeBigQuery(primary))
+    monkeypatch.setattr(_download, "open_bigquery", lambda _project: FakeBigQuery(primary))
 
     assert error(invoke(download_args(config)))["code"] == "RPC_MISMATCH"
     assert not any(path.name.endswith(DATASET_ID) and not path.name.startswith(".") for path in (tmp_path / "out").glob("*"))

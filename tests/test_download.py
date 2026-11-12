@@ -15,8 +15,8 @@ import polars as pl
 import pytest
 from support import DATASET_ID, ChainServer, FakeBigQuery, artifact_from, bigquery_config, block_hash, download_args, error, invoke
 
-from blockweaver import Dataset, _corpus, _sources, open_dataset
-from blockweaver._contract import parse_time
+from blockweaver import Dataset, _download, _work, open_dataset
+from blockweaver._config import parse_time
 
 
 def test_parquet_download_selects_and_coalesces_features(tmp_path: Path, chains: tuple[ChainServer, ChainServer], make_config: Any) -> None:
@@ -125,7 +125,7 @@ def test_download_reads_each_range_boundary_a_fixed_number_of_times(
 
     verifier.request_counts.clear()
     warehouse = bigquery_config(make_config, tmp_path / "bigquery.toml", primary, verifier, tmp_path / "bigquery", features=("timestamp",))
-    monkeypatch.setattr(_sources, "open_bigquery", lambda _project: FakeBigQuery(verifier))
+    monkeypatch.setattr(_download, "open_bigquery", lambda _project: FakeBigQuery(verifier))
     start = datetime.fromtimestamp(verifier.timestamp_base + 10, UTC).isoformat().replace("+00:00", "Z")
     end = datetime.fromtimestamp(verifier.timestamp_base + 14, UTC).isoformat().replace("+00:00", "Z")
     artifact_from(invoke(["download", "--config", str(warehouse), "--id", DATASET_ID, "--from-time", start, "--to-time", end]))
@@ -224,7 +224,7 @@ def test_resume_reuses_only_complete_chunks_and_rejects_rebinding(
 ) -> None:
     primary, verifier = chains
     config = make_config(tmp_path / "config.toml", primary, verifier, output_root=tmp_path / "out")
-    monkeypatch.setattr(_sources, "CHUNK_SIZE", 2)
+    monkeypatch.setattr(_download, "CHUNK_SIZE", 2)
     primary.changes[12] = {"hash": "invalid"}
     failed = invoke(download_args(config))
     assert error(failed)["code"] == "RPC_INVALID"
@@ -258,7 +258,7 @@ def test_resume_integrity_binds_checkpoint_bytes_and_domains(
         output_root=tmp_path / "out",
         features=("timestamp", "base_fee_per_gas"),
     )
-    monkeypatch.setattr(_sources, "CHUNK_SIZE", 2)
+    monkeypatch.setattr(_download, "CHUNK_SIZE", 2)
     primary.changes[12] = {"hash": "invalid"}
     assert error(invoke(download_args(config)))["code"] == "RPC_INVALID"
     primary.changes.clear()
@@ -285,7 +285,7 @@ def test_checkpoint_changed_during_acquisition_is_never_assembled(
 ) -> None:
     primary, verifier = chains
     config = make_config(tmp_path / "config.toml", primary, verifier, output_root=tmp_path / "out")
-    monkeypatch.setattr(_sources, "CHUNK_SIZE", 2)
+    monkeypatch.setattr(_download, "CHUNK_SIZE", 2)
     chunks = tmp_path / "out" / f".blockweaver-{DATASET_ID}" / "chunks"
 
     def change_first_checkpoint() -> None:
@@ -349,19 +349,19 @@ def test_publication_failure_recovers_ready_candidate(
 ) -> None:
     primary, verifier = chains
     config = make_config(tmp_path / "config.toml", primary, verifier, output_root=tmp_path / "out")
-    real_rename = _corpus._rename_no_replace
+    real_rename = _work._rename_no_replace
 
     def interrupt(_source: Path, _destination: Path) -> None:
         raise KeyboardInterrupt
 
-    monkeypatch.setattr(_corpus, "_rename_no_replace", interrupt)
+    monkeypatch.setattr(_work, "_rename_no_replace", interrupt)
     assert error(invoke(download_args(config)))["code"] == "INTERRUPTED"
     hidden = tmp_path / "out" / f".blockweaver-{DATASET_ID}"
     assert {path.name for path in (hidden / "ready").iterdir()} == {"manifest.json", "blocks.parquet"}
     assert {path.name for path in hidden.iterdir()} == {"binding.json", "chunks", "ready"}
 
     requests = len(primary.requests) + len(verifier.requests)
-    monkeypatch.setattr(_corpus, "_rename_no_replace", real_rename)
+    monkeypatch.setattr(_work, "_rename_no_replace", real_rename)
     artifact = artifact_from(invoke(download_args(config)))
     assert len(primary.requests) + len(verifier.requests) > requests  # range and identity are re-resolved
     assert not hidden.exists()
@@ -379,15 +379,15 @@ def test_recovery_rejects_artifacts_outside_the_immutable_binding(
 ) -> None:
     primary, verifier = chains
     config = make_config(tmp_path / "config.toml", primary, verifier, output_root=tmp_path / "out")
-    real_rename, real_discard = _corpus._rename_no_replace, _corpus._discard_work
+    real_rename, real_discard = _work._rename_no_replace, _work._discard_work
 
     def interrupt(*_args: object) -> None:
         raise KeyboardInterrupt
 
-    monkeypatch.setattr(_corpus, "_discard_work" if published else "_rename_no_replace", interrupt)
+    monkeypatch.setattr(_work, "_discard_work" if published else "_rename_no_replace", interrupt)
     assert error(invoke(download_args(config)))["code"] == "INTERRUPTED"
-    monkeypatch.setattr(_corpus, "_rename_no_replace", real_rename)
-    monkeypatch.setattr(_corpus, "_discard_work", real_discard)
+    monkeypatch.setattr(_work, "_rename_no_replace", real_rename)
+    monkeypatch.setattr(_work, "_discard_work", real_discard)
 
     hidden = tmp_path / "out" / f".blockweaver-{DATASET_ID}"
     artifact = next(path for path in (tmp_path / "out").iterdir() if not path.name.startswith(".")) if published else hidden / "ready"
@@ -408,13 +408,13 @@ def test_publication_never_replaces_a_racing_destination(
     primary, verifier = chains
     output_root = tmp_path / "out"
     config = make_config(tmp_path / "config.toml", primary, verifier, output_root=output_root)
-    real_rename = _corpus._rename_no_replace
+    real_rename = _work._rename_no_replace
 
     def race(source: Path, destination: Path) -> None:
         destination.mkdir()
         real_rename(source, destination)
 
-    monkeypatch.setattr(_corpus, "_rename_no_replace", race)
+    monkeypatch.setattr(_work, "_rename_no_replace", race)
     result = invoke(download_args(config))
     assert error(result)["code"] == "DESTINATION_EXISTS"
     destination = next(path for path in output_root.iterdir() if not path.name.startswith("."))
@@ -498,15 +498,15 @@ def test_staged_recovery_ignores_obsolete_checkpoints_and_revalidates(
 ) -> None:
     primary, verifier = chains
     config = make_config(tmp_path / "config.toml", primary, verifier, output_root=tmp_path / "out")
-    real_rename = _corpus._rename_no_replace
-    monkeypatch.setattr(_corpus, "_rename_no_replace", Mock(side_effect=KeyboardInterrupt))
+    real_rename = _work._rename_no_replace
+    monkeypatch.setattr(_work, "_rename_no_replace", Mock(side_effect=KeyboardInterrupt))
     assert error(invoke(download_args(config)))["code"] == "INTERRUPTED"
     hidden = tmp_path / "out" / f".blockweaver-{DATASET_ID}"
     assert "version" not in json.loads((hidden / "binding.json").read_text())
     with next((hidden / "chunks").iterdir()).open("ab") as stream:
         stream.write(b"obsolete checkpoint corruption")
 
-    monkeypatch.setattr(_corpus, "_rename_no_replace", real_rename)
+    monkeypatch.setattr(_work, "_rename_no_replace", real_rename)
     verifier.changes[14] = {"hash": block_hash(999)}
     assert error(invoke(download_args(config)))["code"] == "RPC_MISMATCH"
     verifier.changes.clear()
@@ -525,13 +525,13 @@ def test_committed_recovery_survives_partial_hidden_cleanup(
 ) -> None:
     primary, verifier = chains
     config = make_config(tmp_path / "config.toml", primary, verifier, output_root=tmp_path / "out")
-    real_discard = _corpus._discard_work
-    monkeypatch.setattr(_corpus, "_discard_work", Mock(side_effect=KeyboardInterrupt))
+    real_discard = _work._discard_work
+    monkeypatch.setattr(_work, "_discard_work", Mock(side_effect=KeyboardInterrupt))
     assert error(invoke(download_args(config)))["code"] == "INTERRUPTED"
     hidden = tmp_path / "out" / f".blockweaver-{DATASET_ID}"
     (hidden / "binding.json").unlink()
     shutil.rmtree(hidden / "chunks")
-    monkeypatch.setattr(_corpus, "_discard_work", real_discard)
+    monkeypatch.setattr(_work, "_discard_work", real_discard)
 
     receipt = json.loads(invoke(download_args(config)).stdout)
 
@@ -547,15 +547,15 @@ def test_final_candidate_samples_must_match_verifier(
 ) -> None:
     primary, verifier = chains
     config = make_config(tmp_path / "config.toml", primary, verifier, output_root=tmp_path / "out", features=("timestamp",))
-    real_write = _corpus._write_candidate
+    real_write = _work._write_candidate
 
-    def change_candidate(*args: Any, **kwargs: Any) -> Dataset:
-        dataset = real_write(*args, **kwargs)
-        frame = pl.read_parquet(dataset.data_path)
-        frame.with_columns((pl.col("timestamp") + 1).alias("timestamp")).write_parquet(dataset.data_path)
-        return dataset
+    def change_candidate(*args: Any, **kwargs: Any) -> Any:
+        artifact = real_write(*args, **kwargs)
+        data_path = artifact.dataset.data_path
+        pl.read_parquet(data_path).with_columns((pl.col("timestamp") + 1).alias("timestamp")).write_parquet(data_path)
+        return artifact
 
-    monkeypatch.setattr(_corpus, "_write_candidate", change_candidate)
+    monkeypatch.setattr(_work, "_write_candidate", change_candidate)
 
     result = invoke(download_args(config))
 
@@ -571,18 +571,18 @@ def test_candidate_fingerprint_is_resealed_after_live_rpc_validation(
 ) -> None:
     primary, verifier = chains
     config = make_config(tmp_path / "config.toml", primary, verifier, output_root=tmp_path / "out", features=("timestamp",))
-    real_rename = _corpus._rename_no_replace
-    monkeypatch.setattr(_corpus, "_rename_no_replace", Mock(side_effect=KeyboardInterrupt))
+    real_rename = _work._rename_no_replace
+    monkeypatch.setattr(_work, "_rename_no_replace", Mock(side_effect=KeyboardInterrupt))
     assert error(invoke(download_args(config)))["code"] == "INTERRUPTED"
-    monkeypatch.setattr(_corpus, "_rename_no_replace", real_rename)
-    real_revalidate = _sources.RpcSource.revalidate
+    monkeypatch.setattr(_work, "_rename_no_replace", real_rename)
+    real_revalidate = _download.RpcSource.revalidate
 
-    async def mutate_after_rpc(source: _sources.RpcSource, dataset: Dataset) -> None:
-        await real_revalidate(source, dataset)
-        with dataset.data_path.open("ab") as stream:
+    async def mutate_after_rpc(source: _download.RpcSource, artifact: Any) -> None:
+        await real_revalidate(source, artifact)
+        with artifact.dataset.data_path.open("ab") as stream:
             stream.write(b"changed")
 
-    monkeypatch.setattr(_sources.RpcSource, "revalidate", mutate_after_rpc)
+    monkeypatch.setattr(_download.RpcSource, "revalidate", mutate_after_rpc)
 
     result = invoke(download_args(config))
 
@@ -602,8 +602,8 @@ def test_publication_syncs_both_rename_parents_then_root_after_cleanup(
     config = make_config(tmp_path / "config.toml", primary, verifier, output_root=output_root)
     synced: list[Path] = []
     final_files: list[str] = []
-    real_directory_sync = _corpus.fsync_directory
-    real_file_sync = _corpus._sync_final_file
+    real_directory_sync = _work.fsync_directory
+    real_file_sync = _work._sync_final_file
 
     def sync_directory(path: Path) -> None:
         synced.append(path.resolve())
@@ -613,8 +613,8 @@ def test_publication_syncs_both_rename_parents_then_root_after_cleanup(
         final_files.append(path.name)
         real_file_sync(path)
 
-    monkeypatch.setattr(_corpus, "fsync_directory", sync_directory)
-    monkeypatch.setattr(_corpus, "_sync_final_file", sync_file)
+    monkeypatch.setattr(_work, "fsync_directory", sync_directory)
+    monkeypatch.setattr(_work, "_sync_final_file", sync_file)
 
     artifact_from(invoke(download_args(config)))
 
@@ -632,7 +632,7 @@ def test_unavailable_atomic_publication_keeps_staged_candidate(
     output_root = tmp_path / "out"
     config = make_config(tmp_path / "config.toml", primary, verifier, output_root=output_root)
     monkeypatch.setattr(
-        _corpus,
+        _work,
         "_rename_no_replace",
         Mock(side_effect=OSError(errno.ENOTSUP, "Atomic no-replace publication is unavailable")),
     )

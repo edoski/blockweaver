@@ -8,8 +8,9 @@ from uuid import UUID
 import pytest
 from support import DATASET_ID, ChainServer, download_args, error, invoke
 
-from blockweaver import BlockweaverError, _sources
-from blockweaver._contract import Chain, Provider, RpcDownloadRequest, plan_features, requested_range
+from blockweaver import BlockweaverError, _download, _rpc
+from blockweaver._config import Chain, Provider, RpcDownloadRequest, requested_range
+from blockweaver._contract import Header, plan_features
 
 
 @pytest.mark.parametrize(
@@ -20,8 +21,8 @@ def test_rpc_error_disposition_uses_numeric_codes_without_provider_messages(chai
     primary, _verifier = chains
     primary.rpc_errors = [code]
 
-    async def request() -> list[_sources.Header]:
-        async with _sources.Rpc(primary.url, batch_size=3, concurrency=2, timeout=2) as rpc:
+    async def request() -> list[Header]:
+        async with _rpc.Rpc(Provider("primary", primary.url, 3, 2, 2)) as rpc:
             return await rpc.headers([10])
 
     if retries:
@@ -38,8 +39,8 @@ def test_rpc_limit_splits_immediately_and_retries_only_pending_calls(chains: tup
     primary, _verifier = chains
     primary.limit_batches = True
 
-    async def request() -> list[_sources.Header]:
-        async with _sources.Rpc(primary.url, batch_size=3, concurrency=2, timeout=2) as rpc:
+    async def request() -> list[Header]:
+        async with _rpc.Rpc(Provider("primary", primary.url, 3, 2, 2)) as rpc:
             return await rpc.headers([10, 11, 12])
 
     assert [header.block_number for header in asyncio.run(request())] == [10, 11, 12]
@@ -62,8 +63,8 @@ def test_rpc_retries_preserve_original_pending_order(chains: tuple[ChainServer, 
     for number in (11, 19, 27):
         primary.item_errors[number] = [-32603, -32603]
 
-    async def request() -> list[_sources.Header]:
-        async with _sources.Rpc(primary.url, batch_size=18, concurrency=1, timeout=2) as rpc:
+    async def request() -> list[Header]:
+        async with _rpc.Rpc(Provider("primary", primary.url, 18, 1, 2)) as rpc:
             return await rpc.headers(range(10, 28))
 
     assert [header.block_number for header in asyncio.run(request())] == list(range(10, 28))
@@ -81,11 +82,11 @@ def test_rpc_retry_is_bounded_and_retry_after_is_validated(chains: tuple[ChainSe
         delays.append(delay)
 
     async def request() -> None:
-        async with _sources.Rpc(primary.url, batch_size=1, concurrency=1, timeout=2) as rpc:
+        async with _rpc.Rpc(Provider("primary", primary.url, 1, 1, 2)) as rpc:
             await rpc.headers([10])
 
-    monkeypatch.setattr(_sources.asyncio, "sleep", sleep)
-    monkeypatch.setattr(_sources.random, "uniform", lambda _start, _end: 0.25)
+    monkeypatch.setattr(_rpc.asyncio, "sleep", sleep)
+    monkeypatch.setattr(_rpc.random, "uniform", lambda _start, _end: 0.25)
     primary.http_failures, primary.retry_after = 1, "999"
     asyncio.run(request())
     assert delays == [60.0]
@@ -105,7 +106,7 @@ def test_rpc_groups_are_concurrent_and_cancel_siblings(chains: tuple[ChainServer
     primary, _verifier = chains
 
     async def exercise() -> tuple[int, bool]:
-        rpc = _sources.Rpc("http://unused", batch_size=1, concurrency=3, timeout=2)
+        rpc = _rpc.Rpc(Provider("unused", "http://unused", 1, 3, 2))
         active = maximum = started = 0
         release = asyncio.Event()
 
@@ -173,7 +174,7 @@ def test_paired_provider_failure_cancels_and_awaits_sibling(
     started = 0
     sibling_cancelled = False
 
-    async def chain_id(rpc: _sources.Rpc) -> int:
+    async def chain_id(rpc: _rpc.Rpc) -> int:
         nonlocal ready, sibling_cancelled, started
         if ready is None:
             ready = asyncio.Event()
@@ -182,7 +183,7 @@ def test_paired_provider_failure_cancels_and_awaits_sibling(
         if started == 2:
             current.set()
         await current.wait()
-        if rpc._url == primary.url:
+        if rpc.provider.url == primary.url:
             raise RuntimeError("primary failed")
         try:
             await asyncio.Event().wait()
@@ -191,11 +192,11 @@ def test_paired_provider_failure_cancels_and_awaits_sibling(
             raise
         raise AssertionError("unreachable")
 
-    monkeypatch.setattr(_sources.Rpc, "chain_id", chain_id)
+    monkeypatch.setattr(_rpc.Rpc, "chain_id", chain_id)
 
     async def exercise() -> tuple[bool, int]:
         with pytest.raises(BlockweaverError, match="primary failed"):
-            await _sources.download(request, progress=lambda _event: None, publication=lambda _phase: None)
+            await _download.download(request, progress=lambda _event: None, publication=lambda _phase: None)
         current = asyncio.current_task()
         pending = [task for task in asyncio.all_tasks() if task is not current and not task.done()]
         cancelled_before_cleanup = sibling_cancelled
