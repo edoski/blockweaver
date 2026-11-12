@@ -343,8 +343,7 @@ def _write_candidate(
     filename = f"blocks.{output_format}"
     data_path = candidate / filename
     temporary = candidate / f"{filename}.tmp"
-    scans = [pl.scan_parquet(path).select(plan.columns) for path in sources]
-    combined = pl.concat(scans, how="vertical")
+    combined = pl.scan_parquet(sources).select(plan.columns)
     if output_format == "parquet":
         combined.sink_parquet(temporary, compression="zstd", row_group_size=4096, maintain_order=True)
     else:
