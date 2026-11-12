@@ -22,7 +22,7 @@ def test_rpc_error_disposition_uses_numeric_codes_without_provider_messages(chai
 
     async def request() -> list[_sources.Header]:
         async with _sources.Rpc(primary.url, batch_size=3, concurrency=2, timeout=2) as rpc:
-            return await rpc.headers([10], plan_features([]))
+            return await rpc.headers([10])
 
     if retries:
         assert [header.block_number for header in asyncio.run(request())] == [10]
@@ -40,7 +40,7 @@ def test_rpc_limit_splits_immediately_and_retries_only_pending_calls(chains: tup
 
     async def request() -> list[_sources.Header]:
         async with _sources.Rpc(primary.url, batch_size=3, concurrency=2, timeout=2) as rpc:
-            return await rpc.headers([10, 11, 12], plan_features([]))
+            return await rpc.headers([10, 11, 12])
 
     assert [header.block_number for header in asyncio.run(request())] == [10, 11, 12]
     batch_sizes = [len(batch) for batch in primary.requests]
@@ -64,7 +64,7 @@ def test_rpc_retries_preserve_original_pending_order(chains: tuple[ChainServer, 
 
     async def request() -> list[_sources.Header]:
         async with _sources.Rpc(primary.url, batch_size=18, concurrency=1, timeout=2) as rpc:
-            return await rpc.headers(range(10, 28), plan_features([]))
+            return await rpc.headers(range(10, 28))
 
     assert [header.block_number for header in asyncio.run(request())] == list(range(10, 28))
     assert [[call["params"][0] for call in batch] for batch in primary.requests[1:]] == [
@@ -82,7 +82,7 @@ def test_rpc_retry_is_bounded_and_retry_after_is_validated(chains: tuple[ChainSe
 
     async def request() -> None:
         async with _sources.Rpc(primary.url, batch_size=1, concurrency=1, timeout=2) as rpc:
-            await rpc.headers([10], plan_features([]))
+            await rpc.headers([10])
 
     monkeypatch.setattr(_sources.asyncio, "sleep", sleep)
     monkeypatch.setattr(_sources.random, "uniform", lambda _start, _end: 0.25)
@@ -123,7 +123,7 @@ def test_rpc_groups_are_concurrent_and_cancel_siblings(chains: tuple[ChainServer
             return 200, [{"jsonrpc": "2.0", "id": call["id"], "result": primary.block(number)}], None
 
         monkeypatch.setattr(rpc, "_post", concurrent)
-        assert [item.block_number for item in await rpc.headers([10, 11, 12], plan_features([]))] == [10, 11, 12]
+        assert [item.block_number for item in await rpc.headers([10, 11, 12])] == [10, 11, 12]
 
         cancelled = False
         ready = asyncio.Event()
@@ -146,7 +146,7 @@ def test_rpc_groups_are_concurrent_and_cancel_siblings(chains: tuple[ChainServer
 
         monkeypatch.setattr(rpc, "_post", fail_one)
         with pytest.raises(ValueError, match="bad sibling"):
-            await rpc.headers([10, 11], plan_features([]))
+            await rpc.headers([10, 11])
         return maximum, cancelled
 
     maximum, cancelled = asyncio.run(exercise())

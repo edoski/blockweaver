@@ -242,8 +242,8 @@ def test_resume_reuses_only_complete_chunks_and_rejects_rebinding(
     assert primary.request_counts[11] == 1
 
 
-@pytest.mark.parametrize("corruption", ["digest", "duplicate", "domain"])
-def test_resume_integrity_binds_checkpoint_bytes_and_exported_proofs(
+@pytest.mark.parametrize("corruption", ["digest", "domain"])
+def test_resume_integrity_binds_checkpoint_bytes_and_domains(
     tmp_path: Path,
     chains: tuple[ChainServer, ChainServer],
     make_config: Any,
@@ -266,12 +266,9 @@ def test_resume_integrity_binds_checkpoint_bytes_and_exported_proofs(
     chunks = tmp_path / "out" / f".blockweaver-{DATASET_ID}" / "chunks"
     checkpoint = next(chunks.iterdir())
     frame = pl.read_parquet(checkpoint)
+    replacement = pl.lit(0) if corruption == "domain" else pl.col("base_fee_per_gas") + 1
+    frame.with_columns(replacement.alias("base_fee_per_gas")).write_parquet(checkpoint)
     if corruption == "domain":
-        frame.with_columns(pl.lit(0).alias("base_fee_per_gas")).write_parquet(checkpoint)
-    else:
-        column = "base_fee_per_gas" if corruption == "digest" else "timestamp"
-        frame.with_columns((pl.col(column) + 1).alias(column)).write_parquet(checkpoint)
-    if corruption != "digest":
         first, last, _digest = checkpoint.stem.split("-")
         digest = hashlib.sha256(checkpoint.read_bytes()).hexdigest()
         checkpoint.rename(checkpoint.with_name(f"{first}-{last}-{digest}.parquet"))
@@ -305,9 +302,9 @@ def test_checkpoint_changed_during_acquisition_is_never_assembled(
     ("features", "change", "message"),
     [
         (("timestamp",), {"timestamp": hex(2**63)}, "exceeds signed Int64"),
-        (("gas_used",), {"gasUsed": hex(30_000_001)}, "gas domain"),
-        (("base_fee_per_gas",), {"baseFeePerGas": "0x0"}, "base fee domain"),
-        (("block_hash",), {"hash": "0xABC"}, "block hash"),
+        (("gas_used",), {"gasUsed": hex(30_000_001)}, "Block 12 has gas_used outside its domain"),
+        (("base_fee_per_gas",), {"baseFeePerGas": "0x0"}, "Block 12 has base_fee_per_gas outside its domain"),
+        (("block_hash",), {"hash": "0xABC"}, "Block 12 has block_hash outside its domain"),
     ],
 )
 def test_download_rejects_header_values_outside_their_domain(

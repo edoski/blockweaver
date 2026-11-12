@@ -174,7 +174,7 @@ def test_bigquery_checks_the_gas_domain_of_an_unselected_field(
     warehouse.execute("UPDATE {blocks} SET gas_limit = 20000 WHERE block_number = 12")
     monkeypatch.setattr(_sources, "open_bigquery", lambda _project: warehouse)
     failure = error(invoke(download_args(config)))
-    assert failure["code"] == "BIGQUERY_INVALID" and "block 12" in failure["message"]
+    assert failure["code"] == "BIGQUERY_INVALID" and "Block 12 has gas_used outside its domain" in failure["message"]
 
 
 def test_bigquery_rejects_a_block_with_a_missing_receipt(
@@ -195,6 +195,7 @@ def test_bigquery_rejects_a_result_that_does_not_cover_the_range(
 ) -> None:
     primary, verifier = chains
     config = bigquery_config(make_config, tmp_path / "config.toml", primary, verifier, tmp_path / "out", features=("timestamp",))
+    verifier.changes[14] = {"timestamp": hex(verifier.timestamp_base + 13)}
     warehouse = FakeBigQuery(verifier)
     warehouse.execute(f"DELETE FROM {{blocks}} WHERE block_number = {missing}")
     monkeypatch.setattr(_sources, "open_bigquery", lambda _project: warehouse)

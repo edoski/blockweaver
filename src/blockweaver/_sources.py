@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import random
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Iterator, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
@@ -19,20 +19,24 @@ import aiohttp
 
 from . import __version__
 from ._contract import (
-    INT64_MAX,
     Anchor,
     BigQueryDownloadRequest,
+    BlocksColumn,
     BlockweaverError,
     DownloadRequest,
+    FeeHistory,
     Header,
     Plan,
     Provider,
+    ReceiptPercentile,
     RequestedRange,
     ResolvedRange,
+    Row,
     RpcDownloadRequest,
+    TransactionRows,
     Value,
-    block_hash,
-    parse_header,
+    bigquery_tables,
+    parse_block,
     plan_features,
     quantity,
     validate_links,
@@ -47,6 +51,7 @@ Validator = Callable[[Any], Any]
 BigQuerySchema = dict[str, tuple[str, str]]
 _Left = TypeVar("_Left")
 _Right = TypeVar("_Right")
+_INTEGRITY_PLAN = plan_features([])
 
 
 @dataclass(frozen=True, slots=True)
@@ -129,36 +134,19 @@ def open_bigquery(project: str) -> BigQueryClient:
 
 
 def compile_bigquery(dataset: str, plan: Plan) -> BigQueryPlan:
-    requirements = plan._bigquery_requirements
-    block_fields = dict(requirements.block_fields)
-    gas_domain_proof = "gas_limit" in block_fields
-    result_schema = {
-        "block_number": "INTEGER",
-        "_proof_timestamp": "INTEGER",
-        "_proof_hash": "STRING",
-        "_proof_parent_hash": "STRING",
-    }
-    tables = {"blocks": block_fields}
+    tables = bigquery_tables(plan)
+    result_schema = {"block_number": "INTEGER"}
     ctes = [
         "requested_blocks AS (\n"
-        f"  SELECT {', '.join(sorted(block_fields))}\n"
+        f"  SELECT {', '.join(sorted(tables['blocks']))}\n"
         f"  FROM `{dataset}.blocks`\n"
         "  WHERE block_number BETWEEN @first_block AND @last_block\n"
         "    AND block_timestamp BETWEEN TIMESTAMP_SECONDS(@from_timestamp) AND TIMESTAMP_SECONDS(@to_timestamp)\n"
         ")"
     ]
     joins: list[str] = []
-    projections = [
-        "b.block_number AS block_number",
-        "UNIX_SECONDS(b.block_timestamp) AS _proof_timestamp",
-        "b.block_hash AS _proof_hash",
-        "b.parent_hash AS _proof_parent_hash",
-    ]
-    if gas_domain_proof:
-        projections.extend(["b.gas_used AS _proof_gas_used", "b.gas_limit AS _proof_gas_limit"])
-        result_schema.update({"_proof_gas_used": "INTEGER", "_proof_gas_limit": "INTEGER"})
-    if requirements.transaction_fields:
-        tables["transactions"] = dict(requirements.transaction_fields)
+    projections = ["b.block_number AS block_number"]
+    if "transactions" in tables:
         ctes.append(
             "tx_counts AS (\n"
             "  SELECT block_hash, COUNT(*) AS tx_count\n"
@@ -168,8 +156,7 @@ def compile_bigquery(dataset: str, plan: Plan) -> BigQueryPlan:
             ")"
         )
         joins.append("LEFT JOIN tx_counts AS t USING (block_hash)")
-    if requirements.receipt_fields:
-        tables["receipts"] = dict(requirements.receipt_fields)
+    if "receipts" in tables:
         ctes.extend(
             [
                 "requested_receipts AS (\n"
@@ -189,28 +176,26 @@ def compile_bigquery(dataset: str, plan: Plan) -> BigQueryPlan:
                 "receipt_stats AS (\n"
                 "  SELECT block_number, SUM(gas_used) AS receipt_gas_used,\n    "
                 + ",\n    ".join(
-                    f"MIN(IF(cumulative_gas >= CAST(CEIL(CAST(block_gas_used AS BIGNUMERIC) * {percentile} / 100) AS INT64), "
-                    f"priority_fee, NULL)) AS effective_priority_fee_per_gas_p{percentile}"
-                    for percentile in requirements.percentiles
+                    f"MIN(IF(cumulative_gas >= CAST(CEIL(CAST(block_gas_used AS BIGNUMERIC) * {feature.bigquery.percentile} / 100) AS INT64), "
+                    f"priority_fee, NULL)) AS {feature.name}"
+                    for feature in plan.acquired
+                    if isinstance(feature.bigquery, ReceiptPercentile)
                 )
                 + "\n  FROM weighted_receipts GROUP BY block_number\n)",
             ]
         )
         joins.append("LEFT JOIN receipt_stats AS r USING (block_number)")
-        if not gas_domain_proof:
-            projections.append("b.gas_used AS _proof_gas_used")
-            result_schema["_proof_gas_used"] = "INTEGER"
-        projections.append("COALESCE(r.receipt_gas_used, 0) AS _receipt_gas_used")
-        result_schema["_receipt_gas_used"] = "INTEGER"
-    for feature in plan.features:
-        if feature.bigquery_family == "blocks":
-            assert feature.bigquery_field is not None
-            expression = "UNIX_SECONDS(b.block_timestamp)" if feature.bigquery_field == "block_timestamp" else f"b.{feature.bigquery_field}"
-            projections.append(f"{expression} AS {feature.name}")
-        elif feature.bigquery_family == "transactions":
-            projections.append(f"COALESCE(t.tx_count, 0) AS {feature.name}")
+        projections.extend(["b.gas_used AS _proof_gas_used", "COALESCE(r.receipt_gas_used, 0) AS _receipt_gas_used"])
+        result_schema.update({"_proof_gas_used": "INTEGER", "_receipt_gas_used": "INTEGER"})
+    for feature in plan.acquired:
+        recipe = feature.bigquery
+        if isinstance(recipe, BlocksColumn):
+            expression = f"UNIX_SECONDS(b.{recipe.column})" if recipe.type == "TIMESTAMP" else f"b.{recipe.column}"
+        elif isinstance(recipe, TransactionRows):
+            expression = "COALESCE(t.tx_count, 0)"
         else:
-            projections.append(f"COALESCE(r.{feature.name}, 0) AS {feature.name}")
+            expression = f"COALESCE(r.{feature.name}, 0)"
+        projections.append(f"{expression} AS {feature.name}")
         result_schema[feature.name] = "STRING" if feature.dtype == "UTF-8" else "INTEGER"
     sql = "WITH " + ",\n".join(ctes) + "\nSELECT\n  " + ",\n  ".join(projections) + "\nFROM requested_blocks AS b\n"
     if joins:
@@ -249,31 +234,30 @@ class Rpc:
         reply = await self._run([call], {item_id: lambda value: quantity(value, "chain id")})
         return reply[item_id]
 
-    async def headers(self, numbers: Iterable[int], plan: Plan) -> list[Header]:
-        ordered = list(numbers)
-        calls = self._calls("eth_getBlockByNumber", [[hex(number), False] for number in ordered])
-        validators = {
-            int(call["id"]): lambda value, expected=number: parse_header(value, expected=expected, plan=plan)
-            for call, number in zip(calls, ordered, strict=True)
-        }
+    async def _blocks(self, numbers: Sequence[int], plan: Plan) -> list[dict[str, Value]]:
+        calls = self._calls("eth_getBlockByNumber", [[hex(number), False] for number in numbers])
+        validators: dict[int, Validator] = {}
+        for call, number in zip(calls, numbers, strict=True):
+            validators[int(call["id"])] = lambda value, expected=number: parse_block(value, expected=expected, plan=plan)
         groups = [calls[index : index + self._batch_size] for index in range(0, len(calls), self._batch_size)]
         replies: dict[int, Any] = {}
         for part in await self._run_groups(groups, validators):
             replies.update(part)
         return [replies[int(call["id"])] for call in calls]
 
-    async def header(self, number: int, plan: Plan) -> Header:
-        return (await self.headers([number], plan))[0]
+    async def headers(self, numbers: Sequence[int]) -> list[Header]:
+        return [Header.of(_INTEGRITY_PLAN.row(block)) for block in await self._blocks(numbers, _INTEGRITY_PLAN)]
 
-    async def tagged_header(self, tag: str, plan: Plan) -> Header:
+    async def header(self, number: int) -> Header:
+        return (await self.headers([number]))[0]
+
+    async def tagged_header(self, tag: str) -> Header:
         call = self._calls("eth_getBlockByNumber", [[tag, False]])[0]
         item_id = int(call["id"])
-        reply = await self._run([call], {item_id: lambda value: parse_header(value, expected=None, plan=plan)})
-        return reply[item_id]
+        reply = await self._run([call], {item_id: lambda value: parse_block(value, expected=None, plan=_INTEGRITY_PLAN)})
+        return Header.of(_INTEGRITY_PLAN.row(reply[item_id]))
 
     async def fee_history(self, first_block: int, last_block: int, percentiles: tuple[int, ...]) -> list[dict[int, int]]:
-        if not percentiles:
-            return [{} for _ in range(last_block - first_block + 1)]
         count = last_block - first_block + 1
         call = self._calls("eth_feeHistory", [[hex(count), hex(last_block), list(percentiles)]])[0]
         item_id = int(call["id"])
@@ -283,15 +267,18 @@ class Rpc:
         )
         return reply[item_id]
 
-    async def rows(self, first_block: int, last_block: int, plan: Plan) -> tuple[list[Header], list[dict[str, int | str]]]:
+    async def rows(self, numbers: Sequence[int], plan: Plan) -> list[Row]:
+        """Validated rows for ascending block numbers. A contiguous run shares one eth_feeHistory call."""
         if not plan.percentiles:
-            headers = await self.headers(range(first_block, last_block + 1), plan)
-            return headers, [header.row(plan) for header in headers]
-        headers, fees = await _paired(
-            self.headers(range(first_block, last_block + 1), plan),
-            self.fee_history(first_block, last_block, plan.percentiles),
-        )
-        return headers, [header.row(plan, fee) for header, fee in zip(headers, fees, strict=True)]
+            blocks = await self._blocks(numbers, plan)
+            fees: list[dict[int, int]] = [{} for _ in numbers]
+        elif numbers[-1] - numbers[0] + 1 == len(numbers):
+            blocks, fees = await _paired(self._blocks(numbers, plan), self.fee_history(numbers[0], numbers[-1], plan.percentiles))
+        else:
+            blocks = await self._blocks(numbers, plan)
+            fees = [(await self.fee_history(number, number, plan.percentiles))[0] for number in numbers]
+        rewards = [(feature.name, feature.rpc.percentile) for feature in plan.acquired if isinstance(feature.rpc, FeeHistory)]
+        return [plan.row({**block, **{name: fee[percentile] for name, percentile in rewards}}) for block, fee in zip(blocks, fees, strict=True)]
 
     async def _run(self, calls: list[dict[str, Any]], validators: dict[int, Validator], prior_attempts: int = 0) -> dict[int, Any]:
         pending = {int(call["id"]): call for call in calls}
@@ -437,10 +424,10 @@ class RpcSource:
         self.resolved = resolved
         self._verification = {"primary_chain_id": primary_chain_id, "verifier_chain_id": verifier_chain_id}
 
-    async def chunks(self, first: int, last: int) -> AsyncIterator[tuple[list[Header], list[dict[str, Value]]]]:
+    async def chunks(self, first: int, last: int) -> AsyncIterator[list[Row]]:
         while first <= last:
             end = min(first + CHUNK_SIZE - 1, last)
-            yield await self.primary.rows(first, end, self.request.plan)
+            yield await self.primary.rows(range(first, end + 1), self.request.plan)
             first = end + 1
 
     async def prove(self, target: Header) -> VerifiedProof:
@@ -450,7 +437,7 @@ class RpcSource:
 
     async def revalidate(self, dataset: Dataset) -> None:
         verifier_target = await _candidate_target(dataset, self.verifier)
-        target = await self.primary.header(dataset.last_block, dataset._plan)
+        target = await self.primary.header(dataset.last_block)
         if target != verifier_target:
             raise BlockweaverError("RPC_MISMATCH", "RPC endpoints disagree on the ready candidate target")
         await _finish_candidate_validation(dataset, verifier_target, self.verifier)
@@ -474,7 +461,7 @@ class BigQuerySource:
         self.progress = progress
         self.dry_run_bytes = 0
 
-    async def chunks(self, first: int, last: int) -> AsyncIterator[tuple[list[Header], list[dict[str, Value]]]]:
+    async def chunks(self, first: int, last: int) -> AsyncIterator[list[Row]]:
         if first > last:
             return
         query = compile_bigquery(self.request.dataset, self.request.plan)
@@ -539,8 +526,8 @@ async def _download_rpc(request: RpcDownloadRequest, progress: Progress, publica
             if primary_chain_id != request.chain.chain_id or verifier_chain_id != request.chain.chain_id:
                 raise BlockweaverError("RPC_CHAIN_MISMATCH", "RPC chain ID does not match the configured chain")
             primary_tag, verifier_tag = await _paired(
-                primary.tagged_header(request.chain.finality_tag, _INTEGRITY_PLAN),
-                verifier.tagged_header(request.chain.finality_tag, _INTEGRITY_PLAN),
+                primary.tagged_header(request.chain.finality_tag),
+                verifier.tagged_header(request.chain.finality_tag),
             )
             resolution = await _resolve_range(request.requested_range, primary, min(primary_tag.block_number, verifier_tag.block_number))
             if request.requested_range.kind == "time":
@@ -570,7 +557,7 @@ async def _download_bigquery(request: BigQueryDownloadRequest, progress: Progres
             verifier_chain_id = await verifier.chain_id()
             if verifier_chain_id != request.chain.chain_id:
                 raise BlockweaverError("RPC_CHAIN_MISMATCH", "Verifier RPC chain ID does not match the configured chain")
-            tagged = await verifier.tagged_header(request.chain.finality_tag, _INTEGRITY_PLAN)
+            tagged = await verifier.tagged_header(request.chain.finality_tag)
             resolution = await _resolve_range(request.requested_range, verifier, tagged.block_number)
             if request.requested_range.kind == "time":
                 await _verify_time_boundaries(
@@ -600,7 +587,7 @@ async def verify_rpc(dataset: Dataset, provider: Provider, full: bool) -> dict[s
             chain_id = await rpc.chain_id()
             if chain_id != dataset.chain_id:
                 raise BlockweaverError("RPC_CHAIN_MISMATCH", "RPC chain ID does not match the dataset")
-            target = await rpc.header(dataset.last_block, dataset._plan)
+            target = await rpc.header(dataset.last_block)
             if target.block_hash != dataset._target_hash:
                 raise BlockweaverError("RPC_MISMATCH", "Dataset target hash does not match RPC")
             fresh = await _refresh_finality(target, dataset._anchor, rpc)
@@ -651,15 +638,12 @@ def _rpc(provider: Provider) -> Rpc:
     return Rpc(provider.url, batch_size=provider.batch_size, concurrency=provider.concurrency, timeout=provider.timeout)
 
 
-_INTEGRITY_PLAN = plan_features([])
-
-
 async def _resolve_range(request: RequestedRange, rpc: Rpc, finalized: int) -> _RangeResolution:
     if request.kind == "block":
         if request.end > finalized:
             raise BlockweaverError("RANGE_UNFINALIZED", "Requested block range is not fully finalized")
         numbers = sorted({request.start, request.end})
-        boundaries = await rpc.headers(numbers, _INTEGRITY_PLAN)
+        boundaries = await rpc.headers(numbers)
         return _RangeResolution(
             ResolvedRange(request.start, request.end, boundaries[0].timestamp, boundaries[-1].timestamp),
             tuple(boundaries),
@@ -668,7 +652,7 @@ async def _resolve_range(request: RequestedRange, rpc: Rpc, finalized: int) -> _
 
     async def header(number: int) -> Header:
         if number not in cache:
-            cache[number] = await rpc.header(number, _INTEGRITY_PLAN)
+            cache[number] = await rpc.header(number)
         return cache[number]
 
     genesis, latest = await header(0), await header(finalized)
@@ -708,9 +692,9 @@ async def _verify_time_boundaries(
     boundary_numbers = sorted({resolved.first_block, resolved.last_block})
     known = {header.block_number: header for header in resolution.headers}
     if independent:
-        verifier_boundaries = await verifier.headers(boundary_numbers, _INTEGRITY_PLAN)
+        verifier_boundaries = await verifier.headers(boundary_numbers)
         primary_boundaries = [known[number] for number in boundary_numbers]
-        if any(not _same_core(left, right) for left, right in zip(primary_boundaries, verifier_boundaries, strict=True)):
+        if primary_boundaries != verifier_boundaries:
             raise BlockweaverError("RPC_MISMATCH", "RPC endpoints disagree on a resolved time boundary")
         known = {header.block_number: header for header in verifier_boundaries}
     adjacent_numbers = []
@@ -720,7 +704,7 @@ async def _verify_time_boundaries(
         adjacent_numbers.append(resolved.last_block + 1)
     missing = [number for number in adjacent_numbers if number not in known]
     if missing:
-        known.update((header.block_number, header) for header in await verifier.headers(missing, _INTEGRITY_PLAN))
+        known.update((header.block_number, header) for header in await verifier.headers(missing))
     first, last = known[resolved.first_block], known[resolved.last_block]
     if (
         first.timestamp != resolved.first_timestamp
@@ -734,10 +718,10 @@ async def _verify_time_boundaries(
 
 
 async def _prove_finality(target: Header, verifier: Rpc, request: DownloadRequest) -> Anchor:
-    verifier_target = await verifier.header(target.block_number, plan_features(list(target.values)))
+    verifier_target = await verifier.header(target.block_number)
     if target != verifier_target:
         raise BlockweaverError("RPC_MISMATCH", "RPC endpoints disagree on the target block")
-    tagged = await verifier.tagged_header(request.chain.finality_tag, _INTEGRITY_PLAN)
+    tagged = await verifier.tagged_header(request.chain.finality_tag)
     if tagged.block_number < target.block_number:
         raise BlockweaverError("RANGE_UNFINALIZED", "Verifier finality head does not cover the target")
     await _connect_ancestry(verifier_target, tagged, verifier)
@@ -745,11 +729,11 @@ async def _prove_finality(target: Header, verifier: Rpc, request: DownloadReques
 
 
 async def _refresh_finality(target: Header, anchor: Anchor, rpc: Rpc) -> Anchor:
-    stored = await rpc.header(anchor.block_number, _INTEGRITY_PLAN)
+    stored = await rpc.header(anchor.block_number)
     if stored.block_hash != anchor.block_hash:
         raise BlockweaverError("RPC_MISMATCH", "Stored finalized anchor no longer matches RPC")
     await _connect_ancestry(target, stored, rpc)
-    fresh = await rpc.tagged_header(anchor.tag, _INTEGRITY_PLAN)
+    fresh = await rpc.tagged_header(anchor.tag)
     if fresh.block_number < stored.block_number:
         raise BlockweaverError("RPC_MISMATCH", "RPC finality head regressed behind the stored anchor")
     await _connect_ancestry(stored, fresh, rpc)
@@ -760,25 +744,16 @@ async def _connect_ancestry(previous: Header, tagged: Header, rpc: Rpc) -> None:
     cursor = previous.block_number + 1
     while cursor <= tagged.block_number:
         last = min(cursor + CHUNK_SIZE - 1, tagged.block_number)
-        segment = await rpc.headers(range(cursor, last + 1), _INTEGRITY_PLAN)
+        segment = await rpc.headers(range(cursor, last + 1))
         try:
             validate_links(segment, previous)
         except ValueError as error:
             raise BlockweaverError("RPC_MISMATCH", str(error)) from None
         previous = segment[-1]
         cursor = last + 1
-    reread = await rpc.header(tagged.block_number, _INTEGRITY_PLAN)
-    if tagged != reread or not _same_core(previous, tagged):
+    reread = await rpc.header(tagged.block_number)
+    if tagged != reread or previous != tagged:
         raise BlockweaverError("RPC_MISMATCH", "Finality tag did not survive numbered reread")
-
-
-def _same_core(left: Header, right: Header) -> bool:
-    return (left.block_number, left.block_hash, left.parent_hash, left.timestamp) == (
-        right.block_number,
-        right.block_hash,
-        right.parent_hash,
-        right.timestamp,
-    )
 
 
 async def _check_rows(
@@ -789,23 +764,17 @@ async def _check_rows(
     *,
     previous: Header | None = None,
 ) -> Header | None:
-    contiguous = numbers == list(range(numbers[0], numbers[-1] + 1))
+    rows = await rpc.rows(numbers, plan)
+    contiguous = numbers[-1] - numbers[0] + 1 == len(numbers)
     if contiguous:
-        headers, rows = await rpc.rows(numbers[0], numbers[-1], plan)
         try:
-            validate_links(headers, previous)
+            validate_links([Header.of(row) for row in rows], previous)
         except ValueError as error:
             raise BlockweaverError("RPC_MISMATCH", str(error)) from None
-    else:
-        headers = await rpc.headers(numbers, plan)
-        rows = []
-        for header in headers:
-            fees = (await rpc.fee_history(header.block_number, header.block_number, plan.percentiles))[0] if plan.percentiles else None
-            rows.append(header.row(plan, fees))
     for number, row in zip(numbers, rows, strict=True):
-        if local[number] != row:
+        if local[number] != plan.export(row):
             raise BlockweaverError("RPC_MISMATCH", f"Dataset row {number} does not match verifier RPC")
-    return headers[-1] if contiguous else None
+    return Header.of(rows[-1]) if contiguous else None
 
 
 async def _check_full_dataset(dataset: Dataset, rpc: Rpc) -> None:
@@ -822,7 +791,7 @@ async def _check_full_dataset(dataset: Dataset, rpc: Rpc) -> None:
 
 
 async def _candidate_target(dataset: Dataset, verifier: Rpc) -> Header:
-    target = await verifier.header(dataset.last_block, dataset._plan)
+    target = await verifier.header(dataset.last_block)
     if target.block_hash != dataset._target_hash:
         raise BlockweaverError("RPC_MISMATCH", "Ready candidate target hash does not match verifier RPC")
     return target
@@ -876,48 +845,25 @@ def _bigquery_chunks(
     first_block: int,
     last_block: int,
     plan: Plan,
-) -> Iterator[tuple[list[Header], list[dict[str, Value]]]]:
-    headers: list[Header] = []
-    rows: list[dict[str, Value]] = []
+) -> Iterator[list[Row]]:
+    rows: list[Row] = []
     expected = first_block
     for page in warehouse.pages(query.sql, parameters, maximum_bytes_billed, CHUNK_SIZE):
         for value in page:
-            header, row = _parse_bigquery_row(value, query.result_schema, plan, expected)
-            headers.append(header)
-            rows.append(row)
+            rows.append(_parse_bigquery_row(value, query.result_schema, plan, expected))
             expected += 1
-            if len(headers) == CHUNK_SIZE:
-                yield headers, rows
-                headers, rows = [], []
-    if headers:
-        yield headers, rows
-    if expected != last_block + 1:
-        raise BlockweaverError("BIGQUERY_INVALID", "BigQuery did not return the exact contiguous requested range")
+            if len(rows) == CHUNK_SIZE:
+                yield rows
+                rows = []
+    if rows:
+        yield rows
 
 
-def _parse_bigquery_row(value: Mapping[str, object], schema: dict[str, str], plan: Plan, expected: int) -> tuple[Header, dict[str, Value]]:
+def _parse_bigquery_row(value: Mapping[str, object], schema: dict[str, str], plan: Plan, expected: int) -> Row:
     if set(value) != set(schema):
         raise BlockweaverError("BIGQUERY_INVALID", "BigQuery returned a noncanonical row shape")
-    number = _bigquery_int(value["block_number"], "block_number")
-    if number != expected:
+    if type(value["block_number"]) is not int or value["block_number"] != expected:
         raise BlockweaverError("BIGQUERY_INVALID", "BigQuery did not return the exact contiguous requested range")
-    timestamp = _bigquery_int(value["_proof_timestamp"], "timestamp")
-    header = Header(number, block_hash(value["_proof_hash"], "block hash"), block_hash(value["_proof_parent_hash"], "parent hash"), timestamp, {})
-    if "_proof_gas_limit" in schema:
-        gas_used = _bigquery_int(value["_proof_gas_used"], "gas used")
-        gas_limit = _bigquery_int(value["_proof_gas_limit"], "gas limit")
-        if gas_limit == 0 or gas_used > gas_limit:
-            raise BlockweaverError("BIGQUERY_INVALID", f"BigQuery returned an invalid gas domain for block {number}")
-    if plan.percentiles and _bigquery_int(value["_receipt_gas_used"], "receipt gas used") != _bigquery_int(value["_proof_gas_used"], "block gas used"):
-        raise BlockweaverError("BIGQUERY_INVALID", f"BigQuery receipts are incomplete for block {number}")
-    row: dict[str, Value] = {"block_number": number}
-    for feature in plan.features:
-        raw = value[feature.name]
-        row[feature.name] = block_hash(raw, feature.name) if feature.dtype == "UTF-8" else _bigquery_int(raw, feature.name)
-    return header, row
-
-
-def _bigquery_int(value: object, label: str) -> int:
-    if type(value) is not int or value < 0 or value > INT64_MAX:
-        raise BlockweaverError("BIGQUERY_INVALID", f"BigQuery returned an invalid {label}")
-    return value
+    if plan.percentiles and value["_receipt_gas_used"] != value["_proof_gas_used"]:
+        raise BlockweaverError("BIGQUERY_INVALID", f"BigQuery receipts are incomplete for block {expected}")
+    return plan.row(value)

@@ -6,25 +6,29 @@ import os
 import re
 import sys
 import tomllib
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
+from enum import Enum
 from ipaddress import ip_address
 from math import isfinite
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, ClassVar, Literal
 from urllib.parse import urlsplit
 from uuid import UUID
 
 OutputFormat = Literal["parquet", "csv"]
 Source = Literal["rpc", "bigquery"]
 Value = int | str
+Row = dict[str, Value]
 
 INT64_MAX = 2**63 - 1
 DEFAULT_BATCH_SIZE = 20
 DEFAULT_CONCURRENCY = 6
 DEFAULT_TIMEOUT = 30
 _QUANTITY = re.compile(r"0x(?:0|[1-9a-f][0-9a-f]*)\Z")
-HASH = re.compile(r"0x[0-9a-f]{64}\Z")
+HASH_PATTERN = "0x[0-9a-f]{64}"
+HASH = re.compile(HASH_PATTERN + r"\Z")
 NAME = re.compile(r"[a-z0-9][a-z0-9_-]*\Z")
 _ENV = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 _DATE = re.compile(r"\d{4}-\d{2}-\d{2}\Z")
@@ -41,117 +45,123 @@ class BlockweaverError(Exception):
         self.code = code
 
 
+class Domain(Enum):
+    """The values a column may hold. Each member's value is its published rule text."""
+
+    NONNEGATIVE = "nonnegative"
+    POSITIVE = "positive"
+    HASH = "lowercase 0x-prefixed 32-byte hash"
+
+    def admits(self, value: object) -> bool:
+        if self is Domain.HASH:
+            return isinstance(value, str) and HASH.fullmatch(value) is not None
+        return type(value) is int and (self is Domain.NONNEGATIVE or value > 0) and 0 <= value <= INT64_MAX
+
+
+@dataclass(frozen=True, slots=True)
+class HeaderKey:
+    """An eth_getBlockByNumber key and how its value becomes a column value."""
+
+    key: str
+    kind: Literal["quantity", "hash", "count"]
+    family: ClassVar[str] = "header"
+
+
+@dataclass(frozen=True, slots=True)
+class FeeHistory:
+    percentile: int
+    family: ClassVar[str] = "fee_history"
+
+
+@dataclass(frozen=True, slots=True)
+class BlocksColumn:
+    column: str
+    type: Literal["INTEGER", "STRING", "TIMESTAMP"]
+    family: ClassVar[str] = "blocks"
+
+
+@dataclass(frozen=True, slots=True)
+class TransactionRows:
+    family: ClassVar[str] = "transactions"
+
+
+@dataclass(frozen=True, slots=True)
+class ReceiptPercentile:
+    percentile: int
+    family: ClassVar[str] = "receipts"
+
+
 @dataclass(frozen=True, slots=True)
 class Feature:
+    """One selectable column: its type, its domain, and how each source acquires it."""
+
     name: str
     dtype: Literal["Int64", "UTF-8"]
     unit: str
-    family: Literal["header", "fee_history"]
-    rpc_field: str | None = None
-    dependencies: tuple[str, ...] = ()
-    bigquery_family: Literal["blocks", "transactions", "receipts"] = "blocks"
-    bigquery_field: str | None = None
-    bigquery_dependencies: tuple[str, ...] = ()
-    percentile: int | None = None
-    domain: str = ""
+    domain: Domain
+    rpc: HeaderKey | FeeHistory
+    bigquery: BlocksColumn | TransactionRows | ReceiptPercentile
+    at_most: str | None = None
+    nondecreasing: bool = False
+
+    @property
+    def rule(self) -> str:
+        return self.domain.value + (", nondecreasing" if self.nondecreasing else "") + (f" and at most {self.at_most}" if self.at_most else "")
 
     def document(self) -> dict[str, object]:
+        partners = _bound_partners(self)
         return {
             "name": self.name,
             "type": self.dtype,
             "unit": self.unit,
             "supported_sources": ["rpc", "bigquery"],
-            "acquisition_families": {"rpc": self.family, "bigquery": self.bigquery_family},
-            "domain_rule": self.domain,
-            "hidden_dependencies": {"rpc": list(self.dependencies), "bigquery": list(self.bigquery_dependencies)},
+            "acquisition_families": {"rpc": self.rpc.family, "bigquery": self.bigquery.family},
+            "domain_rule": self.rule,
+            "hidden_dependencies": {
+                "rpc": [partner.rpc.key for partner in partners if isinstance(partner.rpc, HeaderKey)],
+                "bigquery": [partner.bigquery.column for partner in partners if isinstance(partner.bigquery, BlocksColumn)],
+            },
         }
 
 
+TIMESTAMP = Feature(
+    "timestamp",
+    "Int64",
+    "unix_second",
+    Domain.NONNEGATIVE,
+    HeaderKey("timestamp", "quantity"),
+    BlocksColumn("block_timestamp", "TIMESTAMP"),
+    nondecreasing=True,
+)
+BLOCK_HASH = Feature("block_hash", "UTF-8", "hex", Domain.HASH, HeaderKey("hash", "hash"), BlocksColumn("block_hash", "STRING"))
+PARENT_HASH = Feature("parent_hash", "UTF-8", "hex", Domain.HASH, HeaderKey("parentHash", "hash"), BlocksColumn("parent_hash", "STRING"))
+CORE = (TIMESTAMP, BLOCK_HASH, PARENT_HASH)
 FEATURES = (
-    Feature("timestamp", "Int64", "unix_second", "header", "timestamp", bigquery_field="block_timestamp", domain="nonnegative, nondecreasing"),
-    Feature("block_hash", "UTF-8", "hex", "header", "hash", bigquery_field="block_hash", domain="lowercase 0x-prefixed 32-byte hash"),
-    Feature("parent_hash", "UTF-8", "hex", "header", "parentHash", bigquery_field="parent_hash", domain="lowercase 0x-prefixed 32-byte hash"),
-    Feature("base_fee_per_gas", "Int64", "wei/gas", "header", "baseFeePerGas", bigquery_field="base_fee_per_gas", domain="positive"),
-    Feature(
-        "gas_used",
-        "Int64",
-        "gas",
-        "header",
-        "gasUsed",
-        ("gasLimit",),
-        bigquery_field="gas_used",
-        bigquery_dependencies=("gas_limit",),
-        domain="nonnegative and at most gas_limit",
-    ),
-    Feature(
-        "gas_limit",
-        "Int64",
-        "gas",
-        "header",
-        "gasLimit",
-        ("gasUsed",),
-        bigquery_field="gas_limit",
-        bigquery_dependencies=("gas_used",),
-        domain="positive",
-    ),
-    Feature("tx_count", "Int64", "transaction", "header", "transactions", bigquery_family="transactions", domain="nonnegative"),
-    Feature(
-        "effective_priority_fee_per_gas_p50",
-        "Int64",
-        "wei/gas",
-        "fee_history",
-        bigquery_family="receipts",
-        percentile=50,
-        domain="nonnegative",
-    ),
-    Feature(
-        "effective_priority_fee_per_gas_p90",
-        "Int64",
-        "wei/gas",
-        "fee_history",
-        bigquery_family="receipts",
-        percentile=90,
-        domain="nonnegative",
+    *CORE,
+    Feature("base_fee_per_gas", "Int64", "wei/gas", Domain.POSITIVE, HeaderKey("baseFeePerGas", "quantity"), BlocksColumn("base_fee_per_gas", "INTEGER")),
+    Feature("gas_used", "Int64", "gas", Domain.NONNEGATIVE, HeaderKey("gasUsed", "quantity"), BlocksColumn("gas_used", "INTEGER"), at_most="gas_limit"),
+    Feature("gas_limit", "Int64", "gas", Domain.POSITIVE, HeaderKey("gasLimit", "quantity"), BlocksColumn("gas_limit", "INTEGER")),
+    Feature("tx_count", "Int64", "transaction", Domain.NONNEGATIVE, HeaderKey("transactions", "count"), TransactionRows()),
+    *(
+        Feature(f"effective_priority_fee_per_gas_p{percentile}", "Int64", "wei/gas", Domain.NONNEGATIVE, FeeHistory(percentile), ReceiptPercentile(percentile))
+        for percentile in (50, 90)
     ),
 )
 FEATURE_BY_NAME = {feature.name: feature for feature in FEATURES}
 
 
-@dataclass(frozen=True, slots=True)
-class _BigQueryRequirements:
-    block_fields: tuple[tuple[str, str], ...]
-    transaction_fields: tuple[tuple[str, str], ...]
-    receipt_fields: tuple[tuple[str, str], ...]
-    percentiles: tuple[int, ...]
-
-    def document(self) -> dict[str, object]:
-        families: list[dict[str, object]] = [{"family": "blocks", "table": "blocks", "fields": [field for field, _dtype in self.block_fields]}]
-        if self.transaction_fields:
-            families.append(
-                {
-                    "family": "transactions",
-                    "table": "transactions",
-                    "fields": [field for field, _dtype in self.transaction_fields],
-                }
-            )
-        if self.receipt_fields:
-            families.append(
-                {
-                    "family": "receipts",
-                    "table": "receipts",
-                    "fields": [field for field, _dtype in self.receipt_fields],
-                    "reward_percentiles": list(self.percentiles),
-                }
-            )
-        return {"families": families}
+def _bound_partners(feature: Feature) -> list[Feature]:
+    """Features that share an at_most bound with this one. Both sides are acquired so the bound can be checked."""
+    return [other for other in FEATURES if other.name == feature.at_most or other.at_most == feature.name]
 
 
 @dataclass(frozen=True, slots=True)
 class Plan:
+    """What one request exports, stores in checkpoints, and acquires from its source."""
+
     features: tuple[Feature, ...]
-    header_fields: tuple[str, ...]
-    percentiles: tuple[int, ...]
-    _bigquery_requirements: _BigQueryRequirements
+    stored: tuple[Feature, ...]
+    acquired: tuple[Feature, ...]
 
     @property
     def columns(self) -> tuple[str, ...]:
@@ -161,6 +171,14 @@ class Plan:
     def schema(self) -> dict[str, str]:
         return {"block_number": "Int64", **{feature.name: feature.dtype for feature in self.features}}
 
+    @property
+    def stored_schema(self) -> dict[str, str]:
+        return {"block_number": "Int64", **{feature.name: feature.dtype for feature in self.stored}}
+
+    @property
+    def percentiles(self) -> tuple[int, ...]:
+        return tuple(feature.rpc.percentile for feature in self.acquired if isinstance(feature.rpc, FeeHistory))
+
     def schema_document(self) -> list[dict[str, str]]:
         return [
             {"name": "block_number", "type": "Int64", "unit": "block"},
@@ -169,37 +187,49 @@ class Plan:
 
     def document(self, source: Source) -> dict[str, object]:
         if source == "bigquery":
-            return self._bigquery_requirements.document()
-        families: list[dict[str, object]] = [{"family": "header", "method": "eth_getBlockByNumber", "fields": list(self.header_fields)}]
+            families: list[dict[str, object]] = [{"family": table, "table": table, "fields": sorted(fields)} for table, fields in bigquery_tables(self).items()]
+            if self.percentiles:
+                families[-1]["reward_percentiles"] = list(self.percentiles)
+            return {"families": families}
+        keys = [feature.rpc.key for feature in (BLOCK_HASH, PARENT_HASH, TIMESTAMP, *self.acquired[len(CORE) :]) if isinstance(feature.rpc, HeaderKey)]
+        families = [{"family": HeaderKey.family, "method": "eth_getBlockByNumber", "fields": ["number", *keys]}]
         if self.percentiles:
-            families.append({"family": "fee_history", "method": "eth_feeHistory", "reward_percentiles": list(self.percentiles)})
+            families.append({"family": FeeHistory.family, "method": "eth_feeHistory", "reward_percentiles": list(self.percentiles)})
         return {"families": families}
 
+    def row(self, values: Mapping[str, Any]) -> Row:
+        """Check one block's acquired values against the registry and keep what checkpoints store."""
+        for feature in self.acquired:
+            if not feature.domain.admits(values[feature.name]):
+                raise ValueError(f"Block {values['block_number']} has {feature.name} outside its domain: {feature.rule}")
+        for feature in self.acquired:
+            if feature.at_most is not None and values[feature.name] > values[feature.at_most]:
+                raise ValueError(f"Block {values['block_number']} has {feature.name} outside its domain: {feature.rule}")
+        return {name: values[name] for name in self.stored_schema}
 
-def _bigquery_requirements(features: tuple[Feature, ...], percentiles: tuple[int, ...]) -> _BigQueryRequirements:
-    fields = {"block_number": "INTEGER", "block_timestamp": "TIMESTAMP", "block_hash": "STRING", "parent_hash": "STRING"}
-    for feature in features:
-        if feature.bigquery_field is not None:
-            fields[feature.bigquery_field] = "TIMESTAMP" if feature.bigquery_field == "block_timestamp" else "STRING" if feature.dtype == "UTF-8" else "INTEGER"
-        fields.update({dependency: "INTEGER" for dependency in feature.bigquery_dependencies})
-    if percentiles:
-        fields.update({"base_fee_per_gas": "INTEGER", "gas_used": "INTEGER"})
-    return _BigQueryRequirements(
-        tuple(sorted(fields.items())),
-        (("block_hash", "STRING"), ("block_timestamp", "TIMESTAMP")) if any(feature.bigquery_family == "transactions" for feature in features) else (),
-        (
-            (
-                ("block_hash", "STRING"),
-                ("block_timestamp", "TIMESTAMP"),
-                ("effective_gas_price", "INTEGER"),
-                ("gas_used", "INTEGER"),
-                ("transaction_index", "INTEGER"),
-            )
-            if percentiles
-            else ()
-        ),
-        percentiles,
-    )
+    def export(self, row: Mapping[str, Value]) -> Row:
+        return {name: row[name] for name in self.columns}
+
+
+def bigquery_tables(plan: Plan) -> dict[str, dict[str, str]]:
+    """The Google Blockchain Analytics tables and typed fields a plan reads."""
+    blocks = {
+        "block_number": "INTEGER",
+        **{feature.bigquery.column: feature.bigquery.type for feature in plan.acquired if isinstance(feature.bigquery, BlocksColumn)},
+    }
+    tables = {"blocks": blocks}
+    if any(isinstance(feature.bigquery, TransactionRows) for feature in plan.acquired):
+        tables["transactions"] = {"block_hash": "STRING", "block_timestamp": "TIMESTAMP"}
+    if plan.percentiles:
+        blocks.update({"base_fee_per_gas": "INTEGER", "gas_used": "INTEGER"})
+        tables["receipts"] = {
+            "block_hash": "STRING",
+            "block_timestamp": "TIMESTAMP",
+            "effective_gas_price": "INTEGER",
+            "gas_used": "INTEGER",
+            "transaction_index": "INTEGER",
+        }
+    return tables
 
 
 def parse_source(value: object) -> Source:
@@ -266,16 +296,9 @@ def plan_features(names: list[str] | tuple[str, ...]) -> Plan:
     if unknown:
         raise ValueError(f"Unknown feature: {unknown[0]}")
     selected = tuple(feature for feature in FEATURES if feature.name in names)
-    fields = {feature.rpc_field for feature in selected if feature.rpc_field is not None}
-    for feature in selected:
-        fields.update(feature.dependencies)
-    ordered_fields = tuple(
-        field
-        for field in ("number", "hash", "parentHash", "timestamp", "baseFeePerGas", "gasUsed", "gasLimit", "transactions")
-        if field in {"number", "hash", "parentHash", "timestamp"} or field in fields
-    )
-    percentiles = tuple(feature.percentile for feature in selected if feature.percentile is not None)
-    return Plan(selected, ordered_fields, percentiles, _bigquery_requirements(selected, percentiles))
+    stored = tuple(feature for feature in FEATURES if feature in CORE or feature in selected)
+    partners = [partner for feature in selected for partner in _bound_partners(feature)]
+    return Plan(selected, stored, tuple(feature for feature in FEATURES if feature in stored or feature in partners))
 
 
 @dataclass(frozen=True, slots=True)
@@ -778,27 +801,16 @@ def format_utc(timestamp: int) -> str:
 
 @dataclass(frozen=True, slots=True)
 class Header:
+    """The integrity core of one block."""
+
     block_number: int
     block_hash: str
     parent_hash: str
     timestamp: int
-    values: dict[str, Value]
 
-    def row(self, plan: Plan, fees: dict[int, int] | None = None) -> dict[str, Value]:
-        result: dict[str, Value] = {"block_number": self.block_number}
-        for feature in plan.features:
-            if feature.percentile is not None:
-                assert fees is not None
-                result[feature.name] = fees[feature.percentile]
-            elif feature.name == "block_hash":
-                result[feature.name] = self.block_hash
-            elif feature.name == "parent_hash":
-                result[feature.name] = self.parent_hash
-            elif feature.name == "timestamp":
-                result[feature.name] = self.timestamp
-            else:
-                result[feature.name] = self.values[feature.name]
-        return result
+    @classmethod
+    def of(cls, row: Mapping[str, Any]) -> Header:
+        return cls(row["block_number"], row[BLOCK_HASH.name], row[PARENT_HASH.name], row[TIMESTAMP.name])
 
 
 @dataclass(frozen=True, slots=True)
@@ -820,44 +832,30 @@ def quantity(value: Any, label: str) -> int:
     return parsed
 
 
-def block_hash(value: Any, label: str) -> str:
-    if not isinstance(value, str) or HASH.fullmatch(value) is None:
-        raise ValueError(f"Invalid {label}")
-    return value
-
-
-def parse_header(value: Any, *, expected: int | None, plan: Plan) -> Header:
+def parse_block(value: Any, *, expected: int | None, plan: Plan) -> dict[str, Value]:
+    """Decode the header keys a plan acquires from one eth_getBlockByNumber result."""
     if not isinstance(value, dict):
         raise ValueError("Invalid block response shape")
-    if any(field not in value for field in plan.header_fields):
-        raise ValueError("Block response is missing required fields")
-    number = quantity(value["number"], "block number")
+    number = quantity(value.get("number"), "block number")
     if expected is not None and number != expected:
         raise ValueError(f"RPC returned block {number} when {expected} was requested")
-    timestamp = quantity(value["timestamp"], "timestamp")
-    values: dict[str, Value] = {}
-    selected = {feature.name for feature in plan.features}
-    if "baseFeePerGas" in plan.header_fields:
-        base_fee = quantity(value["baseFeePerGas"], "base fee")
-        if base_fee <= 0:
-            raise ValueError("Invalid base fee domain")
-        if "base_fee_per_gas" in selected:
-            values["base_fee_per_gas"] = base_fee
-    if "gasUsed" in plan.header_fields:
-        gas_used = quantity(value["gasUsed"], "gas used")
-        gas_limit = quantity(value["gasLimit"], "gas limit")
-        if gas_limit <= 0 or gas_used > gas_limit:
-            raise ValueError("Invalid gas domain")
-        if "gas_used" in selected:
-            values["gas_used"] = gas_used
-        if "gas_limit" in selected:
-            values["gas_limit"] = gas_limit
-    if "transactions" in plan.header_fields:
-        transactions = value["transactions"]
-        if not isinstance(transactions, list):
-            raise ValueError("Invalid transactions field")
-        values["tx_count"] = len(transactions)
-    return Header(number, block_hash(value["hash"], "block hash"), block_hash(value["parentHash"], "parent hash"), timestamp, values)
+    block: dict[str, Value] = {"block_number": number}
+    for feature in plan.acquired:
+        if not isinstance(feature.rpc, HeaderKey):
+            continue
+        key, kind = feature.rpc.key, feature.rpc.kind
+        if key not in value:
+            raise ValueError(f"Block {number} response is missing {key}")
+        raw = value[key]
+        if kind == "quantity":
+            block[feature.name] = quantity(raw, f"block {number} {key}")
+        elif kind == "count":
+            if not isinstance(raw, list):
+                raise ValueError(f"Block {number} has an invalid {key} list")
+            block[feature.name] = len(raw)
+        else:
+            block[feature.name] = raw
+    return block
 
 
 def validate_links(headers: list[Header], previous: Header | None = None) -> None:
